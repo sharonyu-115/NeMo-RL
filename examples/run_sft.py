@@ -31,6 +31,8 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
 
+OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+
 
 def parse_args():
     """Parse command line arguments."""
@@ -93,7 +95,9 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
     print("\n▶ Setting up data...")
     data_cls = data_config["dataset_name"]
     if data_cls == "open_assistant":
-        data = hf_datasets.OasstDataset(output_dir="/tmp/open_assistant")
+        data = hf_datasets.OasstDataset(
+            output_dir="/tmp/open_assistant", seed=data_config["seed"]
+        )
     elif data_cls == "squad":
         data = hf_datasets.SquadDataset()
     elif data_cls == "prompt_response_dataset":
@@ -108,6 +112,7 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             split=data_config["split"],
             output_key=data_config["output_key"],
             prompt_file=data_config["prompt_file"],
+            seed=data_config["seed"],
         )
     elif data_cls == "openai_format":
         data = hf_datasets.OpenAIFormatDataset(

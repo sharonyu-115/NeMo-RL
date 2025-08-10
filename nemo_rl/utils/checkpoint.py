@@ -21,8 +21,9 @@ import glob
 import json
 import os
 import shutil
+import warnings
 from pathlib import Path
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, Mapping, NotRequired, Optional, TypedDict, Union
 
 import numpy as np
 import torch
@@ -37,17 +38,18 @@ class CheckpointingConfig(TypedDict):
     Attributes:
     enabled (bool): Whether checkpointing is enabled.
     checkpoint_dir (PathLike): Directory where checkpoints will be saved.
-    metric_name (str): Name of the metric to use for determining best checkpoints.
+    metric_name (str | None): Name of the metric to use for determining best checkpoints.
     higher_is_better (bool): Whether higher values of the metric indicate better performance.
     keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
     """
 
     enabled: bool
     checkpoint_dir: PathLike
-    metric_name: str
+    metric_name: str | None
     higher_is_better: bool
     save_period: int
-    keep_top_k: Optional[int]
+    keep_top_k: NotRequired[int]
+    checkpoint_must_save_by: NotRequired[str | None]
 
 
 class CheckpointManager:
@@ -85,8 +87,8 @@ class CheckpointManager:
     def init_tmp_checkpoint(
         self,
         step: int,
-        training_info: dict[str, Any],
-        run_config: Optional[dict[str, Any]] = None,
+        training_info: Mapping[str, Any],
+        run_config: Optional[Mapping[str, Any]] = None,
     ) -> PathLike:
         """Initialize a temporary checkpoint directory.
 
@@ -155,12 +157,14 @@ class CheckpointManager:
         self.remove_old_checkpoints()
 
     def remove_old_checkpoints(self, exclude_latest: bool = True) -> None:
-        """Remove checkpoints that are not in the top-k or latest based on the metric.
+        """Remove checkpoints that are not in the top-k or latest based on the (optional) metric.
 
         If keep_top_k is set, this method removes all checkpoints except the top-k
-        best ones based on the specified metric. The best checkpoints are determined
-        by the metric value and the higher_is_better setting. When multiple checkpoints
-        have the same metric value, more recent checkpoints (higher step numbers) are preferred.
+        best ones. The "best" checkpoints are determined by:
+        - If a metric is provided: the given metric value and the higher_is_better setting.
+          When multiple checkpoints have the same metric value, more recent checkpoints
+          (higher step numbers) are preferred.
+        - If no metric is provided: the step number. The most recent k checkpoints are kept.
 
         Args:
             exclude_latest (bool): Whether to exclude the latest checkpoint from deletion. (may result in K+1 checkpoints)
@@ -173,22 +177,37 @@ class CheckpointManager:
             if checkpoint_history
             else None
         )
-        # sort by metric value first, then by step number (for equal metrics, prefer more recent)
-        if self.higher_is_better:
-            # For higher_is_better=True: higher metric values first, then higher step numbers
-            checkpoint_history.sort(
-                key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
-            )
+
+        if self.metric_name is None:
+            checkpoint_history.sort(key=lambda x: x[0], reverse=True)
         else:
-            # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
-            checkpoint_history.sort(key=lambda x: (x[2][self.metric_name], -x[0]))
+            try:
+                assert self.metric_name is not None  # Type checker hint
+                # sort by metric value first, then by step number (for equal metrics, prefer more recent)
+                if self.higher_is_better:
+                    # For higher_is_better=True: higher metric values first, then higher step numbers
+                    checkpoint_history.sort(
+                        key=lambda x: (x[2][self.metric_name], x[0]), reverse=True
+                    )
+                else:
+                    # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
+                    checkpoint_history.sort(
+                        key=lambda x: (x[2][self.metric_name], -x[0])
+                    )
+            except KeyError:
+                warnings.warn(
+                    f"Metric {self.metric_name} not found in checkpoint history. Keeping most recent k checkpoints."
+                )
+                checkpoint_history.sort(key=lambda x: x[0], reverse=True)
+
+                self.metric_name = None
 
         # remove checkpoints that are not in the top-k
         for checkpoint in checkpoint_history[self.keep_top_k :]:
             if exclude_latest and checkpoint[0] == latest_step:
                 continue
             print(
-                f"Removing checkpoint {checkpoint[1]} due to being outside top-{self.keep_top_k}, metric: {checkpoint[2][self.metric_name]}"
+                f"Removing checkpoint {checkpoint[1]} due to being outside top-{self.keep_top_k}"
             )
             shutil.rmtree(checkpoint[1])
 
@@ -206,8 +225,8 @@ class CheckpointManager:
             return None
         # sort by metric value
         if self.metric_name not in checkpoint_history[0][2]:
-            print(
-                f"WARNING:Metric {self.metric_name} not found in checkpoint history. Returning last"
+            warnings.warn(
+                f"Metric {self.metric_name} not found in checkpoint history. Returning last"
             )
             return self.get_latest_checkpoint_path()
 

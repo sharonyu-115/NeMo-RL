@@ -16,9 +16,8 @@ import argparse
 import os
 import pprint
 from collections import defaultdict
-from typing import Any, Optional, cast
+from typing import Any, Optional
 
-import torch
 from omegaconf import OmegaConf
 from transformers import PreTrainedTokenizerBase
 
@@ -90,8 +89,13 @@ def hf_data_processor(
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["token_ids"] = tokenizer(message, return_tensors="pt")["input_ids"][0]
-    user_message["content"] = message[0]
+
+    user_message["token_ids"] = tokenizer(
+        message,
+        return_tensors="pt",
+        add_special_tokens=False,
+    )["input_ids"][0]
+    user_message["content"] = message
     message_log.append(user_message)
 
     length = sum(len(m["token_ids"]) for m in message_log)
@@ -116,78 +120,11 @@ def hf_data_processor(
     return output
 
 
-# Example of a generic math data processor
-# TaskDataProcessFnCallable
-def math_data_processor(
-    datum_dict: dict[str, Any],
-    task_data_spec: TaskDataSpec,
-    tokenizer: TokenizerType,
-    max_seq_length: int,
-    idx: int,
-) -> DatumSpec:
-    """Process a datum dictionary (directly loaded from dataset) into a DatumSpec for the Math Environment."""
-    problem = datum_dict["problem"]
-    solution = str(datum_dict["expected_answer"])
-    extra_env_info = {"ground_truth": solution}
-
-    message_log: LLMMessageLogType = []
-
-    # system prompt
-    if task_data_spec.system_prompt:
-        sys_prompt: dict[str, str | torch.Tensor] = {
-            "role": "system",
-            "content": task_data_spec.system_prompt,
-        }
-        sys = tokenizer.apply_chat_template(
-            [cast(dict[str, str], sys_prompt)],
-            tokenize=False,
-            add_generation_prompt=False,
-            add_special_tokens=False,
-        )
-        sys_prompt["token_ids"] = tokenizer(sys, return_tensors="pt")["input_ids"][0]
-        message_log.append(sys_prompt)
-
-    # user prompt
-    if task_data_spec.prompt:
-        problem = task_data_spec.prompt.format(problem)
-    user_message = {"role": "user", "content": problem}
-    message = tokenizer.apply_chat_template(
-        [user_message],
-        tokenize=False,
-        add_generation_prompt=True,
-        add_special_tokens=False,
-    )
-    user_message["token_ids"] = tokenizer(message, return_tensors="pt")["input_ids"][0]
-    user_message["content"] = message
-    message_log.append(user_message)
-
-    length = sum(len(m["token_ids"]) for m in message_log)
-
-    loss_multiplier = 1.0
-    if length > max_seq_length:
-        # make smaller and mask out
-        for indiv_message in message_log:
-            indiv_message["token_ids"] = indiv_message["token_ids"][
-                : min(4, max_seq_length // len(message_log))
-            ]
-        loss_multiplier = 0.0
-
-    output: DatumSpec = {
-        "message_log": message_log,
-        "length": length,
-        "extra_env_info": extra_env_info,
-        "loss_multiplier": loss_multiplier,
-        "idx": idx,
-    }
-    if "task_name" in datum_dict:
-        output["task_name"] = datum_dict["task_name"]
-    return output
-
-
 def setup_data(
     tokenizer: TokenizerType,
     data_config: DataConfig,
     env_configs: dict[str, Any],
+    seed: int,
 ) -> tuple[
     AllTaskProcessedDataset,
     Optional[AllTaskProcessedDataset],
@@ -204,12 +141,12 @@ def setup_data(
     # Load OpenMathInstruct2Dataset using nemo rl datasets
     if data_config["dataset_name"] == "OpenMathInstruct-2":
         print("Loading nvidia/OpenMathInstruct2Dataset for training and validation")
-        data: Any = OpenMathInstruct2Dataset()
+        data: Any = OpenMathInstruct2Dataset(seed=seed)
     elif data_config["dataset_name"] == "DeepScaler":
         print(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
-        data: Any = DeepScalerDataset()
+        data: Any = DeepScalerDataset(seed=seed)
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
 
@@ -300,7 +237,7 @@ def main() -> None:
         val_dataset,
         task_to_env,
         val_task_to_env,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    ) = setup_data(tokenizer, config["data"], config["env"], config["grpo"]["seed"])
 
     (
         policy,

@@ -17,10 +17,13 @@ dist/
 *.vscode/
 release_run*
 ckpts/
+3rdparty/vllm
 
 # Test
 coverage.json
 .coverage*
+unit_results.json
+unit_results/
 test_assets/
 
 # Cache

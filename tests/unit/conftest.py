@@ -30,30 +30,68 @@ from nemo_rl.distributed.virtual_cluster import init_ray
 
 dir_path = os.path.dirname(os.path.abspath(__file__))
 
+
+def pytest_addoption(parser):
+    """Add custom command line options for controlling test execution."""
+    parser.addoption(
+        "--hf-gated",
+        action="store_true",
+        default=False,
+        help="Include tests that require HuggingFace token access",
+    )
+    parser.addoption(
+        "--mcore-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY mcore tests (combine with --hf-gated to include mcore+hf_gated tests)",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Modify test collection to skip tests based on markers unless explicitly requested."""
+    run_hf_gated = config.getoption("--hf-gated")
+    run_mcore_only = config.getoption("--mcore-only")
+    marker_expr = config.getoption("-m", default="")
+
+    # If user specified -m marker expressions, let pytest handle everything normally
+    if marker_expr:
+        return
+
+    # Filter tests based on the desired configurations
+    new_items = []
+
+    if run_mcore_only and run_hf_gated:
+        # Configuration 4: Only mcore tests, including ones with hf_gated
+        new_items = [item for item in items if item.get_closest_marker("mcore")]
+    elif run_mcore_only:
+        # Configuration 3: Only mcore tests, excluding ones with hf_gated
+        new_items = [
+            item
+            for item in items
+            if item.get_closest_marker("mcore")
+            and not item.get_closest_marker("hf_gated")
+        ]
+    elif run_hf_gated:
+        # Configuration 2: Default tests + hf_gated tests, excluding mcore
+        new_items = [item for item in items if not item.get_closest_marker("mcore")]
+    else:
+        # Configuration 1: Default only - exclude both hf_gated and mcore
+        new_items = [
+            item
+            for item in items
+            if not item.get_closest_marker("hf_gated")
+            and not item.get_closest_marker("mcore")
+        ]
+
+    # Update the items list in-place
+    items[:] = new_items
+
+
 TEST_ASSETS_DIR = os.path.join(dir_path, "test_assets")
 UNIT_RESULTS_FILE = os.path.join(dir_path, "unit_results.json")
 UNIT_RESULTS_FILE_DATED = os.path.join(
     dir_path, f"unit_results/{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 )
-
-
-# Mapping between asset and absolute path (each are populated from a session level fixture)
-class TEST_ASSETS:
-    TINY_LLAMA_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_llama_with_llama3.2_tokenizer"
-    )
-    TINY_LLAMA_TIED_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_llama_tied_with_llama3.2_tokenizer"
-    )
-    TINY_QWEN2_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_qwen2_with_qwen2_tokenizer"
-    )
-    TINY_QWEN3_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_qwen3_with_qwen3_tokenizer"
-    )
-    TINY_GEMMA3_MODEL_PATH = os.path.join(
-        TEST_ASSETS_DIR, "tiny_gemma3_with_gemma3_tokenizer"
-    )
 
 
 class UnitTestData(TypedDict):
@@ -198,7 +236,14 @@ def tracker(request, session_data, ray_gpu_monitor):
     session_data["metrics"][qualified_name]["_elapsed"] = end_time - start_time
 
 
+def pytest_sessionstart(session):
+    os.makedirs(TEST_ASSETS_DIR, exist_ok=True)
+
+
 def pytest_sessionfinish(session, exitstatus):
+    if not hasattr(session.config, "_unit_test_data"):
+        return
+
     data = session.config._unit_test_data
     data["exit_status"] = exitstatus
     print(f"\nSaving unit test data to {UNIT_RESULTS_FILE}")
@@ -391,14 +436,14 @@ def mock_2gpu_distributed_env():
 #######################
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_llama_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
-    model_path = TEST_ASSETS.TINY_LLAMA_MODEL_PATH
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_llama_with_llama3.2_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=128256 (so we can re-use llama3.2 1b tokenizer)
     config = LlamaConfig(
@@ -419,14 +464,16 @@ def tiny_llama_model_path():
     yield model_path
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_llama_tied_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
-    model_path = TEST_ASSETS.TINY_LLAMA_TIED_MODEL_PATH
+    model_path = os.path.join(
+        TEST_ASSETS_DIR, "tiny_llama_tied_with_llama3.2_tokenizer"
+    )
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=128256 (so we can re-use llama3.2 1b tokenizer)
     config = LlamaConfig(
@@ -447,14 +494,14 @@ def tiny_llama_tied_model_path():
     yield model_path
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_qwen2_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
 
-    model_path = TEST_ASSETS.TINY_QWEN2_MODEL_PATH
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_qwen2_with_qwen2_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=151936 (so we can re-use qwen2 1.5b tokenizer)
     config = Qwen2Config(
@@ -475,14 +522,14 @@ def tiny_qwen2_model_path():
     yield model_path
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_qwen3_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, Qwen3Config, Qwen3ForCausalLM
 
-    model_path = TEST_ASSETS.TINY_QWEN3_MODEL_PATH
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_qwen3_with_qwen3_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=151936 (so we can re-use qwen2 1.5b tokenizer)
     config = Qwen3Config(
@@ -503,14 +550,14 @@ def tiny_qwen3_model_path():
     yield model_path
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 def tiny_gemma3_model_path():
     """Fixture that returns a path to a tiny llama model with a dummy tokenizer."""
     import shutil
 
     from transformers import AutoTokenizer, Gemma3ForCausalLM, Gemma3TextConfig
 
-    model_path = TEST_ASSETS.TINY_GEMMA3_MODEL_PATH
+    model_path = os.path.join(TEST_ASSETS_DIR, "tiny_gemma3_with_gemma3_tokenizer")
     # hidden_size//num_attention_heads = 32 (smallest value to not error due to vllm paged attention)
     # vocab_size=262144 so we can re-use gemma-3-1b tokenizer
     config = Gemma3TextConfig(

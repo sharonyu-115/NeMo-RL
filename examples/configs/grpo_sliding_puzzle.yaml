@@ -14,10 +14,17 @@ checkpointing:
   higher_is_better: true
   keep_top_k: 3
   save_period: 10
+  checkpoint_must_save_by: null
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B-Instruct"
   max_total_sequence_length: 3072
+
+  dtensor_cfg:
+    enabled: true
+    cpu_offload: true
+    activation_checkpointing: true
+    sequence_parallel: true
 
   generation:
     backend: "vllm"
@@ -38,6 +45,7 @@ policy:
 
 data:
   add_system_prompt: false
+  shuffle: false  # disable dataloader shuffle, shuffle is handled within the dataset
 
 env:
   sliding_puzzle_game:
@@ -52,11 +60,15 @@ logger:
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
   wandb_enabled: false
   tensorboard_enabled: false
+  mlflow_enabled: false
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-sliding_puzzle"
   tensorboard: {}
+  mlflow:
+    experiment_name: "grpo-dev"
+    run_name: "grpo-dev-sliding_puzzle"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)

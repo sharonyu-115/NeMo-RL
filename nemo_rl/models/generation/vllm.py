@@ -22,11 +22,8 @@ from collections import defaultdict
 from typing import (
     Any,
     AsyncGenerator,
-    Dict,
-    List,
     NotRequired,
     Optional,
-    Tuple,
     TypedDict,
     Union,
     cast,
@@ -55,6 +52,7 @@ from nemo_rl.models.generation.interfaces import (
     verify_right_padding,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
+from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
 
 
 class VllmSpecificArgs(TypedDict):
@@ -67,6 +65,7 @@ class VllmSpecificArgs(TypedDict):
     async_engine: bool
     load_format: NotRequired[str]
     precision: NotRequired[str]
+    enforce_eager: NotRequired[bool]
 
 
 class VllmConfig(GenerationConfig):
@@ -76,7 +75,7 @@ class VllmConfig(GenerationConfig):
 
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)
+)  # pragma: no cover
 class VllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -131,6 +130,9 @@ class VllmGenerationWorker:
                 seed = node_idx * 1024 + bundle_id
 
             init_kwargs["seed"] = seed
+            # Need to give each DP group its own vllm cache to address:
+            # https://github.com/vllm-project/vllm/issues/18851
+            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -284,7 +286,8 @@ class VllmGenerationWorker:
             raise ImportError(
                 "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
                 "covers the vllm dependency. You may have to update nemo_rl/distributed/ray_actor_environment_registry.py. "
-                "If you are working interactively, you can install by running  `uv sync --extra vllm` anywhere in the repo."
+                "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
+                "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
 
@@ -313,12 +316,8 @@ class VllmGenerationWorker:
             # For non-parallel mode, explicitly set executor to None to avoid Ray issues
             vllm_kwargs["distributed_executor_backend"] = None
 
-        os.environ["VLLM_USE_V1"] = os.environ.get("NRL_VLLM_USE_V1", "1")
+        os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-
-        if not self.cfg["colocated"]["enabled"]:
-            os.environ["NCCL_SHM_DISABLE"] = "1"
-            os.environ["NCCL_P2P_DISABLE"] = "1"
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
@@ -327,20 +326,22 @@ class VllmGenerationWorker:
         llm_kwargs = dict(
             model=self.model_name,
             load_format=load_format,
-            skip_tokenizer_init=self.cfg["vllm_cfg"]["skip_tokenizer_init"],
+            # vllm==0.10.0 breaks skip_tokenizer_init=True.
+            # This will be reverted to `self.cfg["vllm_cfg"]["skip_tokenizer_init"]` once https://github.com/NVIDIA-NeMo/RL/issues/818 is resolved.
+            skip_tokenizer_init=False,
             tensor_parallel_size=self.tensor_parallel_size,
             pipeline_parallel_size=self.pipeline_parallel_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
             dtype=self.cfg["vllm_cfg"]["precision"],
             seed=seed,
-            # Don't use cuda-graph by default as it leads to convergence issues (see https://github.com/NVIDIA-NeMo/RL/issues/186)
-            enforce_eager=True,
+            enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
             worker_extension_cls="nemo_rl.models.generation.vllm_backend.VllmInternalWorkerExtension",
             enable_sleep_mode=True,
             disable_log_stats=True,
+            logprobs_mode="raw_logprobs",
             **vllm_kwargs,
         )
 
@@ -351,6 +352,16 @@ class VllmGenerationWorker:
             self.llm = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
         else:
             self.llm = vllm.LLM(**llm_kwargs)
+
+        # will be initialized in post_init
+        # used in update_weights_from_ipc_handles
+        self.vllm_device_ids = None
+
+    def post_init(self):
+        self.vllm_device_ids = self.report_device_id()
+
+    async def post_init_async(self):
+        self.vllm_device_ids = await self.report_device_id_async()
 
     def init_collective(
         self, rank_prefix: int, ip: str, port: int, world_size: int
@@ -801,6 +812,12 @@ class VllmGenerationWorker:
             BatchedDataDict containing:
                 - texts: List of generated text responses
         """
+        # Check if async engine is enabled
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
+            )
+
         # Extract stop_strings if provided, else use default from config
         batch_stop_strings: list[list[str] | None] = data.get(
             "stop_strings", [self.cfg.get("stop_strings")] * len(data["prompts"])
@@ -816,9 +833,7 @@ class VllmGenerationWorker:
         if self.cfg.get("stop_strings", None):
             stop_strings.update(self.cfg["stop_strings"])
 
-        stop_strings: list[str] | None = (
-            list(stop_strings) if len(stop_strings) > 0 else None
-        )
+        stop_strings = list(stop_strings) if len(stop_strings) > 0 else None
 
         # Read generation parameters from config
         top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
@@ -844,6 +859,107 @@ class VllmGenerationWorker:
             {"texts": texts}
         )
         return return_data
+
+    async def generate_text_async(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate text responses asynchronously, yielding results as they are ready.
+
+        Args:
+            data: BatchedDataDict containing prompts with text strings
+            greedy: Whether to use greedy decoding instead of sampling
+
+        Yields:
+            Tuple of (original_index, BatchedDataDict containing single text response)
+        """
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "generate_text_async can only be used when async_engine is enabled in vLLM config."
+            )
+
+        # Handle empty input case
+        if len(data["prompts"]) == 0:
+            return
+
+        prompts = data["prompts"]
+        batch_size = len(prompts)
+
+        # Extract stop_strings if provided, else use default from config
+        batch_stop_strings: list[list[str] | None] = data.get(
+            "stop_strings", [self.cfg.get("stop_strings")] * batch_size
+        )
+
+        # Create tasks for each prompt
+        async def process_single_prompt(prompt_idx):
+            """Process a single prompt and return the result."""
+            prompt = prompts[prompt_idx]
+
+            # Get stop strings for this specific prompt
+            per_prompt_stop_strings = None
+            if batch_stop_strings and prompt_idx < len(batch_stop_strings):
+                per_prompt_stop_strings = batch_stop_strings[prompt_idx]
+
+            # Merge stop strings
+            final_stop_strings = self._merge_stop_strings(
+                [per_prompt_stop_strings] if per_prompt_stop_strings else None
+            )
+
+            # Create sampling parameters
+            top_k = self.cfg["top_k"] if self.cfg["top_k"] is not None else -1
+            sampling_params = self.SamplingParams(
+                temperature=self.cfg["temperature"] if not greedy else 0,
+                top_p=self.cfg["top_p"],
+                top_k=top_k if not greedy else 1,
+                max_tokens=self.cfg["max_new_tokens"],
+                stop_token_ids=self.cfg["stop_token_ids"],
+                stop=final_stop_strings,
+                include_stop_str_in_output=True,  # returning stop strings like hf
+            )
+
+            request_id = str(uuid.uuid4())
+
+            # Generate using vLLM async engine
+            vllm_request_generator = self.llm.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+            )
+
+            # Get the final result from the generator
+            final_request_output = None
+            async for req_output in vllm_request_generator:
+                final_request_output = req_output
+
+            if final_request_output is None:
+                raise RuntimeError(f"No output received for request {request_id}")
+
+            # Extract the generated text
+            generated_text = final_request_output.outputs[0].text
+
+            # Create result in BatchedDataDict format
+            result_batch = BatchedDataDict[GenerationOutputSpec](
+                {"texts": [generated_text]}
+            )
+
+            return (prompt_idx, result_batch)
+
+        # Create tasks for all prompts and yield results as they complete
+        prompt_tasks = [
+            asyncio.create_task(process_single_prompt(i)) for i in range(batch_size)
+        ]
+
+        # Yield results as they become available
+        for completed_task in asyncio.as_completed(prompt_tasks):
+            try:
+                result = await completed_task
+                yield result
+            except Exception as e:
+                # Cancel remaining tasks
+                for task in prompt_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*prompt_tasks, return_exceptions=True)
+                raise e
 
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
@@ -909,6 +1025,14 @@ class VllmGenerationWorker:
 
         return cast(list[str], list_of_worker_results)
 
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Prepare the info for refit."""
+        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+
+    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+        """Async version of prepare_refit_info."""
+        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+
     def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights from IPC handles by delegating to the vLLM Worker implementation.
 
@@ -928,9 +1052,37 @@ class VllmGenerationWorker:
                     "update_weights_from_ipc_handles cannot be used with async_engine=True. Use update_weights_from_ipc_handles_async instead."
                 )
 
-            result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(ipc_handles,)
-            )
+            if self.tensor_parallel_size == 1:
+                # UniProcExecutor
+                assert len(self.vllm_device_ids) == 1
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_local_ipc_handles",
+                    args=(ipc_handles[self.vllm_device_ids[0]],),
+                )
+            else:
+                """
+                DO NOT USE VLLM's collective_rpc: This code causes duplicate IPC data transfer across Ray workers,
+                leading to unnecessary network serialization overhead and potential performance degradation.
+
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_global_ipc_handles", args=(ipc_handles,)
+                )
+                """
+                ray_worker_outputs = []
+                # MultiProcExecutor
+                for worker, device_id in zip(
+                    self.llm.llm_engine.model_executor.workers, self.vllm_device_ids
+                ):
+                    ray_worker_outputs.append(
+                        worker.execute_method.remote(
+                            "update_weights_from_local_ipc_handles",
+                            ipc_handles[device_id],
+                        )
+                    )
+
+                # Gather the results
+                result_or_coro = ray.get(ray_worker_outputs)
+
             worker_result = result_or_coro[0]
 
             if not worker_result:
@@ -967,8 +1119,9 @@ class VllmGenerationWorker:
                     "update_weights_from_ipc_handles_async can only be used with async_engine=True. Use update_weights_from_ipc_handles instead."
                 )
 
+            # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_ipc_handles", args=(ipc_handles,)
+                "update_weights_from_global_ipc_handles", args=(ipc_handles,)
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -991,7 +1144,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    def update_weights_from_collective(self, info: dict[str, Any]) -> bool:
+    def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -1004,7 +1157,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=(info,)
+                "update_weights_from_collective", args=tuple()
             )
             worker_result = result_or_coro[0]
 
@@ -1021,7 +1174,7 @@ class VllmGenerationWorker:
             traceback.print_exc()
             return False
 
-    async def update_weights_from_collective_async(self, info: dict[str, Any]) -> bool:
+    async def update_weights_from_collective_async(self) -> bool:
         """Async version of update_weights_from_collective."""
         try:
             assert self.llm is not None, (
@@ -1034,7 +1187,7 @@ class VllmGenerationWorker:
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=(info,)
+                "update_weights_from_collective", args=tuple()
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1210,18 +1363,33 @@ class VllmGeneration(GenerationInterface):
             "tensor_parallel"
         ) * self.sharding_annotations.get_axis_size("pipeline_parallel")
 
+        # non-colocated needs to use PACK strategy to avoid uneven node_bundles
+        # e.g. assuming we use 3 nodes with 8GPUs, 2 nodes for train and 1 node for inference.
+        # if we use SPREAD, then the node bundles will be something like 0: [0,3,6] 1: [1,4,7] 2: [2,5], which is not correct.
+        strategy = None if self.cfg["colocated"]["enabled"] else "PACK"
+
         # Determine if we need cross-node model parallelism
         needs_cross_node_parallelism = (
             self.model_parallel_size > cluster.num_gpus_per_node
         )
 
         # Initialize placement groups with the appropriate mode
-        cluster._init_placement_groups(use_unified_pg=needs_cross_node_parallelism)
+        cluster._init_placement_groups(
+            strategy=strategy,
+            use_unified_pg=needs_cross_node_parallelism,
+        )
 
         # Create worker builder for VllmGenerationWorker
         worker_builder = RayWorkerBuilder(
             "nemo_rl.models.generation.vllm.VllmGenerationWorker", config
         )
+
+        # It's necessary to set env_vars here to ensure that vllm non-leader workers also have these env_vars
+        # Explicitly set NCCL_CUMEM_ENABLE to 1 to avoid the P2P initialization error for PyNCCLCommunicator.
+        # See https://github.com/NVIDIA-NeMo/RL/issues/564 for more details.
+        env_vars = {}
+        if not self.cfg["colocated"]["enabled"]:
+            env_vars["NCCL_CUMEM_ENABLE"] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
@@ -1234,6 +1402,7 @@ class VllmGeneration(GenerationInterface):
                 name_prefix=name_prefix,
                 bundle_indices_list=node_bundle_indices,
                 sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars,
             )
         else:
             # Use standard worker group creation for non-parallel case
@@ -1243,7 +1412,12 @@ class VllmGeneration(GenerationInterface):
                 name_prefix=name_prefix,
                 workers_per_node=workers_per_node,
                 sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars,
             )
+
+        # Call some collective rpc functions in VllmGenerationWorker when initializing the vLLM engine
+        # This is necessary for async engine to work
+        self._post_init()
 
         # Number of data parallel groups is the number of tied worker groups
         self.dp_size = self.worker_group.dp_size
@@ -1256,7 +1430,7 @@ class VllmGeneration(GenerationInterface):
 
     def _get_tied_worker_bundle_indices(
         self, cluster: RayVirtualCluster
-    ) -> List[Tuple[int, List[int]]]:
+    ) -> list[tuple[int, list[int]]]:
         """Calculate bundle indices for tensor and pipeline parallel workers.
 
         Handles both unified placement groups (for cross-node model parallelism) and
@@ -1279,7 +1453,7 @@ class VllmGeneration(GenerationInterface):
 
             def get_node_bundles(
                 pg: PlacementGroup,
-            ) -> Dict[str, List[int]]:
+            ) -> dict[str, list[int]]:
                 # Retrieve mapping from node ID to bundle indices from a placement group.
                 try:
                     pg_table = ray.util.placement_group_table(pg)
@@ -1289,7 +1463,7 @@ class VllmGeneration(GenerationInterface):
                         "Failed to retrieve bundle/node mapping from placement group"
                     ) from e
 
-                node_bundles: Dict[str, List[int]] = defaultdict(list)
+                node_bundles: dict[str, list[int]] = defaultdict(list)
                 for bundle_idx, node_id in bundle_to_node.items():
                     node_bundles[node_id].append(bundle_idx)
                 for bundles in node_bundles.values():
@@ -1298,7 +1472,7 @@ class VllmGeneration(GenerationInterface):
 
             def allocate_worker_groups(
                 pg: PlacementGroup, tp_size: int, pp_size: int
-            ) -> List[Tuple[int, List[int]]]:
+            ) -> list[tuple[int, list[int]]]:
                 # Allocate worker groups for TP and PP training, assuming all nodes have identical bundle counts.
 
                 # Retrieve both bundle mapping and per-node bundles
@@ -1328,12 +1502,12 @@ class VllmGeneration(GenerationInterface):
                 node_idx = {nid: idx for idx, nid in enumerate(sorted_nodes)}
 
                 # Flatten bundles in node order
-                flat: List[int] = []
+                flat: list[int] = []
                 for nid in sorted_nodes:
                     flat.extend(node_bundles[nid])
 
                 # Slice into groups and assign logical index
-                groups: List[Tuple[int, List[int]]] = []
+                groups: list[tuple[int, list[int]]] = []
                 for i in range(num_groups):
                     slice_ = flat[
                         i * model_parallel_size : (i + 1) * model_parallel_size
@@ -1376,6 +1550,19 @@ class VllmGeneration(GenerationInterface):
             "report_device_id_async"
             if self.cfg["vllm_cfg"]["async_engine"]
             else "report_device_id"
+        )
+        # Use run_all_workers_single_data for methods that don't need data
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"]
+        )
+        # Wait for all futures to complete
+        results = ray.get(futures)
+        return results
+
+    def _post_init(self):
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
         )
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
@@ -1475,6 +1662,12 @@ class VllmGeneration(GenerationInterface):
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
 
+        # Check if async engine is enabled
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
+            )
+
         # Shard the data across the tied worker groups
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
@@ -1507,28 +1700,35 @@ class VllmGeneration(GenerationInterface):
 
         return combined
 
-    async def generate_async(
-        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    async def _async_generate_base(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        method_name: str,
+        data_validation_fn,
+        greedy: bool = False,
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
-        """Generate responses asynchronously, yielding individual samples as they complete.
+        """Base async generation method that handles common worker management logic.
 
-        This method provides per-sample streaming across all workers, yielding each
-        sample result as soon as it's ready, regardless of which worker processed it.
+        Args:
+            data: Input data for generation
+            method_name: Name of the worker method to call ('generate_async' or 'generate_text_async')
+            data_validation_fn: Function to validate input data
+            greedy: Whether to use greedy decoding
+
+        Yields:
+            Tuple of (original_index, BatchedDataDict containing generation result)
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             raise RuntimeError(
-                "generate_async can only be used when async_engine is enabled in VllmConfig."
+                f"{method_name} can only be used when async_engine is enabled in vLLM config."
             )
 
         assert isinstance(data, BatchedDataDict), (
             f"data must be a BatchedDataDict, got type: {type(data)}"
         )
-        assert "input_ids" in data and "input_lengths" in data, (
-            "input_ids and input_lengths are required in data for vLLM generation"
-        )
 
-        # Handle empty input case
-        if len(data["input_ids"]) == 0:
+        # Validate input data and handle empty case
+        if not data_validation_fn(data):
             return
 
         # Determine the leader worker for the current data parallel shard
@@ -1536,9 +1736,9 @@ class VllmGeneration(GenerationInterface):
             self.current_generate_dp_shard_idx
         )
 
-        # Run the generate_async method on the selected leader worker. This returns an ObjectRefGenerator.
+        # Run the async method on the selected leader worker
         worker_gen_proxy = self.worker_group.run_single_worker_single_data(
-            method_name="generate_async",
+            method_name=method_name,
             worker_idx=leader_worker_idx,
             data=data,
             greedy=greedy,
@@ -1622,6 +1822,52 @@ class VllmGeneration(GenerationInterface):
             f"Worker task {leader_worker_idx} should be done but isn't"
         )
 
+    async def generate_text_async(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate text responses asynchronously, yielding results as they are ready.
+
+        Args:
+            data: BatchedDataDict containing prompts with text strings
+            greedy: Whether to use greedy decoding instead of sampling
+
+        Yields:
+            Tuple of (original_index, BatchedDataDict containing single text response)
+        """
+
+        def validate_text_data(data):
+            if len(data["prompts"]) == 0:
+                return False  # Return False for empty case to trigger early return
+            return True
+
+        async for result in self._async_generate_base(
+            data, "generate_text_async", validate_text_data, greedy
+        ):
+            yield result
+
+    async def generate_async(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate responses asynchronously, yielding individual samples as they complete.
+
+        This method provides per-sample streaming across all workers, yielding each
+        sample result as soon as it's ready, regardless of which worker processed it.
+        """
+
+        def validate_generate_data(data):
+            if "input_ids" not in data or "input_lengths" not in data:
+                raise AssertionError(
+                    "input_ids and input_lengths are required in data for vLLM generation"
+                )
+            if len(data["input_ids"]) == 0:
+                return False  # Return False for empty case to trigger early return
+            return True
+
+        async for result in self._async_generate_base(
+            data, "generate_async", validate_generate_data, greedy
+        ):
+            yield result
+
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
         # non-colocated no need to wake up
@@ -1682,7 +1928,26 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during policy shutdown: {e}")
             return False
 
-    def update_weights(self, ipc_handles: dict[str, Any]) -> bool:
+    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+        """Prepare the info for refit."""
+        # Choose the appropriate method based on async_engine setting
+        method_name = (
+            "prepare_refit_info_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "prepare_refit_info"
+        )
+
+        # Use run_all_workers_single_data to send data to all workers
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            state_dict_info=state_dict_info,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+
+        # Wait for all futures to complete
+        ray.get(futures)
+
+    def update_weights_from_ipc_handles(self, ipc_handles: dict[str, Any]) -> bool:
         """Update weights of the policy using IPC handles, considering tensor parallelism.
 
         For tp > 1, only the leader in each tensor parallel tied worker group will update weights.
@@ -1726,9 +1991,7 @@ class VllmGeneration(GenerationInterface):
             print(f"Error during update weights: {e}")
             return False
 
-    def update_weights_from_collective(
-        self, info: dict[str, Any]
-    ) -> list[ray.ObjectRef]:
+    def update_weights_from_collective(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using collective communication."""
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
@@ -1740,10 +2003,9 @@ class VllmGeneration(GenerationInterface):
             else "update_weights_from_collective"
         )
 
-        # Use run_all_workers_single_data to send data to all workers
+        # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
-            info=info,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 

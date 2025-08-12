@@ -560,7 +560,7 @@ def dynamic_sampling(
 
         generation_sample_buffer_size = repeated_batch.size
         train_prompts_size = (
-            master_config["policy"]["num_prompts_per_step"]
+            master_config["grpo"]["num_prompts_per_step"]
             * master_config["grpo"]["num_generations_per_prompt"]
         )
 

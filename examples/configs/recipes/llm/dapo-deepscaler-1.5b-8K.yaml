@@ -1,7 +1,8 @@
 # DAPO Algorithm Configuration
-dapo:
-  num_prompts_per_step: ${mul:${policy.train_global_batch_size}, 3}
-  num_generations_per_prompt: 16
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 8
+  dapo_batch_multiplier: 3 # Multiplier for dataloader batch size calculation (dapo_batch_multiplier × num_prompts_per_step). Following DAPO dynamic sampling, the actual training batch size equals num_prompts_per_step × num_generations_per_prompt.
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_steps: 100
   normalize_rewards: true
@@ -16,7 +17,7 @@ dapo:
 
 reward_fn:
   enabled: true
-  overlong_buffer_length: 4096
+  overlong_buffer_length: 2048 
   overlong_buffer_penalty: 1.0
   max_response_length: ${policy.max_total_sequence_length}
 
@@ -47,7 +48,7 @@ policy:
   train_micro_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
   logprob_batch_size: 4
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 10240 # 8192 + overlong_buffer_length
   precision: "bfloat16"
 
   dtensor_cfg:

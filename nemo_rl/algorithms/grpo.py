@@ -184,10 +184,15 @@ def setup(
     # ==========================
     #           Data
     # ==========================
+    train_batch_size = (
+        grpo_config["num_prompts_per_step"]
+        * grpo_config.get("dapo_batch_multiplier", 1)
+        if grpo_config["use_dynamic_sampling"]
+        else grpo_config["num_prompts_per_step"]
+    )
     dataloader = StatefulDataLoader(
         dataset,
-        batch_size=grpo_config["num_prompts_per_step"]
-        * grpo_config.get("dapo_batch_multiplier", 1),
+        batch_size=train_batch_size,
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
@@ -487,6 +492,7 @@ def dynamic_sampling(
     baseline: torch.Tensor,
     num_gen_batches: int,
     master_config: MasterConfig,
+    timer: Timer,
     batch_cache: BatchedDataDict[DatumSpec] = None,
 ) -> BatchedDataDict[DatumSpec]:
     """Implements the dynamic sampling algorithm to select prompts with non-zero standard deviation.
@@ -518,67 +524,77 @@ def dynamic_sampling(
     # is_batch_complete is used to indicate if the current batch was able to generate enough prompts with non-zero std.
     is_batch_complete = True
 
-    # Store the baseline and std for the current batch.
+    # Store the baseline, std and total_reward for the current unfiltered batch.
     repeated_batch["baseline"] = baseline
     repeated_batch["std"] = std
-
+    total_rewards = repeated_batch["total_reward"]
     # Dynamic sampling algorithm (used in DAPO algorithm)
     # This block implements dynamic sampling by selecting prompt groups with non-zero std.
     # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until max_num_gen_batches is reached.
     if master_config["grpo"]["use_dynamic_sampling"]:
-        # split std into chunks of size num_generations_per_prompt (prompt groups)
-        std_chunks_per_prompt = std.split(
-            master_config["grpo"]["num_generations_per_prompt"]
-        )
-        keep_prompt_indices = []
-        selected_std_chunks = []
-        for chunk_idx, chunk in enumerate(std_chunks_per_prompt):
-            chunk_length = chunk.shape[0]
-            if torch.nonzero(chunk).shape[0] == chunk_length:
-                chunk_prompt_indices = [
-                    chunk_idx * chunk_length + idx for idx in range(chunk_length)
-                ]
-                keep_prompt_indices.extend(chunk_prompt_indices)
-                selected_std_chunks.append(chunk)
-
-        # Only select the inputs that have non-zero std
-        # total_reward is already a part of repeated_batch so we don't need to add it again
-        repeated_batch = repeated_batch.select_indices(keep_prompt_indices)
-        repeated_batch["std"] = std[keep_prompt_indices]
-        repeated_batch["baseline"] = baseline[keep_prompt_indices]
-        # If none of the prompts in current batch have non-zero std, repeated_batch.size will be 0.
-        # In this case, the current batch will be ignored and the next batch will be processed and we generate responses for it.
-        if repeated_batch.size > 0:
-            # Concatenate the previous partially filled batch with the current batch. This serves as a cache to store and collect the prompts with non-zero std.
-            # This is used in the next iteration when the current batch is not enough to fill the buffer.
-            batch_cache = (
-                repeated_batch
-                if batch_cache is None
-                else BatchedDataDict.from_batches([batch_cache, repeated_batch])
+        with timer.time("dynamic_sampling"):
+            # split std into chunks of size num_generations_per_prompt (prompt groups)
+            std_chunks_per_prompt = std.split(
+                master_config["grpo"]["num_generations_per_prompt"]
             )
-            repeated_batch = batch_cache
+            keep_prompt_indices = []
+            selected_std_chunks = []
+            for chunk_idx, chunk in enumerate(std_chunks_per_prompt):
+                chunk_length = chunk.shape[0]
+                if torch.nonzero(chunk).shape[0] == chunk_length:
+                    chunk_prompt_indices = [
+                        chunk_idx * chunk_length + idx for idx in range(chunk_length)
+                    ]
+                    keep_prompt_indices.extend(chunk_prompt_indices)
+                    selected_std_chunks.append(chunk)
 
-        generation_sample_buffer_size = repeated_batch.size
-        train_prompts_size = (
-            master_config["grpo"]["num_prompts_per_step"]
-            * master_config["grpo"]["num_generations_per_prompt"]
-        )
+            # Only select the inputs that have non-zero std
+            # total_reward is already a part of repeated_batch so we don't need to add it again
+            repeated_batch = repeated_batch.select_indices(keep_prompt_indices)
+            repeated_batch["std"] = std[keep_prompt_indices]
+            repeated_batch["baseline"] = baseline[keep_prompt_indices]
 
-        # If the generation samples size is smaller than a fixed threshold (train_prompts_size), keep generating by processing the next batch
-        if generation_sample_buffer_size < train_prompts_size:
-            max_num_gen_batches = master_config["grpo"].get("max_num_gen_batches", 0)
-            if max_num_gen_batches <= 0 or num_gen_batches <= max_num_gen_batches:
-                print(
-                    f"Generation sample buffer size: {generation_sample_buffer_size} is smaller than train_prompts_size: {train_prompts_size}. Processed {num_gen_batches} batches so far out of {max_num_gen_batches}."
+            # Store filtered and total rewards to track them separately
+            filtered_rewards = repeated_batch["total_reward"]
+            repeated_batch["total_reward"] = total_rewards
+            repeated_batch["filtered_reward"] = filtered_rewards
+
+            # Store the total_reward for the current filtered batch.
+            # If none of the prompts in current batch have non-zero std, repeated_batch.size will be 0.
+            # In this case, the current batch will be ignored and the next batch will be processed and we generate responses for it.
+            if repeated_batch.size > 0:
+                # Concatenate the previous partially filled batch with the current batch. This serves as a cache to store and collect the prompts with non-zero std.
+                # This is used in the next iteration when the current batch is not enough to fill the buffer.
+                batch_cache = (
+                    repeated_batch
+                    if batch_cache is None
+                    else BatchedDataDict.from_batches([batch_cache, repeated_batch])
                 )
-                is_batch_complete = False
+                repeated_batch = batch_cache
+
+            generation_sample_buffer_size = repeated_batch.size
+            train_prompts_size = (
+                master_config["grpo"]["num_prompts_per_step"]
+                * master_config["grpo"]["num_generations_per_prompt"]
+            )
+
+            # If the generation samples size is smaller than a fixed threshold (train_prompts_size), keep generating by processing the next batch
+            if generation_sample_buffer_size < train_prompts_size:
+                max_num_gen_batches = master_config["grpo"].get(
+                    "max_num_gen_batches", 0
+                )
+                if max_num_gen_batches <= 0 or num_gen_batches <= max_num_gen_batches:
+                    print(
+                        f"Generation sample buffer size: {generation_sample_buffer_size} is smaller than train_prompts_size: {train_prompts_size}. Processed {num_gen_batches} batches so far out of {max_num_gen_batches}."
+                    )
+                    is_batch_complete = False
+                else:
+                    raise ValueError(
+                        f"Dynamic sampling has reached the maximum allowed number of batches ({max_num_gen_batches}). Consider evaluating the complexity of your data or adjusting the num_prompts_per_step or num_generations_per_prompt parameters to enhance the diversity of the samples."
+                    )
             else:
-                raise ValueError(
-                    f"Dynamic sampling has reached the maximum allowed number of batches ({max_num_gen_batches}). Consider evaluating the complexity of your data or adjusting the num_prompts_per_step or num_generations_per_prompt parameters to enhance the diversity of the samples."
-                )
-        else:
-            #  Slice the batch, rewards, baselines and std to ensure batch size is train_prompts_size
-            repeated_batch = repeated_batch.slice(0, train_prompts_size)
+                #  Slice the batch, rewards, baselines and std to ensure batch size is train_prompts_size
+                repeated_batch = repeated_batch.slice(0, train_prompts_size)
 
     return repeated_batch, is_batch_complete, batch_cache
 
@@ -735,10 +751,15 @@ def grpo_train(
                     baseline,
                     num_gen_batches,
                     master_config,
+                    timer,
                     batch_cache,
                 )
                 # Get the updated rewards and baselines. For DAPO, these rewards and baselines only correspond to the prompts with non-zero std.
-                rewards = repeated_batch["total_reward"]
+                rewards = (
+                    repeated_batch["total_reward"]
+                    if not master_config["grpo"]["use_dynamic_sampling"]
+                    else repeated_batch["filtered_reward"]
+                )
                 baseline = repeated_batch["baseline"]
                 std = repeated_batch["std"]
 
@@ -910,25 +931,34 @@ def grpo_train(
         # Logging
         # Log training data
         log_data = {"content": flat_messages["content"]}
-        log_data["rewards"] = rewards.tolist()
         log_data["generation_logprobs"] = train_data["generation_logprobs"].tolist()
         log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
         log_data["input_lengths"] = input_lengths.tolist()
-        logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
-
         metrics = {
             "loss": train_results["loss"].numpy(),
-            "reward": rewards.numpy(),
             "grad_norm": train_results["grad_norm"].numpy(),
             "mean_prompt_length": repeated_batch["length"].numpy(),
             "total_num_tokens": input_lengths.numpy(),
         }
+        # Store filtered and total rewards to track them separately in the case of dynamic sampling
+        if master_config["grpo"]["use_dynamic_sampling"]:
+            log_data["filtered_rewards"] = rewards.tolist()
+            log_data["rewards"] = repeated_batch["total_reward"].tolist()
+            metrics["reward"] = repeated_batch["total_reward"].numpy()
+            metrics["filtered_reward"] = rewards.numpy()
+        else:
+            log_data["rewards"] = rewards.tolist()
+            metrics["reward"] = rewards.numpy()
+
+        logger.log_batched_dict_as_jsonl(log_data, f"train_data_step{step}.jsonl")
+
         metrics.update(train_results["all_mb_metrics"])
         for k, v in metrics.items():
             if k in {
                 "lr",
                 "wd",
                 "reward",
+                "filtered_reward",
                 "global_valid_seqs",
                 "global_valid_toks",
                 "mean_prompt_length",
@@ -957,7 +987,13 @@ def grpo_train(
         print("\n📊 Training Results:")
 
         print(f"  • Loss: {metrics['loss']:.4f}")
-        print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
+        if master_config["grpo"]["use_dynamic_sampling"]:
+            print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
+            print(
+                f"  • Avg Total Reward: {np.mean(repeated_batch['total_reward'].numpy()):.4f}"
+            )
+        else:
+            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
         print(
             f"  • Mean Generation Length: {rollout_metrics['mean_gen_tokens_per_sample']:.4f}"
         )

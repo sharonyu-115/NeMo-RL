@@ -29,7 +29,10 @@ from nemo_rl.algorithms.loss_functions import (
     ClippedPGLossDataDict,
     ClippedPGLossFn,
 )
-from nemo_rl.algorithms.reward_functions import RewardConfig, process_rewards
+from nemo_rl.algorithms.reward_functions import (
+    RewardShapingConfig,
+    apply_reward_shaping,
+)
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset, rl_collate_fn
@@ -86,6 +89,7 @@ class GRPOConfig(TypedDict):
     val_at_start: bool
     max_val_samples: int
     seed: int
+    reward_shaping: RewardShapingConfig
     dapo_batch_multiplier: NotRequired[int]
 
 
@@ -112,7 +116,6 @@ class GRPOLoggerConfig(LoggerConfig):
 class MasterConfig(TypedDict):
     policy: PolicyConfig
     loss_fn: ClippedPGLossConfig
-    reward_fn: RewardConfig
     env: dict[str, Any]
     data: DataConfig
     grpo: GRPOConfig
@@ -768,9 +771,9 @@ def grpo_train(
                     continue
 
                 # Process rewards with custom reward function
-                if master_config["reward_fn"]["enabled"]:
-                    rewards = process_rewards(
-                        repeated_batch, rewards, master_config["reward_fn"]
+                if master_config["grpo"]["reward_shaping"]["enabled"]:
+                    rewards = apply_reward_shaping(
+                        repeated_batch, rewards, master_config["grpo"]["reward_shaping"]
                     )
 
                 advantages = (rewards - baseline).unsqueeze(-1)

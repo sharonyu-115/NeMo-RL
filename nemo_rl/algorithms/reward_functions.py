@@ -20,7 +20,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
 
-class RewardConfig(TypedDict):
+class RewardShapingConfig(TypedDict):
     """Configuration for reward function processing.
 
     This configuration enables custom reward shaping, currently supporting DAPO-style
@@ -33,8 +33,8 @@ class RewardConfig(TypedDict):
     max_response_length: int
 
 
-def process_rewards(
-    batch: BatchedDataDict, rewards: torch.Tensor, cfg: RewardConfig
+def apply_reward_shaping(
+    batch: BatchedDataDict, rewards: torch.Tensor, cfg: RewardShapingConfig
 ) -> torch.Tensor:
     """Process rewards by applying penalties for responses exceeding max_response_length. Currently, this function only supports DAPO reward shaping as illustrated in the DAPO paper : https://arxiv.org/pdf/2503.14476.
 

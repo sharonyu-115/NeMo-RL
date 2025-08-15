@@ -4,12 +4,12 @@ grpo:
   num_generations_per_prompt: 16
   dapo_batch_multiplier: 3 # Multiplier for dataloader batch size calculation (dapo_batch_multiplier × num_prompts_per_step). Following DAPO dynamic sampling, the actual training batch size equals num_prompts_per_step × num_generations_per_prompt.
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
-  max_num_steps: 100
+  max_num_steps: 1000
   normalize_rewards: true
   use_leave_one_out_baseline: true
   val_period: 10
   val_at_start: false
-  max_val_samples: 480
+  max_val_samples: 960 # AIME 2024 validation set has 30 samples and we repeat it 32 times to report avg@32 score
   val_batch_size: 32
   seed: 42
   use_dynamic_sampling: true

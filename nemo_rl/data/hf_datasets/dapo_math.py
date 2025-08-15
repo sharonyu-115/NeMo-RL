@@ -40,7 +40,7 @@ def format_dapo_math_17k(
 
 
 def prepare_dapo_math_17k_dataset(
-    seed: int = 42, repititions: int = 16
+    seed: int = 42, repititions: int = 32
 ) -> dict[str, Dataset | None]:
     """Load and split the DeepScaler dataset into train and test sets."""
     # Load the original dataset for training
@@ -58,7 +58,6 @@ def prepare_dapo_math_17k_dataset(
     )
     val_formatted = val_ds.map(format_math, remove_columns=val_ds.column_names)
 
-    # Compute accuracy 16 times per sample (matching the DeepScaleR evaluation setting)
     # DAPO paper repeats the AIME validation set 32 times and reports avg@32 score
     val_repeated = []
     for _ in range(repititions):

@@ -90,6 +90,7 @@ class GRPOConfig(TypedDict):
     max_val_samples: int
     seed: int
     reward_shaping: RewardShapingConfig
+    reward_scaling: NotRequired[dict[str, float]]
     dapo_batch_multiplier: NotRequired[int]
 
 
@@ -729,7 +730,20 @@ def grpo_train(
                         max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                         greedy=False,
                     )
+
                 policy_generation.finish_generation()
+
+            # For math environments, correct answers get a reward of 1.0 and incorrect answers get a reward of 0.0.
+            # We scale the rewards according to the reward_scaling config.
+            if master_config["grpo"]["reward_scaling"] is not None:
+                rewards = repeated_batch["total_reward"]
+                rewards[rewards == 1.0] = master_config["grpo"]["reward_scaling"][
+                    "correct"
+                ]
+                rewards[rewards == 0.0] = master_config["grpo"]["reward_scaling"][
+                    "incorrect"
+                ]
+                repeated_batch["total_reward"] = rewards
 
             # Calculate rewards & advantages
             print("▶ Processing rewards...")

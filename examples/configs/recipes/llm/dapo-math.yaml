@@ -14,6 +14,9 @@ grpo:
   seed: 42
   use_dynamic_sampling: true
   max_num_gen_batches: 10
+  reward_scaling:
+    correct: 1.0
+    incorrect: -1.0
   reward_shaping:
     enabled: false
     overlong_buffer_length: 4096 

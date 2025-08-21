@@ -15,13 +15,14 @@ grpo:
   use_dynamic_sampling: true
   max_num_gen_batches: 10
   reward_scaling:
+    enabled: true
     correct: 1.0
     incorrect: -1.0
   reward_shaping:
-    enabled: false
-    overlong_buffer_length: 4096 
+    enabled: true
+    overlong_buffer_length: 4096
     overlong_buffer_penalty: 1.0
-    max_response_length: ${policy.max_total_sequence_length}
+    max_response_length: 20480 # 16384 + overlong_buffer_length. This is the maximum number of tokens that the model can generate.
 
 loss_fn:
   reference_policy_kl_penalty: 0.0
@@ -50,7 +51,7 @@ policy:
   train_micro_batch_size: 1
   generation_batch_size: 32 # Only used when generating using HF backend
   logprob_batch_size: 4
-  max_total_sequence_length: 20480
+  max_total_sequence_length: 22528 # 16384 + overlong_buffer_length + max_input_seq_length 
   precision: "bfloat16"
 
   dtensor_cfg:
@@ -99,7 +100,7 @@ policy:
 
   generation:
     backend: "vllm"
-    max_new_tokens: ${policy.max_total_sequence_length}
+    max_new_tokens: 20480 # 16384 + overlong_buffer_length. This is the number of tokens that vLLM generates
     temperature: 1.0
     top_p: 1.0
     top_k: null
@@ -111,7 +112,7 @@ policy:
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
       gpu_memory_utilization: 0.6
-      max_model_len: ${policy.max_total_sequence_length}
+      max_model_len: ${policy.max_total_sequence_length} # This is same as max_total_sequence_length
       enforce_eager: True
     colocated:
       # true: generation shares training GPUs
@@ -123,8 +124,8 @@ policy:
         num_nodes: null # Decides number of nodes to be dedicated to generation
 
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
-  prompt_file: "examples/prompts/cot.txt"
+  max_input_seq_length: 2048 # DAPO paper has max input_prompt length of 2048
+  prompt_file: null
   system_prompt_file: null
   dataset_name: "DAPOMath17K"
   shuffle: true

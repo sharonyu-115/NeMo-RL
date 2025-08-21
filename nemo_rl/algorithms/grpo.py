@@ -735,7 +735,7 @@ def grpo_train(
 
             # For math environments, correct answers get a reward of 1.0 and incorrect answers get a reward of 0.0.
             # We scale the rewards according to the reward_scaling config.
-            if master_config["grpo"]["reward_scaling"] is not None:
+            if master_config["grpo"]["reward_scaling"]["enabled"]:
                 rewards = repeated_batch["total_reward"]
                 rewards[rewards == 1.0] = master_config["grpo"]["reward_scaling"][
                     "correct"

@@ -6,7 +6,7 @@ grpo:
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_steps: 1000
   normalize_rewards: true
-  use_leave_one_out_baseline: true
+  use_leave_one_out_baseline: false
   val_period: 10
   val_at_start: false
   max_val_samples: 960 # AIME 2024 validation set has 30 samples and we repeat it 32 times to report avg@32 score

@@ -82,7 +82,9 @@ def hf_data_processor(
     message_log: LLMMessageLogType = []
     user_message = {
         "role": "user",
-        "content": task_data_spec.prompt.format(problem),
+        "content": task_data_spec.prompt.format(problem)
+        if task_data_spec.prompt
+        else problem,
     }
     message: list[str] = tokenizer.apply_chat_template(  # type: ignore
         [user_message],

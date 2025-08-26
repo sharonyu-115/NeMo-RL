@@ -495,6 +495,7 @@ def refit_policy_generation(
 
 def dynamic_sampling(
     repeated_batch: BatchedDataDict[DatumSpec],
+    prompts: torch.Tensor,
     std: torch.Tensor,
     baseline: torch.Tensor,
     num_gen_batches: int,
@@ -540,26 +541,42 @@ def dynamic_sampling(
     # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until max_num_gen_batches is reached.
     if master_config["grpo"]["use_dynamic_sampling"]:
         with timer.time("dynamic_sampling"):
-            # split std into chunks of size num_generations_per_prompt (prompt groups)
-            std_chunks_per_prompt = std.split(
-                master_config["grpo"]["num_generations_per_prompt"]
-            )
-            keep_prompt_indices = []
-            selected_std_chunks = []
-            for chunk_idx, chunk in enumerate(std_chunks_per_prompt):
-                chunk_length = chunk.shape[0]
-                if torch.nonzero(chunk).shape[0] == chunk_length:
-                    chunk_prompt_indices = [
-                        chunk_idx * chunk_length + idx for idx in range(chunk_length)
-                    ]
-                    keep_prompt_indices.extend(chunk_prompt_indices)
-                    selected_std_chunks.append(chunk)
+            # Approach 1: Get the prompt indices with non-zero std
+            keep_prompt_indices_approach1 = []
+            unique_prompts = torch.unique(prompts, dim=0)
+            device_ordinal = std.get_device()
+            if device_ordinal == -1:
+                device = torch.device("cpu")
+            else:
+                device = torch.device(device)
+            for i in range(len(unique_prompts)):
+                is_matching_prompt = (prompts == unique_prompts[i]).all(1)
+                matched_prompt_indices = torch.arange(len(prompts), device=device)[
+                    is_matching_prompt
+                ]
+                prompt_group_std = std[matched_prompt_indices]
+                if (
+                    prompt_group_std[prompt_group_std != 0.0].shape[0]
+                    == prompt_group_std.shape[0]
+                ):
+                    keep_prompt_indices_approach1.extend(
+                        matched_prompt_indices.tolist()
+                    )
+
+            # Approach 2: Get the prompt indices with non-zero std
+            keep_prompt_indices_approach2 = []
+            non_zero_std_indices = std != 0.0
+            keep_prompt_indices_approach2 = torch.arange(
+                len(non_zero_std_indices), device=device
+            )[non_zero_std_indices].tolist()
 
             # Only select the inputs that have non-zero std
             # total_reward is already a part of repeated_batch so we don't need to add it again
-            repeated_batch = repeated_batch.select_indices(keep_prompt_indices)
-            repeated_batch["std"] = std[keep_prompt_indices]
-            repeated_batch["baseline"] = baseline[keep_prompt_indices]
+            repeated_batch = repeated_batch.select_indices(
+                keep_prompt_indices_approach2
+            )
+            repeated_batch["std"] = std[keep_prompt_indices_approach2]
+            repeated_batch["baseline"] = baseline[keep_prompt_indices_approach2]
 
             # Store filtered and total rewards to track them separately
             filtered_rewards = repeated_batch["total_reward"]
@@ -768,6 +785,7 @@ def grpo_train(
                 # Apply dynamic sampling to filter prompts with non-zero std (DAPO algorithm)
                 repeated_batch, is_batch_complete, batch_cache = dynamic_sampling(
                     repeated_batch,
+                    input_ids,
                     std,
                     baseline,
                     num_gen_batches,

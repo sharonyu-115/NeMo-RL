@@ -10,7 +10,7 @@ grpo:
   val_period: 10
   val_at_start: false
   max_val_samples: 960 # AIME 2024 validation set has 30 samples and we repeat it 32 times to report avg@32 score
-  val_batch_size: 32
+  val_batch_size: 960 # Set it to high or max value for faster validation
   seed: 42
   use_dynamic_sampling: true
   max_num_gen_batches: 10

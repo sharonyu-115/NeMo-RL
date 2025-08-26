@@ -541,42 +541,17 @@ def dynamic_sampling(
     # If sampled prompts (with non-zero std) are fewer than num_prompts_per_step * num_generations_per_prompt, continue sampling until max_num_gen_batches is reached.
     if master_config["grpo"]["use_dynamic_sampling"]:
         with timer.time("dynamic_sampling"):
-            # Approach 1: Get the prompt indices with non-zero std
-            keep_prompt_indices_approach1 = []
-            unique_prompts = torch.unique(prompts, dim=0)
-            device_ordinal = std.get_device()
-            if device_ordinal == -1:
-                device = torch.device("cpu")
-            else:
-                device = torch.device(device)
-            for i in range(len(unique_prompts)):
-                is_matching_prompt = (prompts == unique_prompts[i]).all(1)
-                matched_prompt_indices = torch.arange(len(prompts), device=device)[
-                    is_matching_prompt
-                ]
-                prompt_group_std = std[matched_prompt_indices]
-                if (
-                    prompt_group_std[prompt_group_std != 0.0].shape[0]
-                    == prompt_group_std.shape[0]
-                ):
-                    keep_prompt_indices_approach1.extend(
-                        matched_prompt_indices.tolist()
-                    )
-
-            # Approach 2: Get the prompt indices with non-zero std
-            keep_prompt_indices_approach2 = []
-            non_zero_std_indices = std != 0.0
-            keep_prompt_indices_approach2 = torch.arange(
-                len(non_zero_std_indices), device=device
-            )[non_zero_std_indices].tolist()
+            # Get the prompt indices with non-zero std
+            non_zero_std_mask = std != 0.0
+            keep_prompt_indices = torch.arange(
+                len(non_zero_std_mask), device=std.device
+            )[non_zero_std_mask].tolist()
 
             # Only select the inputs that have non-zero std
             # total_reward is already a part of repeated_batch so we don't need to add it again
-            repeated_batch = repeated_batch.select_indices(
-                keep_prompt_indices_approach2
-            )
-            repeated_batch["std"] = std[keep_prompt_indices_approach2]
-            repeated_batch["baseline"] = baseline[keep_prompt_indices_approach2]
+            repeated_batch = repeated_batch.select_indices(keep_prompt_indices)
+            repeated_batch["std"] = std[keep_prompt_indices]
+            repeated_batch["baseline"] = baseline[keep_prompt_indices]
 
             # Store filtered and total rewards to track them separately
             filtered_rewards = repeated_batch["total_reward"]

@@ -93,14 +93,14 @@ class HFVerifyWorker:
 
         for response, ground_truth in zip(pred_responses, ground_truths):
             try:
-                ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                 with _mute_output():
                     if use_dapo_math_verifier:
                         # This compute_score is from the DAPO Math Verifier from Verl
-                        reward_dict = dapo_math_verify(response, ground_truth_parsable)
+                        reward_dict = dapo_math_verify(response, ground_truth)
                         ret_score = reward_dict["score"]
                         extracted_answer = reward_dict["pred"]
                     else:
+                        ground_truth_parsable = "\\boxed{" + ground_truth + "}"
                         ret_score, extracted_answer = self.verify_func(
                             [ground_truth_parsable], [response]
                         )

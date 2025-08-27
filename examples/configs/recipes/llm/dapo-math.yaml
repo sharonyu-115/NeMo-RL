@@ -133,7 +133,8 @@ data:
 env:
   math:
     num_workers: 16
-
+    use_dapo_math_verifier: true
+    
 logger:
   log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal

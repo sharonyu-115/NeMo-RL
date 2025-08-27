@@ -15,7 +15,7 @@ grpo:
   use_dynamic_sampling: true
   max_num_gen_batches: 10
   reward_scaling:
-    enabled: true
+    enabled: false
     correct: 1.0
     incorrect: -1.0
   reward_shaping:

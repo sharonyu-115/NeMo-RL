@@ -17,7 +17,6 @@ from typing import Any
 
 from datasets import Dataset, load_dataset
 
-from nemo_rl.data.hf_datasets.deepscaler import format_math
 from nemo_rl.data.interfaces import TaskDataSpec
 
 
@@ -54,7 +53,7 @@ def prepare_dapo_math_17k_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     train_formatted = train_ds.map(
         format_dapo_math_17k, remove_columns=train_ds.column_names
     )
-    val_formatted = val_ds.map(format_math, remove_columns=val_ds.column_names)
+    val_formatted = val_ds.map(format_dapo_math_17k, remove_columns=val_ds.column_names)
 
     return {
         "train": train_formatted,

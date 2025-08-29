@@ -603,6 +603,20 @@ def dynamic_sampling(
     return repeated_batch, is_batch_complete, batch_cache
 
 
+def scale_rewards(
+    repeated_batch: BatchedDataDict[DatumSpec], master_config: MasterConfig
+) -> BatchedDataDict[DatumSpec]:
+    """Scale the rewards according to the reward_scaling config."""
+    # For math environments, correct answers get a reward of 1.0 and incorrect answers get a reward of 0.0.
+    # We scale the rewards according to the reward_scaling config.
+    if master_config["grpo"]["reward_scaling"]["enabled"]:
+        rewards = repeated_batch["total_reward"]
+        rewards[rewards == 1.0] = master_config["grpo"]["reward_scaling"]["correct"]
+        rewards[rewards == 0.0] = master_config["grpo"]["reward_scaling"]["incorrect"]
+        repeated_batch["total_reward"] = rewards
+    return repeated_batch
+
+
 def grpo_train(
     policy: ColocatablePolicyInterface,
     policy_generation: Optional[GenerationInterface],
@@ -734,17 +748,7 @@ def grpo_train(
 
                 policy_generation.finish_generation()
 
-            # For math environments, correct answers get a reward of 1.0 and incorrect answers get a reward of 0.0.
-            # We scale the rewards according to the reward_scaling config.
-            if master_config["grpo"]["reward_scaling"]["enabled"]:
-                rewards = repeated_batch["total_reward"]
-                rewards[rewards == 1.0] = master_config["grpo"]["reward_scaling"][
-                    "correct"
-                ]
-                rewards[rewards == 0.0] = master_config["grpo"]["reward_scaling"][
-                    "incorrect"
-                ]
-                repeated_batch["total_reward"] = rewards
+            repeated_batch = scale_rewards(repeated_batch, master_config)
 
             # Calculate rewards & advantages
             print("▶ Processing rewards...")
@@ -1123,6 +1127,8 @@ def validate(
                     max_rollout_turns=master_config["grpo"]["max_rollout_turns"],
                     greedy=False,
                 )
+
+            val_batch = scale_rewards(val_batch, master_config)
             rewards = val_batch["total_reward"]
 
             total_rewards.extend(rewards.tolist())
@@ -1147,9 +1153,8 @@ def validate(
                 rs_cfg.get("correct", 1.0) if rs_cfg.get("enabled", False) else 1.0
             )
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            accuracy = float(
-                ((rewards_t == float(correct_value)).float().mean()).item()
-            )
+            correct_value = torch.tensor(correct_value, dtype=torch.float32)
+            accuracy = (rewards_t == correct_value).float().mean().item()
         else:
             accuracy = 0.0
 
@@ -1161,7 +1166,6 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
-
         # Print sample conversations only once at the end of validation
         try:
             print_message_log_samples(

@@ -39,15 +39,13 @@ def format_dapo_math_17k(
     }
 
 
-def prepare_dapo_math_17k_dataset(
-    seed: int = 42, repititions: int = 32
-) -> dict[str, Dataset | None]:
+def prepare_dapo_math_17k_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     """Load and split the DeepScaler dataset into train and test sets."""
     # Load the original dataset for training
     train_ds = load_dataset("BytedTsinghua-SIA/DAPO-Math-17k", split="train")
 
     # Load hendrydong/aime24 dataset for validation
-    val_ds = load_dataset("HuggingFaceH4/aime_2024", split="train")
+    val_ds = load_dataset("BytedTsinghua-SIA/AIME-2024", split="train")
 
     # Shuffle the training dataset with the specified seed
     train_ds = train_ds.shuffle(seed=seed)
@@ -57,12 +55,6 @@ def prepare_dapo_math_17k_dataset(
         format_dapo_math_17k, remove_columns=train_ds.column_names
     )
     val_formatted = val_ds.map(format_math, remove_columns=val_ds.column_names)
-
-    # DAPO paper repeats the AIME validation set 32 times and reports avg@32 score
-    val_repeated = []
-    for _ in range(repititions):
-        val_repeated.extend(val_formatted)
-    val_formatted = val_formatted.from_list(val_repeated)
 
     return {
         "train": train_formatted,

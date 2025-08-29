@@ -1139,8 +1139,23 @@ def validate(
             all_message_logs.extend(to_env)
 
         # Calculate validation metrics
-        accuracy = sum(total_rewards) / len(total_rewards)
-        avg_length = sum(total_lengths) / len(total_lengths)
+        num_samples = len(total_rewards)
+        if num_samples > 0:
+            # Determine which reward value corresponds to a correct answer
+            rs_cfg = master_config["grpo"].get("reward_scaling", {})
+            correct_value = (
+                rs_cfg.get("correct", 1.0) if rs_cfg.get("enabled", False) else 1.0
+            )
+            rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
+            accuracy = float(
+                ((rewards_t == float(correct_value)).float().mean()).item()
+            )
+        else:
+            accuracy = 0.0
+
+        avg_length = (
+            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
+        )
 
         val_metrics = {
             "accuracy": accuracy,

@@ -48,7 +48,7 @@ def last_boxed_only_string(string: str) -> Optional[str]:
 
 
 def remove_boxed(s: str) -> str:
-    """Remove the LaTeX boxed command from a string.
+    r"""Remove the LaTeX boxed command from a string.
 
     Args:
         s: String with format "\\boxed{content}"
@@ -272,7 +272,7 @@ def compute_score(
         solution_str, ground_truth, strict_box_verify, pause_tokens_index
     )
 
-    reward = 1.0 if correct else -1.0
+    reward = 1.0 if correct else 0.0
     acc = correct
 
     return {

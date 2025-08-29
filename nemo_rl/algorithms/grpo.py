@@ -1128,10 +1128,7 @@ def validate(
                     greedy=False,
                 )
 
-            val_batch = scale_rewards(val_batch, master_config)
-            rewards = val_batch["total_reward"]
-
-            total_rewards.extend(rewards.tolist())
+            total_rewards.extend(val_batch["total_reward"].tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
@@ -1147,14 +1144,10 @@ def validate(
         # Calculate validation metrics
         num_samples = len(total_rewards)
         if num_samples > 0:
-            # Determine which reward value corresponds to a correct answer
-            rs_cfg = master_config["grpo"].get("reward_scaling", {})
-            correct_value = (
-                rs_cfg.get("correct", 1.0) if rs_cfg.get("enabled", False) else 1.0
-            )
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            correct_value = torch.tensor(correct_value, dtype=torch.float32)
-            accuracy = (rewards_t == correct_value).float().mean().item()
+            # Unscaled binary reward values range = {0.0, 1.0}
+            correct_response_reward = torch.tensor(1.0, dtype=torch.float32)
+            accuracy = (rewards_t == correct_response_reward).float().mean().item()
         else:
             accuracy = 0.0
 

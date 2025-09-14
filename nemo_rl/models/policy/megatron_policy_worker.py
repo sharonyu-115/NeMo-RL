@@ -1742,6 +1742,9 @@ class MegatronPolicyWorker:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
         """
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(f"[SHARON] GPU Memory before saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
@@ -1799,6 +1802,29 @@ class MegatronPolicyWorker:
 
             if not is_training:  # Restore training state if it was changed
                 self.model.train()
+            
+            torch.randn(1).cuda()  # wake up torch allocator
+            if hasattr(self, "optimizer") and self.optimizer is not None:
+                # Iterate through the state dictionaries for each parameter group
+                if isinstance(self.optimizer, ChainedOptimizer):
+                    optimizer_state = self.optimizer.state
+                else:
+                    optimizer_state = self.optimizer._get_state()
+                for _, state in optimizer_state.items():
+                    # Iterate through the state items (e.g., momentum, variance) for a parameter
+                    for k, v in state.items():
+                        # Check if the item is a tensor and on the GPU
+                        if torch.is_tensor(v) and v.is_cuda:
+                            # Move the tensor to CPU and update the state dictionary
+                            state[k] = v.to("cpu")
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+            reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+            print(f"[SHARON] GPU Memory after saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
 
         except Exception as e:
             print(f"Failed to save checkpoint to {weights_path}: {e}")
@@ -1829,3 +1855,234 @@ class MegatronPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    def compute_kv_scales_with_calibration_data(
+        self, input_ids: list, max_samples: int = 32
+    ) -> dict[str, float]:
+        """
+        Compute KV cache scales using calibration data on Megatron model.
+        
+        This method runs a forward pass through the Megatron model with calibration data
+        to collect K/V tensor statistics and compute appropriate scaling factors for FP8 quantization.
+        
+        Args:
+            input_ids: List of input token IDs for calibration
+            max_samples: Maximum number of samples to use for calibration
+            
+        Returns:
+            Dictionary mapping parameter names to scale values for K/V cache quantization
+        """
+        import torch
+        from collections import defaultdict
+        
+        print(f"[KV_SCALES] MegatronPolicyWorker: Computing KV scales with {len(input_ids)} input samples")
+        
+        # Convert input_ids back to tensor
+        if isinstance(input_ids, list):
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+        
+        # Move to appropriate device
+        device = next(self.model.parameters()).device
+        input_ids = input_ids.to(device)
+        
+        print(f"[KV_SCALES] Input shape: {input_ids.shape}, device: {device}")
+        
+        # Dictionary to store KV observers for each attention layer
+        kv_observers = {}
+        hooks = []
+        
+        def create_attention_hook(layer_name: str):
+            """Create a hook to capture K/V tensors from attention layers."""
+            observer = KVScaleObserver()
+            kv_observers[layer_name] = observer
+            
+            def hook_fn(module, input, output):
+                try:
+                    # For Megatron attention modules, we need to capture K/V projections
+                    # The exact implementation depends on the Megatron attention structure
+                    if hasattr(module, 'key_value') and hasattr(module, 'query'):
+                        # Megatron-style attention with combined key_value projection
+                        hidden_states = input[0] if isinstance(input, tuple) else input
+                        
+                        with torch.no_grad():
+                            # Get K/V from the key_value projection
+                            kv_output = module.key_value(hidden_states)
+                            # Split into K and V (assuming they are concatenated)
+                            if kv_output.shape[-1] % 2 == 0:
+                                split_size = kv_output.shape[-1] // 2
+                                k_tensor = kv_output[..., :split_size]
+                                v_tensor = kv_output[..., split_size:]
+                                observer.observe(k_tensor, v_tensor)
+                    
+                    elif hasattr(module, 'k_proj') and hasattr(module, 'v_proj'):
+                        # HuggingFace-style attention with separate K/V projections
+                        hidden_states = input[0] if isinstance(input, tuple) else input
+                        
+                        with torch.no_grad():
+                            k_tensor = module.k_proj(hidden_states)
+                            v_tensor = module.v_proj(hidden_states)
+                            observer.observe(k_tensor, v_tensor)
+                            
+                except Exception as e:
+                    print(f"[KV_SCALES] Warning: Hook error in {layer_name}: {e}")
+            
+            return hook_fn
+        
+        try:
+            # Register hooks on attention modules
+            print("[KV_SCALES] Registering hooks on attention modules...")
+            attention_modules_found = 0
+            
+            for name, module in self.model.named_modules():
+                # Look for attention modules in Megatron model
+                if ('self_attn' in name or 'attention' in name) and (
+                    hasattr(module, 'key_value') or 
+                    (hasattr(module, 'k_proj') and hasattr(module, 'v_proj'))
+                ):
+                    hook = module.register_forward_hook(create_attention_hook(name))
+                    hooks.append(hook)
+                    attention_modules_found += 1
+                    print(f"[KV_SCALES] Registered hook for: {name}")
+            
+            print(f"[KV_SCALES] Found {attention_modules_found} attention modules")
+            
+            if attention_modules_found == 0:
+                print("[KV_SCALES] Warning: No attention modules found, using default scales")
+                return self._get_default_kv_scales()
+            
+            # Run forward pass with calibration data
+            print("[KV_SCALES] Running forward pass for calibration...")
+            with torch.no_grad():
+                # Limit input size to avoid memory issues
+                if input_ids.shape[0] > max_samples:
+                    input_ids = input_ids[:max_samples]
+                
+                # Run the forward pass
+                try:
+                    _ = self.model(input_ids)
+                except Exception as e:
+                    print(f"[KV_SCALES] Forward pass error: {e}")
+                    print("[KV_SCALES] Falling back to default scales")
+                    return self._get_default_kv_scales()
+            
+            # Compute scales from collected statistics
+            print("[KV_SCALES] Computing scales from collected statistics...")
+            kv_scales = {}
+            
+            for layer_name, observer in kv_observers.items():
+                if observer.k_tensors and observer.v_tensors:
+                    k_scale, v_scale = observer.compute_scales()
+                    
+                    # Extract layer index from name
+                    layer_idx = self._extract_layer_index_from_name(layer_name)
+                    if layer_idx is not None:
+                        k_param_name = f"model.layers.{layer_idx}.self_attn.k_scale"
+                        v_param_name = f"model.layers.{layer_idx}.self_attn.v_scale"
+                        
+                        kv_scales[k_param_name] = k_scale
+                        kv_scales[v_param_name] = v_scale
+                        
+                        print(f"[KV_SCALES] Layer {layer_idx}: k_scale={k_scale:.6f}, v_scale={v_scale:.6f}")
+            
+            if not kv_scales:
+                print("[KV_SCALES] No scales computed, using defaults")
+                return self._get_default_kv_scales()
+            
+            print(f"[KV_SCALES] Successfully computed {len(kv_scales)} KV scales")
+            return kv_scales
+            
+        finally:
+            # Clean up hooks
+            for hook in hooks:
+                hook.remove()
+            print(f"[KV_SCALES] Cleaned up {len(hooks)} hooks")
+    
+    def _extract_layer_index_from_name(self, layer_name: str) -> int:
+        """Extract layer index from Megatron layer name."""
+        import re
+        # Try different patterns for Megatron layer naming
+        patterns = [
+            r'layers\.(\d+)\.',  # Standard: layers.0.
+            r'layer_(\d+)\.',    # Alternative: layer_0.
+            r'\.(\d+)\.',        # Generic: .0.
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, layer_name)
+            if match:
+                return int(match.group(1))
+        
+        return None
+    
+    def _get_default_kv_scales(self) -> dict[str, float]:
+        """Generate default KV scales when computation fails."""
+        default_k_scale = 0.1
+        default_v_scale = 0.1
+        
+        # Try to get number of layers from model config
+        num_layers = 36  # Default for Qwen3-8B
+        if hasattr(self.model, 'config') and hasattr(self.model.config, 'num_hidden_layers'):
+            num_layers = self.model.config.num_hidden_layers
+        elif hasattr(self.model, 'config') and hasattr(self.model.config, 'num_layers'):
+            num_layers = self.model.config.num_layers
+        
+        kv_scales = {}
+        for layer_idx in range(num_layers):
+            k_param_name = f"model.layers.{layer_idx}.self_attn.k_scale"
+            v_param_name = f"model.layers.{layer_idx}.self_attn.v_scale"
+            
+            kv_scales[k_param_name] = default_k_scale
+            kv_scales[v_param_name] = default_v_scale
+        
+        print(f"[KV_SCALES] Generated {len(kv_scales)} default KV scales for {num_layers} layers")
+        return kv_scales
+
+
+# Import the KVScaleObserver class for use in the worker
+class KVScaleObserver:
+    """
+    Observer for collecting K/V tensor statistics during calibration.
+    
+    This class captures K/V tensors during forward passes and computes
+    appropriate scaling factors for FP8 quantization.
+    """
+    
+    def __init__(self, symmetric: bool = True, num_bits: int = 8):
+        self.symmetric = symmetric
+        self.num_bits = num_bits
+        self.k_tensors = []
+        self.v_tensors = []
+        
+        # vLLM-style constants for scale computation
+        self.K_SCALE_CONSTANT = 200.0
+        self.V_SCALE_CONSTANT = 100.0
+    
+    def observe(self, k_tensor: torch.Tensor, v_tensor: torch.Tensor):
+        """Collect K/V tensor statistics."""
+        with torch.no_grad():
+            self.k_tensors.append(k_tensor.detach())
+            self.v_tensors.append(v_tensor.detach())
+    
+    def compute_scales(self) -> tuple[float, float]:
+        """Compute K/V scales based on collected statistics."""
+        if not self.k_tensors or not self.v_tensors:
+            return 0.1, 0.1  # Conservative fallback
+        
+        # Compute max absolute values across all collected tensors
+        k_max = max(torch.abs(tensor).max().item() for tensor in self.k_tensors)
+        v_max = max(torch.abs(tensor).max().item() for tensor in self.v_tensors)
+        
+        # Apply vLLM-style scaling
+        k_scale = k_max / self.K_SCALE_CONSTANT
+        v_scale = v_max / self.V_SCALE_CONSTANT
+        
+        # Ensure minimum scale to avoid numerical issues
+        k_scale = max(k_scale, 1e-6)
+        v_scale = max(v_scale, 1e-6)
+        
+        return k_scale, v_scale
+    
+    def reset(self):
+        """Reset collected statistics."""
+        self.k_tensors.clear()
+        self.v_tensors.clear()

@@ -240,6 +240,9 @@ def _parallelize_qwen(
             "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
             "model.layers.*.self_attn.q_norm": Qwen3QKNorm(),
             "model.layers.*.self_attn.k_norm": Qwen3QKNorm(),
+            # FP8 quantization scaling factors - these are scalar parameters, replicate across all devices
+            "model.layers.*.self_attn.k_scale": RowwiseParallel(input_layouts=Replicate()),
+            "model.layers.*.self_attn.v_scale": RowwiseParallel(input_layouts=Replicate()),
             "model.layers.*.post_attention_layernorm": SequenceParallel(),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
@@ -258,11 +261,14 @@ def _parallelize_qwen(
             "model.layers.*.self_attn.k_proj": ColwiseParallel(),
             "model.layers.*.self_attn.v_proj": ColwiseParallel(),
             "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+            # FP8 quantization scaling factors - replicate across all devices
+            "model.layers.*.self_attn.k_scale": RowwiseParallel(input_layouts=Replicate()),
+            "model.layers.*.self_attn.v_scale": RowwiseParallel(input_layouts=Replicate()),
             "model.layers.*.mlp.up_proj": ColwiseParallel(),
             "model.layers.*.mlp.gate_proj": ColwiseParallel(),
             "model.layers.*.mlp.down_proj": RowwiseParallel(),
         }
-
+    print(f"base_model_tp_plan: {base_model_tp_plan}")
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 

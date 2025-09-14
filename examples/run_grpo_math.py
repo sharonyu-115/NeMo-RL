@@ -42,6 +42,7 @@ from nemo_rl.environments.math_environment import MathEnvironment
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config, parse_hydra_overrides
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.data.hf_datasets.dapo import DAPODataset
 
 OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
 
@@ -147,6 +148,9 @@ def setup_data(
             "Loading agentica-org/DeepScaleR-Preview-Dataset for training and validation"
         )
         data: Any = DeepScalerDataset(seed=seed)
+    elif data_config["dataset_name"] == "DAPO":
+        print("Loading DAPO for training and validation")
+        data: Any = DAPODataset(seed=seed)
     else:
         raise ValueError(f"No processor for dataset {data_config['dataset_name']}.")
 

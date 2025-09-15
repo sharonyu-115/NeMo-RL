@@ -502,6 +502,73 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         # Only get the first worker's info since all workers will have the same result
         return results[0]
 
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        save_path: Optional[str] = None,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """触发各 Megatron worker 的 KV-cache FP8 scale 标定，并返回结果。
+
+        说明：后端 `MegatronPolicyWorker.calibrate_qkv_fp8_scales` 已实现分布式规约，
+        返回的是跨 rank 合并后的结果。因此这里按 DP 分片输入并并行调用，最终取第一个
+        worker 的返回即可。
+        """
+        dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        # 仅分 DP 维度；对于动态/打包模式，沿用现有分片逻辑
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "calibrate_qkv_fp8_scales",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "micro_batch_size": micro_batch_size,
+                "percentile": percentile,
+                "margin": margin,
+                "save_path": save_path,
+                "include_q": include_q,
+            },
+        )
+        results = self.worker_group.get_all_worker_results(futures)
+        # 由于后端已在分布式内合并，这里返回任一结果均一致
+        return results[0]
+
     def prepare_weights_for_ipc(
         self, _refit_buffer_size_gb: Optional[int] = None
     ) -> list[list[str]]:

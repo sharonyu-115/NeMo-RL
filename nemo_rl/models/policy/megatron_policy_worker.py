@@ -1900,8 +1900,8 @@ class MegatronPolicyWorker:
         hook_handles = []
 
         def _extract_layer_key(module_name: str) -> str:
-            # 期望形如 "decoder.layers.<idx>.self_attention.query_key_value"
-            m = re.search(r"decoder\\.layers\\.(\\d+)", module_name)
+            # 期望形如 "module.decoder.layers.<idx>.self_attention.query_key_value"
+            m = re.search(r"module\.decoder\.layers\.(\d+)", module_name)
             if m is not None:
                 return f"layer_{m.group(1)}"
             return module_name
@@ -1922,19 +1922,48 @@ class MegatronPolicyWorker:
                     layer_to_samples_q[layer_key].append(float(torch.amax(torch.abs(q)).item()))
                     layer_to_samples_k[layer_key].append(float(torch.amax(torch.abs(k)).item()))
                     layer_to_samples_v[layer_key].append(float(torch.amax(torch.abs(v)).item()))
-                except Exception:
+                except Exception as e:
+                    print(f"[ALEXQ] Error extracting layer key: {e}")
                     pass
 
             return _hook
 
-        # 注册 hook：匹配模块名中包含 query_key_value 的线性层
+        # 注册 hook：兼容多种命名（query_key_value / linear_qkv / qkv）
+        qkv_name_patterns = ("query_key_value", "linear_qkv", ".qkv", "_qkv")
+        matched_modules = []
         for name, module in self.model.named_modules():
-            if "query_key_value" in name:
+            if any(pat in name for pat in qkv_name_patterns):
                 try:
                     handle = module.register_forward_hook(_hook_builder(name))
                     hook_handles.append(handle)
-                except Exception:
+                    matched_modules.append((name, module.__class__.__name__))
+                except Exception as e:
+                    print(f"[ALEXQ] Error registering hook on {name}: {e}")
                     continue
+
+        if not hook_handles:
+            print("[ALEXQ] No QKV proj modules matched for hook. Example module/param names:")
+            try:
+                # 打印前若干个模块与参数名，帮助定位实际命名
+                cnt = 0
+                for n, _m in self.model.named_modules():
+                    if cnt >= 10:
+                        break
+                    print(f"    [module] {n}")
+                    cnt += 1
+                cnt = 0
+                for n, _p in self.model.named_parameters():
+                    if cnt >= 10:
+                        break
+                    print(f"    [param]  {n}")
+                    cnt += 1
+            except Exception:
+                pass
+        else:
+            # 轻量打印匹配到的前几个模块，确认命中
+            print("[ALEXQ] Registered QKV hooks on modules (showing up to 8):")
+            for i, (mn, cls) in enumerate(matched_modules[:8]):
+                print(f"    {i:02d}: {mn}  <{cls}>")
 
         # 运行一次推理流程以触发 hooks（重用 get_logprobs 的前向路径）
         try:
@@ -1943,7 +1972,8 @@ class MegatronPolicyWorker:
             for h in hook_handles:
                 try:
                     h.remove()
-                except Exception:
+                except Exception as e:
+                    print(f"[ALEXQ] Error removing hook: {e}")
                     pass
 
         # 计算本地分位 amax
@@ -1987,8 +2017,8 @@ class MegatronPolicyWorker:
             if include_q:
                 q_scale = (vals.get("q_amax_p", 0.0) * margin) / FP8_MAX_E4M3
                 out_entry["q_scale"] = float(q_scale)
-            k_scale = (vals.get("k_amax_p", 0.0) * margin) / FP8_MAX_E5M2
-            v_scale = (vals.get("v_amax_p", 0.0) * margin) / FP8_MAX_E5M2
+            k_scale = (vals.get("k_amax_p", 0.0) * margin) / FP8_MAX_E4M3
+            v_scale = (vals.get("v_amax_p", 0.0) * margin) / FP8_MAX_E4M3
             out_entry["k_scale"] = float(k_scale)
             out_entry["v_scale"] = float(v_scale)
             result_layers[layer_key] = out_entry
@@ -1999,6 +2029,7 @@ class MegatronPolicyWorker:
             "margin": margin,
             "layers": result_layers,
         }
+        print(f"[ALEXQ] Calibrated KV cache scales: {final_result}")
 
         # 将结果在所有 rank 同步（广播 rank0 的结果）
         if world_size > 1:

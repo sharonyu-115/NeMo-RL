@@ -766,9 +766,35 @@ def grpo_train(
                     # Compute KV scales if needed for FP8 quantization
                     if sync_kv_scales and kv_scales_cache is None:
                         print("[KV_SCALES] Computing KV cache scales for the first time...")
-                        kv_scales_cache = compute_kv_scales_with_data(
-                            policy, repeated_batch, master_config
+                        # kv_scales_cache = compute_kv_scales_with_data(
+                        #     policy, repeated_batch, master_config
+                        # )
+                        kv_scales_cache = {}
+
+                        # Create calibration data from flattened messages
+                        calibration_data = BatchedDataDict[ClippedPGLossDataDict](
+                            {
+                                "input_ids": batched_flat["token_ids"],
+                                "input_lengths": input_lengths,
+                                # "advantages": batched_flat["advantages"],
+                                # "generation_logprobs": batched_flat["generation_logprobs"],
+                                # "token_mask": batched_flat["token_loss_mask"],
+                                # "sample_mask": batched_flat["loss_multiplier"],
+                            }
                         )
+                        # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                        calibration_data.update(batched_flat.get_multimodal_dict(as_tensors=False))
+                        calibration_data.to("cpu")
+                        kv_scales = policy.calibrate_qkv_fp8_scales(calibration_data, include_q=True)["layers"]
+                        for k, v in kv_scales.items():
+                            layer_idx = k.split("_")[1]
+                            k_param_name = f"model.layers.{layer_idx}.self_attn.k_scale"
+                            v_param_name = f"model.layers.{layer_idx}.self_attn.v_scale"
+                            q_param_name = f"model.layers.{layer_idx}.self_attn.attn.q_scale"
+                            
+                            kv_scales_cache[q_param_name] = v["q_scale"]
+                            kv_scales_cache[k_param_name] = v["k_scale"]
+                            kv_scales_cache[v_param_name] = v["v_scale"]
                     
                     refit_policy_generation(
                         policy, policy_generation, colocated_inference, timer=timer,
@@ -902,9 +928,19 @@ def grpo_train(
             # Recompute KV scales after policy training if needed
             if sync_kv_scales:
                 print("[KV_SCALES] Recomputing KV cache scales after policy update...")
-                kv_scales_cache = compute_kv_scales_with_data(
-                    policy, repeated_batch, master_config
-                )
+                # kv_scales_cache = compute_kv_scales_with_data(
+                #     policy, repeated_batch, master_config
+                # )
+                kv_scales = policy.calibrate_qkv_fp8_scales(train_data, include_q=True)["layers"]
+                for k, v in kv_scales.items():
+                    layer_idx = k.split("_")[1]
+                    k_param_name = f"model.layers.{layer_idx}.self_attn.k_scale"
+                    v_param_name = f"model.layers.{layer_idx}.self_attn.v_scale"
+                    q_param_name = f"model.layers.{layer_idx}.self_attn.attn.q_scale"
+                    
+                    kv_scales_cache[q_param_name] = v["q_scale"]
+                    kv_scales_cache[k_param_name] = v["k_scale"]
+                    kv_scales_cache[v_param_name] = v["v_scale"]
                 # Set generation as stale to force refit with new scales
                 POLICY_GENERATION_STALE = True
 

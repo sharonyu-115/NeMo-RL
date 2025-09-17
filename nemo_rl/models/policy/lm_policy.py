@@ -174,8 +174,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         if config["sequence_packing"]["enabled"]:
             self.use_sequence_packing = True
             self.sequence_packing_args: SequencePackingArgs = {
-                "train_mb_tokens": config["sequence_packing"]["train_mb_tokens"],
-                "logprob_mb_tokens": config["sequence_packing"]["logprob_mb_tokens"],
                 "algorithm": config["sequence_packing"]["algorithm"],
                 "input_key": "input_ids",
                 "input_lengths_key": "input_lengths",
@@ -406,10 +404,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         if self.flops_tracker is not None:
             aggregated_results["total_flops"] = self.flops_tracker.total_flops
-            aggregated_results["num_ranks"] = len(results)
+            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+            gpus_per_worker = self.worker_group.cluster.world_size() / len(results)
 
             try:
-                aggregated_results["theoretical_tflops"] = sum(
+                aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
                     get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
                     for r in results
                 )

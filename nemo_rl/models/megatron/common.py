@@ -16,6 +16,7 @@ from typing import Any, Iterator, Optional
 
 import torch
 import torch.distributed as dist
+from megatron.bridge.training.state import GlobalState
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -26,7 +27,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
 )
 from megatron.training.utils import get_ltor_masks_and_position_ids
-from nemo.tron.state import GlobalState
 
 from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -333,7 +333,13 @@ def forward_step_arbitrary_loss(
         else:
             input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
-                input_ids, 0, False, False, False
+                data=input_ids,
+                eod_token=0,  # used for loss_mask, which we don't use
+                pad_token=0,  # used for loss_mask, which we don't use
+                reset_position_ids=False,
+                reset_attention_mask=False,
+                eod_mask_loss=False,
+                pad_mask_loss=False,
             )
 
     with straggler_timer:

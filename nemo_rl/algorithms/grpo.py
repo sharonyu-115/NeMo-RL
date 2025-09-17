@@ -749,6 +749,11 @@ def grpo_train(
                 policy_generation.finish_generation()
 
             repeated_batch = scale_rewards(repeated_batch, master_config)
+            # Process rewards with custom reward function
+            if master_config["grpo"]["reward_shaping"]["enabled"]:
+                repeated_batch = apply_reward_shaping(
+                    repeated_batch, master_config["grpo"]["reward_shaping"]
+                )
 
             # Calculate rewards & advantages
             print("▶ Processing rewards...")
@@ -789,12 +794,6 @@ def grpo_train(
                 # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                 if not is_batch_complete:
                     continue
-
-                # Process rewards with custom reward function
-                if master_config["grpo"]["reward_shaping"]["enabled"]:
-                    rewards = apply_reward_shaping(
-                        repeated_batch, rewards, master_config["grpo"]["reward_shaping"]
-                    )
 
                 advantages = (rewards - baseline).unsqueeze(-1)
 

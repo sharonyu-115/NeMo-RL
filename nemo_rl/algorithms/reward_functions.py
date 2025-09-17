@@ -34,14 +34,15 @@ class RewardShapingConfig(TypedDict):
 
 
 def apply_reward_shaping(
-    batch: BatchedDataDict, rewards: torch.Tensor, cfg: RewardShapingConfig
-) -> torch.Tensor:
+    batch: BatchedDataDict, cfg: RewardShapingConfig
+) -> BatchedDataDict:
     """Process rewards by applying penalties for responses exceeding max_response_length. Currently, this function only supports DAPO reward shaping as illustrated in the DAPO paper : https://arxiv.org/pdf/2503.14476.
 
     Nonetheless, it can be potentially extended to support any custom reward logic.
     """
+    rewards = batch["total_reward"]
     if not cfg["enabled"]:
-        return rewards
+        return batch
 
     # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.
     if (
@@ -68,7 +69,15 @@ def apply_reward_shaping(
     updated_rewards = torch.zeros_like(rewards)
     for i, message_log in enumerate(batch["message_log"]):
         # Get the assistant response length (index 1 is the assistant response)
-        message_response_length = message_log[1]["token_ids"].shape[0]
+        message_response_length = None
+        for message in message_log:
+            if message["role"] == "assistant":
+                message_response_length = message["token_ids"].shape[0]
+                break
+        assert message_response_length is not None, (
+            "Assistant response not found during reward shaping"
+        )
+
         # Calculate the exceed length and the corresponding reward penalty
         exceed_length = message_response_length - expected_response_length
         overlong_reward = min(
@@ -76,4 +85,7 @@ def apply_reward_shaping(
         )
         updated_rewards[i] = rewards[i] + overlong_reward
 
-    return updated_rewards
+    # Update the rewards in the batch
+    batch["total_reward"] = updated_rewards
+
+    return batch

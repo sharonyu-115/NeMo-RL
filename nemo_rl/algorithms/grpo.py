@@ -766,6 +766,7 @@ def grpo_train(
                     # Compute KV scales if needed for FP8 quantization
                     if sync_kv_scales and kv_scales_cache is None:
                         print("[KV_SCALES] Computing KV cache scales for the first time...")
+                        policy.prepare_for_lp_inference()
                         # kv_scales_cache = compute_kv_scales_with_data(
                         #     policy, repeated_batch, master_config
                         # )

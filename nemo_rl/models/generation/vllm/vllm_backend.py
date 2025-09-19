@@ -13,7 +13,7 @@
 # limitations under the License.
 from collections import defaultdict
 from typing import Any, Optional
-
+import traceback
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
@@ -208,6 +208,7 @@ class VllmInternalWorkerExtension:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_ipc_handles: {e}"
             )
+            print(traceback.format_exc())
             return False
 
     @wrap_with_nvtx_name(

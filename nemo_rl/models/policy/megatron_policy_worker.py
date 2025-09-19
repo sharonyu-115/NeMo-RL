@@ -1928,18 +1928,54 @@ class MegatronPolicyWorker:
 
             return _hook
 
-        # 注册 hook：兼容多种命名（query_key_value / linear_qkv / qkv）
-        qkv_name_patterns = ("query_key_value", "linear_qkv", ".qkv", "_qkv")
-        matched_modules = []
-        for name, module in self.model.named_modules():
-            if any(pat in name for pat in qkv_name_patterns):
+        # 新增：优先在 core_attention 的 forward_pre 上挂 hook，以捕获已做完 q/k norm 与 RoPE 的 q/k/v
+        def _pre_hook_builder_core_attention(module_name: str):
+            layer_key = _extract_layer_key(module_name)
+
+            def _pre_hook(module, inputs):
                 try:
-                    handle = module.register_forward_hook(_hook_builder(name))
-                    hook_handles.append(handle)
-                    matched_modules.append((name, module.__class__.__name__))
+                    args = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
+                    if len(args) == 1 and isinstance(args[0], (tuple, list)):
+                        args = args[0]
+                    # 期望前 3 个为 q, k, v（Megatron CoreAttention 的典型签名）
+                    q = args[0]
+                    k = args[1]
+                    v = args[2]
+                    if include_q:
+                        layer_to_samples_q[layer_key].append(float(torch.amax(torch.abs(q)).item()))
+                    layer_to_samples_k[layer_key].append(float(torch.amax(torch.abs(k)).item()))
+                    layer_to_samples_v[layer_key].append(float(torch.amax(torch.abs(v)).item()))
                 except Exception as e:
-                    print(f"[ALEXQ] Error registering hook on {name}: {e}")
+                    print(f"[ALEXQ] Error in core_attention pre-hook on {module_name}: {e}")
+                    pass
+
+            return _pre_hook
+
+        matched_modules = []
+        # 1) 优先尝试在 core_attention 上注册 forward_pre_hook
+        for name, module in self.model.named_modules():
+            print(f"[ALEXQ] Module name: {name}")
+            if "self_attention.core_attention" in name:
+                try:
+                    handle = module.register_forward_pre_hook(_pre_hook_builder_core_attention(name))
+                    hook_handles.append(handle)
+                    matched_modules.append((name, module.__class__.__name__, "pre"))
+                except Exception as e:
+                    print(f"[ALEXQ] Error registering pre-hook on {name}: {e}")
                     continue
+
+        # 2) 若未命中 core_attention，则退回到原先在 QKV 投影输出上的 forward_hook
+        if not hook_handles:
+            qkv_name_patterns = ("query_key_value", "linear_qkv", ".qkv", "_qkv")
+            for name, module in self.model.named_modules():
+                if any(pat in name for pat in qkv_name_patterns):
+                    try:
+                        handle = module.register_forward_hook(_hook_builder(name))
+                        hook_handles.append(handle)
+                        matched_modules.append((name, module.__class__.__name__, "post"))
+                    except Exception as e:
+                        print(f"[ALEXQ] Error registering hook on {name}: {e}")
+                        continue
 
         if not hook_handles:
             print("[ALEXQ] No QKV proj modules matched for hook. Example module/param names:")
@@ -1961,9 +1997,9 @@ class MegatronPolicyWorker:
                 pass
         else:
             # 轻量打印匹配到的前几个模块，确认命中
-            print("[ALEXQ] Registered QKV hooks on modules (showing up to 8):")
-            for i, (mn, cls) in enumerate(matched_modules[:8]):
-                print(f"    {i:02d}: {mn}  <{cls}>")
+            print("[ALEXQ] Registered hooks on modules (showing up to 8):")
+            for i, (mn, cls, kind) in enumerate(matched_modules[:8]):
+                print(f"    {i:02d}: {mn}  <{cls}>  [{kind}]")
 
         # 运行一次推理流程以触发 hooks（重用 get_logprobs 的前向路径）
         try:

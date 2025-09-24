@@ -16,6 +16,8 @@ import os
 import time
 import warnings
 from collections import defaultdict
+import json
+import re
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, Optional, TypeVar
@@ -1846,6 +1848,9 @@ class MegatronPolicyWorker:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
         """
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(f"[SHARON] GPU Memory before saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
@@ -1906,6 +1911,29 @@ class MegatronPolicyWorker:
 
             if not is_training:  # Restore training state if it was changed
                 self.model.train()
+            
+            torch.randn(1).cuda()  # wake up torch allocator
+            if hasattr(self, "optimizer") and self.optimizer is not None:
+                # Iterate through the state dictionaries for each parameter group
+                if isinstance(self.optimizer, ChainedOptimizer):
+                    optimizer_state = self.optimizer.state
+                else:
+                    optimizer_state = self.optimizer._get_state()
+                for _, state in optimizer_state.items():
+                    # Iterate through the state items (e.g., momentum, variance) for a parameter
+                    for k, v in state.items():
+                        # Check if the item is a tensor and on the GPU
+                        if torch.is_tensor(v) and v.is_cuda:
+                            # Move the tensor to CPU and update the state dictionary
+                            state[k] = v.to("cpu")
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+            reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+            print(f"[SHARON] GPU Memory after saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
 
         except Exception as e:
             print(f"Failed to save checkpoint to {weights_path}: {e}")
@@ -1936,3 +1964,233 @@ class MegatronPolicyWorker:
     def stop_gpu_profiling(self) -> None:
         """Stop GPU profiling."""
         torch.cuda.profiler.stop()
+
+    @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        save_path: Optional[str] = None,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """One-shot 标定 Q/K/V 的激活 scale（用于 FP8 KV cache）。
+
+        - 通过 forward hook 捕获每层 `query_key_value` 的输出，分割 Q/K/V，并统计分位 amax。
+        - 在并行（DP/TP/PP）环境下，先本地统计分位，再对所有 rank 取最大值以保证保守性。
+        - 默认仅返回并保存 K/V 的 scale（E5M2），可选返回 Q（E4M3）。
+
+        Args:
+            data: 用于标定的一小批代表性样本，遵循 get_logprobs 的输入约定。
+            micro_batch_size: 标定时的 micro batch 大小；若 None 则复用 logprob_batch_size。
+            percentile: amax 的分位数（如 99.9）。
+            margin: 余量系数，例如 1.05。
+            save_path: 若提供，则 rank0 会将结果保存为 JSON。
+            include_q: 是否也返回 Q 的 scale（一般只需 K/V）。
+
+        Returns:
+            { "format": "fp8", "percentile": float, "margin": float,
+              "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
+        """
+        # FP8 动态范围（对称）
+        FP8_MAX_E4M3 = 448.0
+        FP8_MAX_E5M2 = 57344.0
+
+        self.model.eval()
+
+        # 记录每层的 q/k/v 的局部分位 amax
+        layer_to_samples_q: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_k: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_v: dict[str, list[float]] = defaultdict(list)
+        hook_handles = []
+
+        def _extract_layer_key(module_name: str) -> str:
+            # 期望形如 "module.decoder.layers.<idx>.self_attention.query_key_value"
+            m = re.search(r"module\.decoder\.layers\.(\d+)", module_name)
+            if m is not None:
+                return f"layer_{m.group(1)}"
+            return module_name
+
+        def _hook_builder(module_name: str):
+            layer_key = _extract_layer_key(module_name)
+
+            def _hook(module, inputs, output):
+                out = output[0] if isinstance(output, (tuple, list)) else output
+                try:
+                    last_dim = out.shape[-1]
+                    assert last_dim % 3 == 0
+                    qkv_stride = last_dim // 3
+                    q = out[..., :qkv_stride]
+                    k = out[..., qkv_stride : 2 * qkv_stride]
+                    v = out[..., 2 * qkv_stride : 3 * qkv_stride]
+                    # per-tensor 绝对最大值（局部）
+                    layer_to_samples_q[layer_key].append(float(torch.amax(torch.abs(q)).item()))
+                    layer_to_samples_k[layer_key].append(float(torch.amax(torch.abs(k)).item()))
+                    layer_to_samples_v[layer_key].append(float(torch.amax(torch.abs(v)).item()))
+                except Exception as e:
+                    print(f"[ALEXQ] Error extracting layer key: {e}")
+                    pass
+
+            return _hook
+
+        # 新增：优先在 core_attention 的 forward_pre 上挂 hook，以捕获已做完 q/k norm 与 RoPE 的 q/k/v
+        def _pre_hook_builder_core_attention(module_name: str):
+            layer_key = _extract_layer_key(module_name)
+
+            def _pre_hook(module, inputs):
+                try:
+                    args = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
+                    if len(args) == 1 and isinstance(args[0], (tuple, list)):
+                        args = args[0]
+                    # 期望前 3 个为 q, k, v（Megatron CoreAttention 的典型签名）
+                    q = args[0]
+                    k = args[1]
+                    v = args[2]
+                    if include_q:
+                        layer_to_samples_q[layer_key].append(float(torch.amax(torch.abs(q)).item()))
+                    layer_to_samples_k[layer_key].append(float(torch.amax(torch.abs(k)).item()))
+                    layer_to_samples_v[layer_key].append(float(torch.amax(torch.abs(v)).item()))
+                except Exception as e:
+                    print(f"[ALEXQ] Error in core_attention pre-hook on {module_name}: {e}")
+                    pass
+
+            return _pre_hook
+
+        matched_modules = []
+        # 1) 优先尝试在 core_attention 上注册 forward_pre_hook
+        for name, module in self.model.named_modules():
+            print(f"[ALEXQ] Module name: {name}")
+            if "self_attention.core_attention" in name:
+                try:
+                    handle = module.register_forward_pre_hook(_pre_hook_builder_core_attention(name))
+                    hook_handles.append(handle)
+                    matched_modules.append((name, module.__class__.__name__, "pre"))
+                except Exception as e:
+                    print(f"[ALEXQ] Error registering pre-hook on {name}: {e}")
+                    continue
+
+        # 2) 若未命中 core_attention，则退回到原先在 QKV 投影输出上的 forward_hook
+        if not hook_handles:
+            qkv_name_patterns = ("query_key_value", "linear_qkv", ".qkv", "_qkv")
+            for name, module in self.model.named_modules():
+                if any(pat in name for pat in qkv_name_patterns):
+                    try:
+                        handle = module.register_forward_hook(_hook_builder(name))
+                        hook_handles.append(handle)
+                        matched_modules.append((name, module.__class__.__name__, "post"))
+                    except Exception as e:
+                        print(f"[ALEXQ] Error registering hook on {name}: {e}")
+                        continue
+
+        if not hook_handles:
+            print("[ALEXQ] No QKV proj modules matched for hook. Example module/param names:")
+            try:
+                # 打印前若干个模块与参数名，帮助定位实际命名
+                cnt = 0
+                for n, _m in self.model.named_modules():
+                    if cnt >= 10:
+                        break
+                    print(f"    [module] {n}")
+                    cnt += 1
+                cnt = 0
+                for n, _p in self.model.named_parameters():
+                    if cnt >= 10:
+                        break
+                    print(f"    [param]  {n}")
+                    cnt += 1
+            except Exception:
+                pass
+        else:
+            # 轻量打印匹配到的前几个模块，确认命中
+            print("[ALEXQ] Registered hooks on modules (showing up to 8):")
+            for i, (mn, cls, kind) in enumerate(matched_modules[:8]):
+                print(f"    {i:02d}: {mn}  <{cls}>  [{kind}]")
+
+        # 运行一次推理流程以触发 hooks（重用 get_logprobs 的前向路径）
+        try:
+            _ = self.get_logprobs(data=data, micro_batch_size=micro_batch_size)
+        finally:
+            for h in hook_handles:
+                try:
+                    h.remove()
+                except Exception as e:
+                    print(f"[ALEXQ] Error removing hook: {e}")
+                    pass
+
+        # 计算本地分位 amax
+        def _percentile(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            t = torch.tensor(sorted(values), device="cuda", dtype=torch.float32)
+            rank = max(0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1)))))
+            return float(t[rank].item())
+
+        local_layer_to_pamax = {}
+        for layer_key in set(list(layer_to_samples_k.keys()) + list(layer_to_samples_v.keys()) + (list(layer_to_samples_q.keys()) if include_q else [])):
+            entry = {}
+            if include_q:
+                entry["q_amax_p"] = _percentile(layer_to_samples_q.get(layer_key, []), percentile)
+            entry["k_amax_p"] = _percentile(layer_to_samples_k.get(layer_key, []), percentile)
+            entry["v_amax_p"] = _percentile(layer_to_samples_v.get(layer_key, []), percentile)
+            local_layer_to_pamax[layer_key] = entry
+
+        # 合并所有 rank：对分位 amax 取最大（保守）
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        gathered = [None for _ in range(world_size)] if world_size > 1 else None
+        if world_size > 1:
+            torch.distributed.all_gather_object(gathered, local_layer_to_pamax)
+            merged = defaultdict(dict)
+            for d in gathered:  # type: ignore
+                if d is None:
+                    continue
+                for k, v in d.items():
+                    dst = merged[k]
+                    for kk, vv in v.items():
+                        dst[kk] = max(dst.get(kk, 0.0), float(vv))
+            layer_to_pamax = dict(merged)
+        else:
+            layer_to_pamax = local_layer_to_pamax
+
+        # 计算 scale（对称量化）：scale = pamax / fp8_max
+        result_layers = {}
+        for layer_key, vals in layer_to_pamax.items():
+            out_entry = {}
+            if include_q:
+                q_scale = (vals.get("q_amax_p", 0.0) * margin) / FP8_MAX_E4M3
+                out_entry["q_scale"] = float(q_scale)
+            k_scale = (vals.get("k_amax_p", 0.0) * margin) / FP8_MAX_E4M3
+            v_scale = (vals.get("v_amax_p", 0.0) * margin) / FP8_MAX_E4M3
+            out_entry["k_scale"] = float(k_scale)
+            out_entry["v_scale"] = float(v_scale)
+            result_layers[layer_key] = out_entry
+
+        final_result = {
+            "format": "fp8",
+            "percentile": percentile,
+            "margin": margin,
+            "layers": result_layers,
+        }
+        print(f"[ALEXQ] Calibrated KV cache scales: {final_result}")
+
+        # 将结果在所有 rank 同步（广播 rank0 的结果）
+        if world_size > 1:
+            if torch.distributed.get_rank() == 0:
+                obj_list = [final_result]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]
+            else:
+                obj_list = [None]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]  # type: ignore
+
+        # 可选保存至 JSON（仅 rank0）
+        if save_path is not None and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            try:
+                with open(save_path, "w") as f:
+                    json.dump(final_result, f)
+            except Exception:
+                pass
+
+        return final_result

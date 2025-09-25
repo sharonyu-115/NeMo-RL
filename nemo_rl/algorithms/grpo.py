@@ -730,47 +730,47 @@ def grpo_train(
                     )
                     input_ids = batched_flat["token_ids"]
 
-            # Generate responses - this updates the LLMMessageLogType in repeated_batch
-            print(
-                f"▶ Generating responses for batch of size {repeated_batch.size}...",
-                flush=True,
-            )
-            with timer.time("prepare_for_generation"):
-                if NEED_REFIT and POLICY_GENERATION_STALE:
-                    # Compute KV scales if needed for FP8 quantization
-                    if sync_kv_scales and kv_scales_cache is None:
-                        print("[KV_SCALES] Computing KV cache scales for the first time...")
-                        policy.prepare_for_lp_inference()
-                        kv_scales_cache = {}
-                        # Create calibration data from flattened messages
-                        calibration_data = BatchedDataDict[ClippedPGLossDataDict](
-                            {
-                                "input_ids": batched_flat["token_ids"],
-                                "input_lengths": input_lengths
-                            }
+                # Generate responses - this updates the LLMMessageLogType in repeated_batch
+                print(
+                    f"▶ Generating responses for batch of size {repeated_batch.size}...",
+                    flush=True,
+                )
+                with timer.time("prepare_for_generation"):
+                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                        # Compute KV scales if needed for FP8 quantization
+                        if sync_kv_scales and kv_scales_cache is None:
+                            print("[KV_SCALES] Computing KV cache scales for the first time...")
+                            policy.prepare_for_lp_inference()
+                            kv_scales_cache = {}
+                            # Create calibration data from flattened messages
+                            calibration_data = BatchedDataDict[ClippedPGLossDataDict](
+                                {
+                                    "input_ids": batched_flat["token_ids"],
+                                    "input_lengths": input_lengths
+                                }
+                            )
+                            # this will be mini-batched inside the policy, so maintain the packed multimodal structure
+                            calibration_data.update(batched_flat.get_multimodal_dict(as_tensors=False))
+                            calibration_data.to("cpu")
+                            kv_scales = policy.calibrate_qkv_fp8_scales(calibration_data, include_q=True)["layers"]
+                            for k, v in kv_scales.items():
+                                layer_idx = k.split("_")[1]
+                                k_param_name = f"model.layers.{layer_idx}.self_attn.k_scale"
+                                v_param_name = f"model.layers.{layer_idx}.self_attn.v_scale"
+                                # q_param_name is different from k_param_name and v_param_name because vllm handles the param mappings differently for q and k/v
+                                q_param_name = f"model.layers.{layer_idx}.self_attn.attn.q_scale"
+                                
+                                kv_scales_cache[q_param_name] = v["q_scale"]
+                                kv_scales_cache[k_param_name] = v["k_scale"]
+                                kv_scales_cache[v_param_name] = v["v_scale"]
+                        
+                        refit_policy_generation(
+                            policy, policy_generation, colocated_inference, timer=timer,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None
                         )
-                        # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                        calibration_data.update(batched_flat.get_multimodal_dict(as_tensors=False))
-                        calibration_data.to("cpu")
-                        kv_scales = policy.calibrate_qkv_fp8_scales(calibration_data, include_q=True)["layers"]
-                        for k, v in kv_scales.items():
-                            layer_idx = k.split("_")[1]
-                            k_param_name = f"model.layers.{layer_idx}.self_attn.k_scale"
-                            v_param_name = f"model.layers.{layer_idx}.self_attn.v_scale"
-                            # q_param_name is different from k_param_name and v_param_name because vllm handles the param mappings differently for q and k/v
-                            q_param_name = f"model.layers.{layer_idx}.self_attn.attn.q_scale"
-                            
-                            kv_scales_cache[q_param_name] = v["q_scale"]
-                            kv_scales_cache[k_param_name] = v["k_scale"]
-                            kv_scales_cache[v_param_name] = v["v_scale"]
-                    
-                    refit_policy_generation(
-                        policy, policy_generation, colocated_inference, timer=timer,
-                        kv_scales=kv_scales_cache if sync_kv_scales else None
-                    )
-                    POLICY_GENERATION_STALE = False
-                else:
-                    policy_generation.prepare_for_generation()
+                        POLICY_GENERATION_STALE = False
+                    else:
+                        policy_generation.prepare_for_generation()
 
                 with timer.time("generation"):
                     # Use async rollouts if vLLM async engine is enabled
@@ -911,19 +911,20 @@ def grpo_train(
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
-                    print("[KV_SCALES] Recomputing KV cache scales after policy update...")
-                    kv_scales = policy.calibrate_qkv_fp8_scales(train_data, include_q=True)["layers"]
-                    for k, v in kv_scales.items():
-                        layer_idx = k.split("_")[1]
-                        k_param_name = f"model.layers.{layer_idx}.self_attn.k_scale"
-                        v_param_name = f"model.layers.{layer_idx}.self_attn.v_scale"
-                        q_param_name = f"model.layers.{layer_idx}.self_attn.attn.q_scale"
+                    with timer.time("recompute_kv_scales"):
+                        print("[KV_SCALES] Recomputing KV cache scales after policy update...")
+                        kv_scales = policy.calibrate_qkv_fp8_scales(train_data, include_q=True)["layers"]
+                        for k, v in kv_scales.items():
+                            layer_idx = k.split("_")[1]
+                            k_param_name = f"model.layers.{layer_idx}.self_attn.k_scale"
+                            v_param_name = f"model.layers.{layer_idx}.self_attn.v_scale"
+                            q_param_name = f"model.layers.{layer_idx}.self_attn.attn.q_scale"
                         
-                        kv_scales_cache[q_param_name] = v["q_scale"]
-                        kv_scales_cache[k_param_name] = v["k_scale"]
-                        kv_scales_cache[v_param_name] = v["v_scale"]
-                    # Set generation as stale to force refit with new scales
-                    POLICY_GENERATION_STALE = True
+                            kv_scales_cache[q_param_name] = v["q_scale"]
+                            kv_scales_cache[k_param_name] = v["k_scale"]
+                            kv_scales_cache[v_param_name] = v["v_scale"]
+                        # Set generation as stale to force refit with new scales
+                        POLICY_GENERATION_STALE = True
 
                 is_last_step = (total_steps + 1 >= max_num_steps) or (
                     (current_epoch + 1 == max_num_epochs)

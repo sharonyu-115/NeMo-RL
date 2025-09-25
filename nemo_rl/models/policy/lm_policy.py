@@ -592,7 +592,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         input by DP and call in parallel, then take the result from the first worker.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
-        # 仅分 DP 维度；对于动态/打包模式，沿用现有分片逻辑
         if self.use_dynamic_batches:
             self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
                 "dynamic_batching"

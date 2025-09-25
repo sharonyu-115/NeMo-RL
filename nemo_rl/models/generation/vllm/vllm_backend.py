@@ -13,7 +13,6 @@
 # limitations under the License.
 from collections import defaultdict
 from typing import Any, Optional
-import traceback
 import torch
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
@@ -92,6 +91,7 @@ class VllmInternalWorkerExtension:
 
         Args:
             local_device_ipc_handles (dict): parameter IPC handles for local device.
+            kv_scales (dict): KV cache scales to be loaded.
 
         Returns:
             bool: True if weights were successfully updated.
@@ -187,7 +187,7 @@ class VllmInternalWorkerExtension:
                 self.model_runner.model.load_weights(weights=weights)
             
             # When kv_scales is provided, we need to invoke process_weights_after_loading() 
-            # to copy the kv scales to the _k_scale and _v_scale attributes used during inference
+            # to copy the q_scale, _k_scale and _v_scale scales to the _q_scale, _k_scale and _v_scale attributes used during inference
             if kv_scales:
                 print(f"[KV_SCALES] Processing {len(kv_scales)} KV cache scales after weight loading")
                 from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -208,7 +208,6 @@ class VllmInternalWorkerExtension:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_ipc_handles: {e}"
             )
-            print(traceback.format_exc())
             return False
 
     @wrap_with_nvtx_name(
@@ -245,7 +244,7 @@ class VllmInternalWorkerExtension:
                 self.model_runner.model.load_weights(weights=weights)
             
             # When kv_scales is provided, we need to invoke process_weights_after_loading() 
-            # to copy the kv scales to the _k_scale and _v_scale attributes used during inference
+            # to copy the q_scale, _k_scale and _v_scale scales to the _q_scale, _k_scale and _v_scale attributes used during inference
             if kv_scales:
                 print(f"[KV_SCALES] Processing {len(kv_scales)} KV cache scales after collective weight loading")
                 from vllm.model_executor.model_loader.utils import process_weights_after_loading

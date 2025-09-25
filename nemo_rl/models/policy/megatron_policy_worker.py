@@ -1848,9 +1848,10 @@ class MegatronPolicyWorker:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
         """
+        # Temporary fix to avoid OOM after saving checkpoint
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-        print(f"[SHARON] GPU Memory before saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+        print(f"GPU Memory before saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
@@ -1912,6 +1913,7 @@ class MegatronPolicyWorker:
             if not is_training:  # Restore training state if it was changed
                 self.model.train()
             
+            # Temporary fix to avoid OOM after saving checkpoint: https://github.com/NVIDIA-NeMo/RL/issues/1057
             torch.randn(1).cuda()  # wake up torch allocator
             if hasattr(self, "optimizer") and self.optimizer is not None:
                 # Iterate through the state dictionaries for each parameter group
@@ -1932,7 +1934,7 @@ class MegatronPolicyWorker:
 
             allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
             reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-            print(f"[SHARON] GPU Memory after saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+            print(f"GPU Memory after saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
 
         except Exception as e:
@@ -1976,38 +1978,37 @@ class MegatronPolicyWorker:
         save_path: Optional[str] = None,
         include_q: bool = False,
     ) -> dict[str, Any]:
-        """One-shot 标定 Q/K/V 的激活 scale（用于 FP8 KV cache）。
+        """One-shot calibration of Q/K/V activation scales (for FP8 KV cache).
 
-        - 通过 forward hook 捕获每层 `query_key_value` 的输出，分割 Q/K/V，并统计分位 amax。
-        - 在并行（DP/TP/PP）环境下，先本地统计分位，再对所有 rank 取最大值以保证保守性。
-        - 默认仅返回并保存 K/V 的 scale（E5M2），可选返回 Q（E4M3）。
+        - Captures each layer's `query_key_value` output through forward hooks, splits Q/K/V, and computes percentile amax.
+        - In parallel (DP/TP/PP) environments, first computes local percentiles, then takes max across all ranks for conservativeness.
+        - By default only returns and saves K/V scales (E5M2), optionally returns Q (E4M3).
 
         Args:
-            data: 用于标定的一小批代表性样本，遵循 get_logprobs 的输入约定。
-            micro_batch_size: 标定时的 micro batch 大小；若 None 则复用 logprob_batch_size。
-            percentile: amax 的分位数（如 99.9）。
-            margin: 余量系数，例如 1.05。
-            save_path: 若提供，则 rank0 会将结果保存为 JSON。
-            include_q: 是否也返回 Q 的 scale（一般只需 K/V）。
+            data: Representative sample batch for calibration, following get_logprobs input conventions.
+            micro_batch_size: Micro batch size during calibration; if None, reuses logprob_batch_size.
+            percentile: Percentile for amax (e.g. 99.9).
+            margin: Margin factor, e.g. 1.05.
+            save_path: If provided, rank0 will save results as JSON.
+            include_q: Whether to also return Q scale (usually only K/V needed).
 
         Returns:
             { "format": "fp8", "percentile": float, "margin": float,
               "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
         """
-        # FP8 动态范围（对称）
+
         FP8_MAX_E4M3 = 448.0
-        FP8_MAX_E5M2 = 57344.0
 
         self.model.eval()
 
-        # 记录每层的 q/k/v 的局部分位 amax
+        # Record local percentile amax for q/k/v of each layer
         layer_to_samples_q: dict[str, list[float]] = defaultdict(list)
         layer_to_samples_k: dict[str, list[float]] = defaultdict(list)
         layer_to_samples_v: dict[str, list[float]] = defaultdict(list)
         hook_handles = []
 
         def _extract_layer_key(module_name: str) -> str:
-            # 期望形如 "module.decoder.layers.<idx>.self_attention.query_key_value"
+            # Expected format: "module.decoder.layers.<idx>.self_attention.query_key_value"
             m = re.search(r"module\.decoder\.layers\.(\d+)", module_name)
             if m is not None:
                 return f"layer_{m.group(1)}"
@@ -2035,7 +2036,7 @@ class MegatronPolicyWorker:
 
             return _hook
 
-        # 新增：优先在 core_attention 的 forward_pre 上挂 hook，以捕获已做完 q/k norm 与 RoPE 的 q/k/v
+        # Hook to capture q/k/v after q/k norm and RoPE
         def _pre_hook_builder_core_attention(module_name: str):
             layer_key = _extract_layer_key(module_name)
 
@@ -2053,25 +2054,25 @@ class MegatronPolicyWorker:
                     layer_to_samples_k[layer_key].append(float(torch.amax(torch.abs(k)).item()))
                     layer_to_samples_v[layer_key].append(float(torch.amax(torch.abs(v)).item()))
                 except Exception as e:
-                    print(f"[ALEXQ] Error in core_attention pre-hook on {module_name}: {e}")
+                    print(f"[KV_SCALES] Error in core_attention pre-hook on {module_name}: {e}")
                     pass
 
             return _pre_hook
 
         matched_modules = []
-        # 1) 优先尝试在 core_attention 上注册 forward_pre_hook
+        # 1) Try to register forward_pre_hook on core_attention first
         for name, module in self.model.named_modules():
-            print(f"[ALEXQ] Module name: {name}")
+            print(f"[KV_SCALES] Module name: {name}")
             if "self_attention.core_attention" in name:
                 try:
                     handle = module.register_forward_pre_hook(_pre_hook_builder_core_attention(name))
                     hook_handles.append(handle)
                     matched_modules.append((name, module.__class__.__name__, "pre"))
                 except Exception as e:
-                    print(f"[ALEXQ] Error registering pre-hook on {name}: {e}")
+                    print(f"[KV_SCALES] Error registering pre-hook on {name}: {e}")
                     continue
 
-        # 2) 若未命中 core_attention，则退回到原先在 QKV 投影输出上的 forward_hook
+        # 2) If core_attention is not hit, fall back to forward_hook on QKV projection output
         if not hook_handles:
             qkv_name_patterns = ("query_key_value", "linear_qkv", ".qkv", "_qkv")
             for name, module in self.model.named_modules():
@@ -2081,13 +2082,13 @@ class MegatronPolicyWorker:
                         hook_handles.append(handle)
                         matched_modules.append((name, module.__class__.__name__, "post"))
                     except Exception as e:
-                        print(f"[ALEXQ] Error registering hook on {name}: {e}")
+                        print(f"[KV_SCALES] Error registering hook on {name}: {e}")
                         continue
 
         if not hook_handles:
-            print("[ALEXQ] No QKV proj modules matched for hook. Example module/param names:")
+            print("[KV_SCALES] No QKV proj modules matched for hook. Example module/param names:")
             try:
-                # 打印前若干个模块与参数名，帮助定位实际命名
+                # Print the first 10 modules and parameters to help locate the actual names
                 cnt = 0
                 for n, _m in self.model.named_modules():
                     if cnt >= 10:
@@ -2103,12 +2104,12 @@ class MegatronPolicyWorker:
             except Exception:
                 pass
         else:
-            # 轻量打印匹配到的前几个模块，确认命中
-            print("[ALEXQ] Registered hooks on modules (showing up to 8):")
+            # Lightly print the first few modules and parameters to confirm hits
+            print("[KV_SCALES] Registered hooks on modules (showing up to 8):")
             for i, (mn, cls, kind) in enumerate(matched_modules[:8]):
                 print(f"    {i:02d}: {mn}  <{cls}>  [{kind}]")
 
-        # 运行一次推理流程以触发 hooks（重用 get_logprobs 的前向路径）
+        # Run a forward pass to trigger hooks (reuse get_logprobs forward path)
         try:
             _ = self.get_logprobs(data=data, micro_batch_size=micro_batch_size)
         finally:
@@ -2116,10 +2117,10 @@ class MegatronPolicyWorker:
                 try:
                     h.remove()
                 except Exception as e:
-                    print(f"[ALEXQ] Error removing hook: {e}")
+                    print(f"[KV_SCALES] Error removing hook: {e}")
                     pass
 
-        # 计算本地分位 amax
+        # Compute local percentile amax
         def _percentile(values: list[float], p: float) -> float:
             if not values:
                 return 0.0
@@ -2136,7 +2137,7 @@ class MegatronPolicyWorker:
             entry["v_amax_p"] = _percentile(layer_to_samples_v.get(layer_key, []), percentile)
             local_layer_to_pamax[layer_key] = entry
 
-        # 合并所有 rank：对分位 amax 取最大（保守）
+        # Merge across all ranks: take maximum of percentile amax (conservative approach)
         world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
         gathered = [None for _ in range(world_size)] if world_size > 1 else None
         if world_size > 1:
@@ -2153,7 +2154,7 @@ class MegatronPolicyWorker:
         else:
             layer_to_pamax = local_layer_to_pamax
 
-        # 计算 scale（对称量化）：scale = pamax / fp8_max
+        # Compute scale (symmetric quantization): scale = pamax / fp8_max
         result_layers = {}
         for layer_key, vals in layer_to_pamax.items():
             out_entry = {}
@@ -2172,9 +2173,9 @@ class MegatronPolicyWorker:
             "margin": margin,
             "layers": result_layers,
         }
-        print(f"[ALEXQ] Calibrated KV cache scales: {final_result}")
+        print(f"[KV_SCALES] Calibrated KV cache scales: {final_result}")
 
-        # 将结果在所有 rank 同步（广播 rank0 的结果）
+        # Sync results across all ranks (broadcast rank0's result)
         if world_size > 1:
             if torch.distributed.get_rank() == 0:
                 obj_list = [final_result]

@@ -134,6 +134,7 @@ class MasterConfig(TypedDict):
 # Setup & Initialization
 # ===============================================================================
 
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -507,6 +508,7 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     vllm_cfg = generation_config.get("vllm_cfg", {})
     return vllm_cfg.get("async_engine", False)
 
+
 def refit_policy_generation(
     policy: ColocatablePolicyInterface,
     policy_generation: GenerationInterface,
@@ -627,7 +629,7 @@ def grpo_train(
 
     # Check if we need to sync KV cache scales (infer from config)
     sync_kv_scales = _should_sync_kv_scales(master_config)
-    kv_scales_cache = None  # Cache reused for compuated kv scales 
+    kv_scales_cache = None  # Cache reused for computed kv scales 
     
     if sync_kv_scales:
         generation_config = master_config["policy"]["generation"]
@@ -641,14 +643,14 @@ def grpo_train(
         print(f"[KV_SCALES] Configuration: policy_backend={policy_backend}, generation_backend={backend}")
         print(f"[KV_SCALES] vLLM settings: precision={vllm_precision}, kv_cache_dtype={kv_cache_dtype}")
 
-        # Temoprary assert check to flag error when kv cache fp8 is enabled but either of thefollowing conditions are met: 
+        # Temporary assert check to flag error when kv cache fp8 is enabled but either of thefollowing conditions are met: 
         # 1. policy backend is dtensor
         # 2. async rollouts is enabled
         # 3. pipeline_model_parallel_size is greater than 1 for the megatron backend
         # TODO: Add the related support
         assert policy_backend != "dtensor", "DTensor backend is not supported with kv cache fp8 enabled."
         assert not _should_use_async_rollouts(master_config), "Async rollouts is not supported with kv cache fp8 enabled."
-        assert master_config["policy"]["megatron_cfg"]["pipeline_model_parallel_size"] == 1, "Pipeline model parallel size must be 1 for megatron backend with kv cache fp8 enabled."
+        assert master_config["policy"]["megatron_cfg"].get("pipeline_model_parallel_size", 1) == 1, "Pipeline model parallel size must be 1 for megatron backend with kv cache fp8 enabled."
     else:
         print("[KV_SCALES] KV cache scale sync not needed (non-FP8 mode or kv_cache_dtype is not fp8)")
 

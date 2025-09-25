@@ -2038,12 +2038,12 @@ class MegatronPolicyWorker:
                     q = out[..., :qkv_stride]
                     k = out[..., qkv_stride : 2 * qkv_stride]
                     v = out[..., 2 * qkv_stride : 3 * qkv_stride]
-                    # per-tensor 绝对最大值（局部）
+                    # per-tensor absolute maximum value (local)
                     layer_to_samples_q[layer_key].append(float(torch.amax(torch.abs(q)).item()))
                     layer_to_samples_k[layer_key].append(float(torch.amax(torch.abs(k)).item()))
                     layer_to_samples_v[layer_key].append(float(torch.amax(torch.abs(v)).item()))
                 except Exception as e:
-                    print(f"[ALEXQ] Error extracting layer key: {e}")
+                    print(f"[KV_SCALES] Error extracting layer key: {e}")
                     pass
 
             return _hook
@@ -2130,7 +2130,7 @@ class MegatronPolicyWorker:
                     h.remove()
                 except Exception as e:
                     print(f"[KV_SCALES] Error removing hook: {e}")
-                    pass
+                    pass    
 
         # Compute local percentile amax
         def _percentile(values: list[float], p: float) -> float:

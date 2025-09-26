@@ -2026,28 +2026,6 @@ class MegatronPolicyWorker:
                 return f"layer_{m.group(1)}"
             return module_name
 
-        def _hook_builder(module_name: str):
-            layer_key = _extract_layer_key(module_name)
-
-            def _hook(module, inputs, output):
-                out = output[0] if isinstance(output, (tuple, list)) else output
-                try:
-                    last_dim = out.shape[-1]
-                    assert last_dim % 3 == 0
-                    qkv_stride = last_dim // 3
-                    q = out[..., :qkv_stride]
-                    k = out[..., qkv_stride : 2 * qkv_stride]
-                    v = out[..., 2 * qkv_stride : 3 * qkv_stride]
-                    # per-tensor absolute maximum value (local)
-                    layer_to_samples_q[layer_key].append(float(torch.amax(torch.abs(q)).item()))
-                    layer_to_samples_k[layer_key].append(float(torch.amax(torch.abs(k)).item()))
-                    layer_to_samples_v[layer_key].append(float(torch.amax(torch.abs(v)).item()))
-                except Exception as e:
-                    print(f"[KV_SCALES] Error extracting layer key: {e}")
-                    pass
-
-            return _hook
-
         # Hook to capture q/k/v after q/k norm and RoPE
         def _pre_hook_builder_core_attention(module_name: str):
             layer_key = _extract_layer_key(module_name)

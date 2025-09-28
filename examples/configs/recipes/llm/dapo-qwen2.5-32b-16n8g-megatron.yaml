@@ -13,6 +13,7 @@ grpo:
   val_batch_size: 960
   seed: 42
   use_dynamic_sampling: true
+  overlong_filtering: true
   max_num_gen_batches: 10
   reward_scaling:
     enabled: true
@@ -77,6 +78,7 @@ policy:
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
     #gives ~20% training perf speedup with sequence packing
+    moe_permute_fusion: false
     apply_rope_fusion: True
 
     optimizer:
@@ -150,6 +152,7 @@ policy:
       precision: ${policy.precision}
       tensor_parallel_size: 4
       pipeline_parallel_size: 1
+      expert_parallel_size: 1
       gpu_memory_utilization: 0.7
       max_model_len: ${policy.max_total_sequence_length} # This is same as max_total_sequence_length
       enforce_eager: True
@@ -180,6 +183,7 @@ logger:
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false
+  swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: false  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   wandb:
     project: "dapo-dev"

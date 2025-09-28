@@ -41,7 +41,8 @@ def format_dapo_math_17k(
 def prepare_dapo_math_17k_dataset(seed: int = 42) -> dict[str, Dataset | None]:
     """Load and split the DeepScaler dataset into train and test sets."""
     # Load the original dataset for training
-    train_ds = load_dataset("BytedTsinghua-SIA/DAPO-Math-17k", split="train")
+    # @zpqiu: deduplicated version of BytedTsinghua-SIA/DAPO-Math-17k
+    train_ds = load_dataset("pe-nlp/DAPO-Math-17k", split="train")
 
     # Load hendrydong/aime24 dataset for validation
     val_ds = load_dataset("BytedTsinghua-SIA/AIME-2024", split="train")

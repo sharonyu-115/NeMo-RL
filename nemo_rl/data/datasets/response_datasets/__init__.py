@@ -127,4 +127,5 @@ __all__ = [
     "RefCOCODataset",
     "ResponseDataset",
     "SquadDataset",
+    "DAPOMath17KDataset",
 ]

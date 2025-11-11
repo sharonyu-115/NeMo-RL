@@ -2419,7 +2419,7 @@ class CustomFloat16Module(Float16Module):
 
         - Captures each layer's `query_key_value` output through forward hooks, splits Q/K/V, and computes percentile amax.
         - In parallel (DP/TP/PP) environments, first computes local percentiles, then takes max across all ranks for conservativeness.
-        - By default only returns and saves K/V scales (E5M2), optionally returns Q (E4M3).
+        - By default only returns and saves K/V scales, optionally returns Q.
 
         Args:
             data: Representative sample batch for calibration, following get_logprobs input conventions.
@@ -2434,7 +2434,19 @@ class CustomFloat16Module(Float16Module):
               "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
         """
 
-        FP8_MAX_E4M3 = 448.0
+        # Allow overriding FP8 max for Q, K, V via environment variables for ease of testing.
+        # Defaults align with FP8 e4m3 max magnitude.
+        # Use different defaults for Q, K, V to adapt to distribution diffefences
+        def _get_env_float(name: str, default: float) -> float:
+            try:
+                val = os.getenv(name, None)
+                return float(val) if val is not None and val != "" else default
+            except Exception:
+                return default
+
+        FP8_MAX_Q = _get_env_float("FP8_MAX_Q", 448.0)
+        FP8_MAX_K = _get_env_float("FP8_MAX_K", 448.0)
+        FP8_MAX_V = _get_env_float("FP8_MAX_V", 448.0)
 
         self.model.eval()
 
@@ -2482,7 +2494,7 @@ class CustomFloat16Module(Float16Module):
                     args = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
                     if len(args) == 1 and isinstance(args[0], (tuple, list)):
                         args = args[0]
-                    # 期望前 3 个为 q, k, v（Megatron CoreAttention 的典型签名）
+                    # Expected first 3 args to be q, k, v (typical signature for Megatron CoreAttention)
                     q = args[0]
                     k = args[1]
                     v = args[2]
@@ -2596,10 +2608,10 @@ class CustomFloat16Module(Float16Module):
         for layer_key, vals in layer_to_pamax.items():
             out_entry = {}
             if include_q:
-                q_scale = (vals.get("q_amax_p", 0.0) * margin) / FP8_MAX_E4M3
+                q_scale = (vals.get("q_amax_p", 0.0) * margin) / FP8_MAX_Q
                 out_entry["q_scale"] = float(q_scale)
-            k_scale = (vals.get("k_amax_p", 0.0) * margin) / FP8_MAX_E4M3
-            v_scale = (vals.get("v_amax_p", 0.0) * margin) / FP8_MAX_E4M3
+            k_scale = (vals.get("k_amax_p", 0.0) * margin) / FP8_MAX_K
+            v_scale = (vals.get("v_amax_p", 0.0) * margin) / FP8_MAX_V
             out_entry["k_scale"] = float(k_scale)
             out_entry["v_scale"] = float(v_scale)
             result_layers[layer_key] = out_entry
@@ -2623,7 +2635,7 @@ class CustomFloat16Module(Float16Module):
                 torch.distributed.broadcast_object_list(obj_list, src=0)
                 final_result = obj_list[0]  # type: ignore
 
-        # 可选保存至 JSON（仅 rank0）
+        # Optional save to JSON (only rank0)
         if save_path is not None and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
             try:
                 with open(save_path, "w") as f:

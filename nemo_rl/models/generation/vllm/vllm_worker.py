@@ -665,7 +665,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(self, kv_scales: Optional[dict[str, float]] = None) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -677,9 +677,14 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                     "update_weights_from_collective can only be used with async_engine=False. Use update_weights_from_collective_async instead."
                 )
 
-            result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
-            )
+            if kv_scales:
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_collective", args=(kv_scales,)
+                )
+            else:
+                result_or_coro = self.llm.collective_rpc(
+                    "update_weights_from_collective", args=tuple()
+                )
             worker_result = result_or_coro[0]
 
             if not worker_result:

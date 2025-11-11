@@ -14,7 +14,7 @@
 import gc
 import traceback
 from typing import Any
-
+import traceback
 import torch
 import zmq
 
@@ -169,12 +169,13 @@ class VllmInternalWorkerExtension:
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
                 f"{traceback.format_exc()}"
             )
+            print(traceback.format_exc())
             return False
 
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(self, kv_scales: Optional[dict[str, float]] = None) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "

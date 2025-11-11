@@ -699,11 +699,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         save_path: Optional[str] = None,
         include_q: bool = False,
     ) -> dict[str, Any]:
-        """触发各 Megatron worker 的 KV-cache FP8 scale 标定，并返回结果。
+        """Trigger KV-cache FP8 scale calibration across Megatron workers and return results.
 
-        说明：后端 `MegatronPolicyWorker.calibrate_qkv_fp8_scales` 已实现分布式规约，
-        返回的是跨 rank 合并后的结果。因此这里按 DP 分片输入并并行调用，最终取第一个
-        worker 的返回即可。
+        Note: The backend `MegatronPolicyWorker.calibrate_qkv_fp8_scales` already implements 
+        distributed reduction, returning results merged across ranks. Therefore, we shard the 
+        input by DP and call in parallel, then take the result from the first worker.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
         # 仅分 DP 维度；对于动态/打包模式，沿用现有分片逻辑
@@ -754,7 +754,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             },
         )
         results = self.worker_group.get_all_worker_results(futures)
-        # 由于后端已在分布式内合并，这里返回任一结果均一致
         return results[0]
 
     def get_free_memory_bytes(self) -> int:

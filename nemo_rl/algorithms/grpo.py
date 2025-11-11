@@ -997,7 +997,7 @@ def grpo_train(
     kv_scales_cache = None  # Cache reused for computed kv scales 
     
     if sync_kv_scales:        
-        print(f"[KV_SCALES] FP8 KV cache detected, will sync q_scale, _k_scale and _v_scale during refit")        # Note: KV cache FP8 compatibility assertions are now handled in the setup function
+        print(f"[KV_SCALES] FP8 KV cache detected, will sync q_scale, _k_scale and _v_scale during refit")
     else:
         print("[KV_SCALES] KV cache scale sync not needed (non-FP8 mode or kv_cache_dtype is not fp8)")
 

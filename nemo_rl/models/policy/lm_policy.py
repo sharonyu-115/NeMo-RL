@@ -762,17 +762,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         free_memory_bytes = min(ray.get(future) for future in futures)
         return free_memory_bytes
 
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int) -> list[ray.ObjectRef]:
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None) -> list[ray.ObjectRef]:
         """Send the weights for IPC handles via ZMQ socket."""
         futures = self.worker_group.run_all_workers_single_data(
-            "stream_weights_via_ipc_zmq", buffer_size_bytes=buffer_size_bytes
+            "stream_weights_via_ipc_zmq", buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
         )
         return futures
 
-    def broadcast_weights_for_collective(self) -> list[ray.ObjectRef]:
+    def broadcast_weights_for_collective(self, kv_scales: Optional[dict[str, float]] = None) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
-            "broadcast_weights_for_collective"
+            "broadcast_weights_for_collective",
+            kv_scales=kv_scales,
         )
         # this function should co-work with vllm, so we should wait for all futures to complete outside
         return futures

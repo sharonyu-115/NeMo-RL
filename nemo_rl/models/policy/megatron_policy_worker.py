@@ -1918,6 +1918,32 @@ class MegatronPolicyWorker:
         for name, tensor in hf_params_generator:
             metadata = (tensor.shape, tensor.dtype)
             refit_param_info_hf[name] = metadata
+        # Also include KV/Q scale metadata so consumer can rely solely on state_dict_info
+        try:
+            import re
+            # Infer number of layers by scanning existing parameter names
+            max_layer_idx = -1
+            layer_regex = re.compile(r"^model\\.layers\\.(\\d+)\\.")
+            for k in refit_param_info_hf.keys():
+                m = layer_regex.match(k)
+                if m:
+                    idx = int(m.group(1))
+                    if idx > max_layer_idx:
+                        max_layer_idx = idx
+            num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+            # Append q/k/v scale placeholders (shape [1], dtype float32)
+            for layer_idx in range(num_layers):
+                q_key = f"model.layers.{layer_idx}.self_attn.attn.q_scale"
+                k_key = f"model.layers.{layer_idx}.self_attn.k_scale"
+                v_key = f"model.layers.{layer_idx}.self_attn.v_scale"
+                if q_key not in refit_param_info_hf:
+                    refit_param_info_hf[q_key] = ([1], torch.float32)
+                if k_key not in refit_param_info_hf:
+                    refit_param_info_hf[k_key] = ([1], torch.float32)
+                if v_key not in refit_param_info_hf:
+                    refit_param_info_hf[v_key] = ([1], torch.float32)
+        except Exception:
+            pass
         return refit_param_info_hf
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
@@ -1980,7 +2006,7 @@ class MegatronPolicyWorker:
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0) -> None:
+    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0,  kv_scales: Optional[dict[str, float]] = None) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
 
@@ -1993,9 +2019,42 @@ class MegatronPolicyWorker:
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
+        def _enumerate_kv_scale_keys():
+            import re
+            max_layer_idx = -1
+            layer_regex = re.compile(r"^model\\.layers\\.(\\d+)\\.")
+            # Use state_dict keys to infer number of layers
+            for name in self.model.state_dict().keys():
+                m = layer_regex.match(name)
+                if m:
+                    idx = int(m.group(1))
+                    if idx > max_layer_idx:
+                        max_layer_idx = idx
+            num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+            keys = []
+            for layer_idx in range(num_layers):
+                keys.append(f"model.layers.{layer_idx}.self_attn.attn.q_scale")
+                keys.append(f"model.layers.{layer_idx}.self_attn.k_scale")
+                keys.append(f"model.layers.{layer_idx}.self_attn.v_scale")
+            return keys
+
+        def iter_with_kv_scales():
+            for name, tensor in hf_params_generator:
+                yield name, tensor
+            # Always append kv-scale entries to match metadata; use provided value or default 1.0
+            for param_name in _enumerate_kv_scale_keys():
+                if kv_scales and param_name in kv_scales:
+                    scale_value = kv_scales[param_name]
+                else:
+                    scale_value = 1.0
+                scale_tensor = torch.tensor(
+                    scale_value, dtype=torch.float32, device="cuda"
+                ).reshape(1)
+                yield param_name, scale_tensor
+
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
-            params_generator=hf_params_generator,
+            params_generator=iter_with_kv_scales(),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -2003,7 +2062,7 @@ class MegatronPolicyWorker:
         )
 
     @torch.no_grad()
-    def broadcast_weights_for_collective(self) -> None:
+    def broadcast_weights_for_collective(self, kv_scales: Optional[dict[str, float]] = None) -> None:
         """Broadcast the weights for collective communication."""
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
@@ -2011,9 +2070,42 @@ class MegatronPolicyWorker:
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
+        def _enumerate_kv_scale_keys():
+            import re
+            max_layer_idx = -1
+            layer_regex = re.compile(r"^model\\.layers\\.(\\d+)\\.")
+            # Use state_dict keys to infer number of layers
+            for name in self.model.state_dict().keys():
+                m = layer_regex.match(name)
+                if m:
+                    idx = int(m.group(1))
+                    if idx > max_layer_idx:
+                        max_layer_idx = idx
+            num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+            keys = []
+            for layer_idx in range(num_layers):
+                keys.append(f"model.layers.{layer_idx}.self_attn.attn.q_scale")
+                keys.append(f"model.layers.{layer_idx}.self_attn.k_scale")
+                keys.append(f"model.layers.{layer_idx}.self_attn.v_scale")
+            return keys
+
+        def iter_with_kv_scales():
+            for name, tensor in hf_params_generator:
+                yield name, tensor
+            # Always append kv-scale entries to match metadata; use provided value or default 1.0
+            for param_name in _enumerate_kv_scale_keys():
+                if kv_scales and param_name in kv_scales:
+                    scale_value = kv_scales[param_name]
+                else:
+                    scale_value = 1.0
+                scale_tensor = torch.tensor(
+                    scale_value, dtype=torch.float32, device="cuda"
+                ).reshape(1)
+                yield param_name, scale_tensor
+
         # param_iterator will return (name, tensor), we only need tensor
         packed_broadcast_producer(
-            iterator=hf_params_generator,
+            iterator=iter_with_kv_scales(),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],
@@ -2367,43 +2459,6 @@ class MegatronPolicyWorker:
             "tp_size": self.megatron_cfg.model.tensor_model_parallel_size,
         }
 
-
-class CustomFloat16Module(Float16Module):
-    """Float 16 Module.
-
-    Attributes:
-        config (TransformerConfig): Transformer config
-        fp16 (bool) : Specifies if the model runs in fp16 mode
-        bf16 (bool) : Specifies if the model runs in bf16 mode
-
-    Args:
-        config (TransformerConfig): The transformer config used to initalize the model
-    """
-
-    def __init__(self, config: TransformerConfig, module: torch.nn.Module):
-        super(CustomFloat16Module, self).__init__(config, module)
-        self.re_enable_float32_expert_bias()
-
-    def re_enable_float32_expert_bias(self) -> None:
-        """Ensure MoE router expert bias stays in float32 for numerical stability.
-
-        Walks the wrapped module to find MoE routers and invokes the
-        `_maintain_float32_expert_bias()` helper which recreates or casts the
-        expert bias tensors to float32 as required by Megatron-LM.
-        """
-        module = self.module
-        # Handle VLM models where language model is nested
-        if hasattr(module, "language_model"):
-            module = module.language_model
-        if hasattr(module, "decoder") and hasattr(module.decoder, "layers"):
-            for layer in module.decoder.layers:
-                mlp = getattr(layer, "mlp", None)
-                router = getattr(mlp, "router", None) if mlp is not None else None
-                if router is not None and hasattr(
-                    router, "_maintain_float32_expert_bias"
-                ):
-                    router._maintain_float32_expert_bias()
-
     @torch.no_grad()
     def calibrate_qkv_fp8_scales(
         self,
@@ -2608,3 +2663,40 @@ class CustomFloat16Module(Float16Module):
                 pass
 
         return final_result
+
+
+class CustomFloat16Module(Float16Module):
+    """Float 16 Module.
+
+    Attributes:
+        config (TransformerConfig): Transformer config
+        fp16 (bool) : Specifies if the model runs in fp16 mode
+        bf16 (bool) : Specifies if the model runs in bf16 mode
+
+    Args:
+        config (TransformerConfig): The transformer config used to initalize the model
+    """
+
+    def __init__(self, config: TransformerConfig, module: torch.nn.Module):
+        super(CustomFloat16Module, self).__init__(config, module)
+        self.re_enable_float32_expert_bias()
+
+    def re_enable_float32_expert_bias(self) -> None:
+        """Ensure MoE router expert bias stays in float32 for numerical stability.
+
+        Walks the wrapped module to find MoE routers and invokes the
+        `_maintain_float32_expert_bias()` helper which recreates or casts the
+        expert bias tensors to float32 as required by Megatron-LM.
+        """
+        module = self.module
+        # Handle VLM models where language model is nested
+        if hasattr(module, "language_model"):
+            module = module.language_model
+        if hasattr(module, "decoder") and hasattr(module.decoder, "layers"):
+            for layer in module.decoder.layers:
+                mlp = getattr(layer, "mlp", None)
+                router = getattr(mlp, "router", None) if mlp is not None else None
+                if router is not None and hasattr(
+                    router, "_maintain_float32_expert_bias"
+                ):
+                    router._maintain_float32_expert_bias()

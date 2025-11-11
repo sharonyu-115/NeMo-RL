@@ -448,22 +448,17 @@ def setup(
             assert loss_config["use_importance_sampling_correction"] is True, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
+        if generation_config["vllm_cfg"]["kv_cache_dtype"] == "fp8":
+            # Temporary additional FP8 KV cache compatibility checks
+            # TODO: Add the related support
+            assert policy_config["dtensor_cfg"]["enabled"] == False, "DTensor backend is not supported with kv cache fp8 enabled."
+            assert not _should_use_async_rollouts(master_config), "Async rollouts is not supported with kv cache fp8 enabled."
+            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, "Pipeline model parallel size must be 1 for megatron backend with kv cache fp8 enabled."
+
         ## make vllm hf overrides match the training policy
         generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
             "hf_config_overrides", {}
         )
-            
-            # Temporary additional FP8 KV cache compatibility checks
-            # TODO: Add the related support
-            vllm_cfg = generation_config.get("vllm_cfg", {})
-            kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-            if kv_cache_dtype == "fp8":
-                policy_backend = "megatron" if policy_config.get("megatron_cfg", {}).get("enabled", False) else "dtensor"
-                
-                # Validate KV cache FP8 compatibility
-                assert policy_backend != "dtensor", "DTensor backend is not supported with kv cache fp8 enabled."
-                assert not _should_use_async_rollouts(master_config), "Async rollouts is not supported with kv cache fp8 enabled."
-                assert policy_config.get("megatron_cfg", {}).get("pipeline_model_parallel_size", 1) == 1, "Pipeline model parallel size must be 1 for megatron backend with kv cache fp8 enabled."
 
         policy_generation = VllmGeneration(
             cluster=inference_cluster, config=generation_config
@@ -759,129 +754,28 @@ def _should_use_penguin(master_config: MasterConfig) -> bool:
 
     return should_use_penguin
 
-# Need a function to compute the kv cache scales for all the attention layers with the updated policy model
-# TODO: Determine the inputs and outputs. inputs: the trained policy model? training data? 
-# TODO: How to do the calculation? Caculating the kv cache scales needs to do a foward path with some training data, get the activations of each attention layer and compute the scales based on the activations. 
-# TODO: The calcuation needs to be done only when the sync_kv_scales flat is True, and after policy model is updated. 
-# TODO: The output should be a dictionary of the kv cache scales for all the attention layers? The structure should be consistent with the required format that can be loaded by vllm using model_runner.model.load_weights() as the other weights. 
-#       Code snippet reference: /lustre/fsw/portfolios/coreai/users/shuangy/src/vllm/vllm/model_executor/layers/quantization/kv_cache.py:
-#        def create_weights(self, layer: torch.nn.Module):
-#            """
-#            Create "weight" (aka q_scale, k_scale and v_scale)
-#            for an attention layer.
-#            """
-            # Initialize the Q and KV cache scales to -1.0, an invalid value.
-            # If the q and k/v_scales appear in the checkpoint, it will be
-            # overwritten when loading weights.
-#            layer.q_scale = torch.nn.Parameter(torch.tensor(-1.0),
-#                                            requires_grad=False)
-#            layer.k_scale = torch.nn.Parameter(torch.tensor(-1.0),
-#                                            requires_grad=False)
-#            layer.v_scale = torch.nn.Parameter(torch.tensor(-1.0),
-#                                            requires_grad=False)
-            # Initialize P = softmax(QK^T) scales
-#            layer.prob_scale = torch.nn.Parameter(torch.tensor(-1.0),
-#                                                   requires_grad=False)
-#                                                requires_grad=False)
-# TODO: How to pass the kv scales to refit_policy_generation()? refit_policy_generation() is the function that updates the weights of the policy generation interface.
-# When refit_policy_generation() invokes update_weights_from_ipc_handles() or update_weights_from_collective(), if it is fp8 and sync_kv_scales is True, the kv scales should be passed to the policy generation interface. load_weights() once invoked will load the kv scales. 
-# In order for vllm to really load the kv scales, the kv scales should be passed to the policy generation interface in the same format as the other weights. 
-# Additionally, vllm process_weights_after_loading() will be invoked after load_weights() to copy the kv scales to the _k_scale and _v_scale attributes. Reference code: /lustre/fsw/portfolios/coreai/users/shuangy/src/vllm/vllm/model_executor/layers/quantization/kv_cache.py
 
-
-def compute_kv_scales_with_data(
-    policy: ColocatablePolicyInterface,
-    sample_data: BatchedDataDict,
-    master_config: MasterConfig,
-    max_samples: int = 32,
-) -> dict[str, float]:
+# Function to check if KV cache scales should be calculated and synchronized during refit
+def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
     """
-    Compute KV cache scales for all attention layers using calibration data.
+    Check if KV cache scales should be synchronized during refit.
     
-    Args:
-        policy: The policy model to calibrate
-        sample_data: Calibration data batch
-        master_config: Configuration containing model settings
-        max_samples: Maximum number of samples to use for calibration
-        
-    Returns:
-        Dictionary mapping parameter names to scale values for K/V cache quantization
+    Returns True if:
+    - vLLM precision is fp8 and kv_cache_dtype is fp8
     """
-    # TODO: Review the implementation of this function.
-    print(f"[KV_SCALES] Computing KV cache scales with {min(max_samples, sample_data.size)} samples...")
+    generation_config = master_config["policy"]["generation"]
+    if generation_config is None:
+        return False
     
-    # Limit the number of samples for calibration
-    if sample_data.size > max_samples:
-        sample_data = sample_data.slice(0, max_samples)
+    backend = generation_config.get("backend", "")
+    if backend != "vllm":
+        return False
     
-    # Convert to input format expected by policy
-    import torch
-    from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+    vllm_cfg = generation_config.get("vllm_cfg", {})
+    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
+    vllm_precision = vllm_cfg.get("precision", "auto")
     
-    try:
-        # Extract tokenized inputs from the batch
-        batched_flat, input_lengths = batched_message_log_to_flat_message(
-            sample_data["message_log"], 
-            pad_value_dict={"token_ids": 0}  # Use 0 as pad token for calibration
-        )
-        input_ids = batched_flat["token_ids"]
-        
-        # Convert to tensor if needed
-        if not isinstance(input_ids, torch.Tensor):
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
-        
-        # For distributed policy, we'll use a simplified approach
-        # TODO: Implement proper distributed calibration through worker_group
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        input_ids = input_ids.to(device)
-        
-        print(f"[KV_SCALES] Calibration input shape: {input_ids.shape}")
-        
-        # Skip the complex hook-based calibration for distributed policy
-        # TODO: Implement proper distributed calibration using policy.worker_group
-        
-        # For distributed Policy, we cannot directly access model.named_modules()
-        # Instead, we'll use a simplified approach with default scales
-        print("[KV_SCALES] Using simplified calibration for distributed policy")
-        
-        # TODO: For a quick prototype, use a pseudo default scales. 
-        #       Need to update later to would use worker_group to run calibration? 
-        default_k_scale = 0.1  # Conservative scale for K projections  
-        default_v_scale = 0.1  # Conservative scale for V projections
-        # TODO: Current use Qwen3-8B-Base as an example, should be obtained from model config
-        num_layers = 36  # Default number of layers - should be obtained from model config
-        
-        # Generate default KV scales for distributed policy
-        kv_scales = {}
-        print("[KV_SCALES] Generating default KV scales for distributed policy")
-        
-        # Generate scales for typical transformer layers
-        for layer_idx in range(num_layers):
-            k_param_name = f"model.layers.{layer_idx}.self_attn.k_scale"
-            v_param_name = f"model.layers.{layer_idx}.self_attn.v_scale"
-            
-            kv_scales[k_param_name] = default_k_scale
-            kv_scales[v_param_name] = default_v_scale
-        
-        print(f"[KV_SCALES] Computed {len(kv_scales)} KV cache scales")
-        return kv_scales
-    
-    except Exception as e:
-        print(f"[KV_SCALES] Error computing KV scales: {e}")
-        # For training stability, we can either:
-        # 1. Re-raise the exception to fail fast and debug issues early
-        # 2. Fall back to default scales to continue training
-        # Current choice: fallback for robustness, but log the error clearly
-        print("[KV_SCALES] Falling back to default scales to maintain training stability")
-        print("[KV_SCALES] Note: This may impact FP8 quantization quality")
-        
-        # Return default scales
-        default_scales = {}
-        for name, module in policy.model.named_modules():
-            if "self_attn" in name:
-                default_scales[f"{name}.k_scale"] = 1.0
-                default_scales[f"{name}.v_scale"] = 1.0
-        return default_scales
+    return kv_cache_dtype == "fp8" and vllm_precision == "fp8"
 
 
 def refit_policy_generation(
@@ -907,6 +801,9 @@ def refit_policy_generation(
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])
 
+    if kv_scales:
+        print(f"[KV_SCALES] Refit: Adding {len(kv_scales)} KV scales to weight update")
+
     # Create a context manager that does nothing when timer is None
     timer_context = (
         timer.time("prepare_for_generation/transfer_and_update_weights")
@@ -929,7 +826,7 @@ def refit_policy_generation(
                 )
 
             futures_train = policy.stream_weights_via_ipc_zmq(
-                buffer_size_bytes=buffer_size_bytes
+                buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
             )
             futures_inference = policy_generation.update_weights_via_ipc_zmq()
             # wait for all futures to complete
@@ -938,12 +835,8 @@ def refit_policy_generation(
             update_success = all(result for result in results if result is not None)
         else:
             # update weights through nccl
-            futures_train = policy.broadcast_weights_for_collective()
-            if kv_scales:
-                print(f"[KV_SCALES] Refit: Adding {len(kv_scales)} KV scales to collective weight update")
-                futures_inference = policy_generation.update_weights_from_collective(kv_scales=kv_scales)
-            else:
-                futures_inference = policy_generation.update_weights_from_collective()
+            futures_train = policy.broadcast_weights_for_collective(kv_scales=kv_scales)
+            futures_inference = policy_generation.update_weights_from_collective()
             # wait for all futures to complete
             ray.get(futures_train)
             results = ray.get(futures_inference)
@@ -1090,7 +983,7 @@ def grpo_train(
                     f"▶ Generating responses for batch of size {repeated_batch.size}...",
                     flush=True,
                 )
-                with timer.time("prepare_for_generation"):
+                with timer.time("prepare_for_generation/total"):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         # Compute KV scales if needed for FP8 quantization
                         if sync_kv_scales and kv_scales_cache is None:

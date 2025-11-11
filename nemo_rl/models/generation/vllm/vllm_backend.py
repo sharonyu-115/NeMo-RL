@@ -13,7 +13,7 @@
 # limitations under the License.
 import gc
 import traceback
-from typing import Any
+from typing import Any, Optional
 import torch
 import zmq
 
@@ -173,7 +173,7 @@ class VllmInternalWorkerExtension:
     @wrap_with_nvtx_name(
         "vllm_internal_worker_extension/update_weights_from_collective"
     )
-    def update_weights_from_collective(self, kv_scales: Optional[dict[str, float]] = None) -> bool:
+    def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "

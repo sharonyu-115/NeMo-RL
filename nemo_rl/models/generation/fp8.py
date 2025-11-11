@@ -148,7 +148,7 @@ def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None
         if not isinstance(k_scale, float) or not isinstance(
                 v_scale, float):
             raise ValueError("Only support per-tensor scaling factor "
-                             "for fp8 KV cache")
+                                "for fp8 KV cache")
 
         if layer.q_scale < 0.0:
             logger.warning_once(
@@ -156,6 +156,8 @@ def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None
                 "Setting it to k_scale. This only matters for "
                 "the flash-attn backend.")
             layer._q_scale.copy_(k_scale)
+            layer._q_scale_float = k_scale
+
         # These are used in the final Attention.forward()
         layer._k_scale.copy_(k_scale)
         layer._v_scale.copy_(v_scale)
@@ -187,13 +189,16 @@ def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None
     if not is_singleton_float(q_scale) or not is_singleton_float(
             prob_scale):
         raise ValueError("Only support per-tensor scaling factor"
-                         "for fp8-quantized Q/prob")
+                            "for fp8-quantized Q/prob")
 
     # These are used in the final Attention.forward()
     layer._q_scale.copy_(q_scale)
+    layer._q_scale_float = q_scale.item() if isinstance(
+        q_scale, torch.Tensor) else q_scale
+
     layer._prob_scale.copy_(prob_scale)
     if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0
-                                          or prob_scale == 1.0):
+                                            or prob_scale == 1.0):
         logger.warning_once(
             f"Using uncalibrated q_scale {q_scale} and/or prob_scale "
             f"{prob_scale} with fp8 attention. This may cause accuracy "

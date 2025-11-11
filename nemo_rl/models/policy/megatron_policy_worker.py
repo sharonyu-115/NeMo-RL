@@ -2509,9 +2509,8 @@ class CustomFloat16Module(Float16Module):
             return _pre_hook
 
         matched_modules = []
-        # 1) Try to register forward_pre_hook on core_attention first
+        # Try to register forward_pre_hook on core_attention first
         for name, module in self.model.named_modules():
-            print(f"[KV_SCALES] Module name: {name}")
             if "self_attention.core_attention" in name:
                 try:
                     handle = module.register_forward_pre_hook(_pre_hook_builder_core_attention(name))
@@ -2520,19 +2519,6 @@ class CustomFloat16Module(Float16Module):
                 except Exception as e:
                     print(f"[KV_SCALES] Error registering pre-hook on {name}: {e}")
                     continue
-
-        # 2) If core_attention is not hit, fall back to forward_hook on QKV projection output
-        if not hook_handles:
-            qkv_name_patterns = ("query_key_value", "linear_qkv", ".qkv", "_qkv")
-            for name, module in self.model.named_modules():
-                if any(pat in name for pat in qkv_name_patterns):
-                    try:
-                        handle = module.register_forward_hook(_hook_builder(name))
-                        hook_handles.append(handle)
-                        matched_modules.append((name, module.__class__.__name__, "post"))
-                    except Exception as e:
-                        print(f"[KV_SCALES] Error registering hook on {name}: {e}")
-                        continue
 
         if not hook_handles:
             print("[KV_SCALES] No QKV proj modules matched for hook. Example module/param names:")

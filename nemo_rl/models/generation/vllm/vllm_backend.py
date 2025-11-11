@@ -14,7 +14,6 @@
 import gc
 import traceback
 from typing import Any
-import traceback
 import torch
 import zmq
 
@@ -169,7 +168,6 @@ class VllmInternalWorkerExtension:
                 f"Error in VllmInternalWorkerExtension.update_weights_via_ipc_zmq: {e}.\n"
                 f"{traceback.format_exc()}"
             )
-            print(traceback.format_exc())
             return False
 
     @wrap_with_nvtx_name(

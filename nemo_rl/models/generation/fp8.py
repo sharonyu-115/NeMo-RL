@@ -115,6 +115,9 @@ def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None
     from vllm.platforms import current_platform
     
     logger = init_logger(__name__)
+
+    # print(f"[KV_SCALES] kv_cache_process_weights_after_loading: layer.k_scale = {layer.k_scale}, layer.v_scale = {layer.v_scale}")
+    print(f"[@@KV_SCALES@@] [fp8.py] kv_cache_process_weights_after_loading: layer.k_scale = {layer.k_scale}, layer.v_scale = {layer.v_scale}")
     
     # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
     # regardless whether the kv-scale is available in the checkpoint.
@@ -408,9 +411,12 @@ def load_weights(weights, model_runner):
     model = model_runner.model
 
     for k, v in weights:
+        if "scale" in k:
+            print(f"[@@KV_SCALES@@] [fp8.py] load_weights: Parameter {k}, value = {v.item() if v.numel() == 1 else v}")
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue
+        print(f"[@@KV_SCALES@@] [fp8.py] load_weights: Casting weight {k} into fp8")
         # Cast the weight into fp8 and its scale factor
         param_lp, param_scale = cast_tensor_to_fp8_blockwise(
             v.to(torch.float),

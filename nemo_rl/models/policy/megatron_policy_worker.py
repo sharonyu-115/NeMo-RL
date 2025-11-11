@@ -1902,6 +1902,13 @@ class MegatronPolicyWorker:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
+    def _extract_layer_key(self, module_name: str) -> int:
+        # Expected format: "module.decoder.layers.<idx>.self_attention.query_key_value"
+        m = re.search(r"model\.layers\.(\d+)", module_name)
+        if m is not None:
+            return int(m.group(1))
+        return -1
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
@@ -1921,16 +1928,17 @@ class MegatronPolicyWorker:
         # Also include KV/Q scale metadata so consumer can rely solely on state_dict_info
         try:
             import re
-            # Infer number of layers by scanning existing parameter names
+            # Infer number of layers by scanning existing parameter names (robust to various prefixes)
             max_layer_idx = -1
-            layer_regex = re.compile(r"^model\\.layers\\.(\\d+)\\.")
+            
             for k in refit_param_info_hf.keys():
-                m = layer_regex.match(k)
-                if m:
-                    idx = int(m.group(1))
-                    if idx > max_layer_idx:
-                        max_layer_idx = idx
-            num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+                # print(f"[@@KV_SCALES@@] prepare_refit_info: k = {k}")
+                idx = self._extract_layer_key(k)
+                if idx > max_layer_idx:
+                    max_layer_idx = idx
+
+            num_layers = (max_layer_idx + 1) if max_layer_idx >= 0 else 0
+            print(f"[@@KV_SCALES@@] prepare_refit_info: num_layers = {num_layers}")
             # Append q/k/v scale placeholders (shape [1], dtype float32)
             for layer_idx in range(num_layers):
                 q_key = f"model.layers.{layer_idx}.self_attn.attn.q_scale"
@@ -2019,30 +2027,24 @@ class MegatronPolicyWorker:
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
-        def _enumerate_kv_scale_keys():
-            import re
+        def iter_with_kv_scales():
             max_layer_idx = -1
-            layer_regex = re.compile(r"^model\\.layers\\.(\\d+)\\.")
-            # Use state_dict keys to infer number of layers
-            for name in self.model.state_dict().keys():
-                m = layer_regex.match(name)
-                if m:
-                    idx = int(m.group(1))
-                    if idx > max_layer_idx:
-                        max_layer_idx = idx
+            for name, tensor in hf_params_generator:
+                idx = self._extract_layer_key(name)
+                if idx > max_layer_idx:
+                    max_layer_idx = idx
+                
+                yield name, tensor
+
             num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+            print(f"[@@KV_SCALES@@] iter_with_kv_scales: num_layers = {num_layers}")
             keys = []
             for layer_idx in range(num_layers):
                 keys.append(f"model.layers.{layer_idx}.self_attn.attn.q_scale")
                 keys.append(f"model.layers.{layer_idx}.self_attn.k_scale")
                 keys.append(f"model.layers.{layer_idx}.self_attn.v_scale")
-            return keys
-
-        def iter_with_kv_scales():
-            for name, tensor in hf_params_generator:
-                yield name, tensor
             # Always append kv-scale entries to match metadata; use provided value or default 1.0
-            for param_name in _enumerate_kv_scale_keys():
+            for param_name in keys:
                 if kv_scales and param_name in kv_scales:
                     scale_value = kv_scales[param_name]
                 else:
@@ -2070,30 +2072,22 @@ class MegatronPolicyWorker:
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
-        def _enumerate_kv_scale_keys():
-            import re
+        def iter_with_kv_scales():
             max_layer_idx = -1
-            layer_regex = re.compile(r"^model\\.layers\\.(\\d+)\\.")
-            # Use state_dict keys to infer number of layers
-            for name in self.model.state_dict().keys():
-                m = layer_regex.match(name)
-                if m:
-                    idx = int(m.group(1))
-                    if idx > max_layer_idx:
-                        max_layer_idx = idx
+            for name, tensor in hf_params_generator:
+                idx = self._extract_layer_key(name)
+                if idx > max_layer_idx:
+                    max_layer_idx = idx
             num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+            print(f"[@@KV_SCALES@@] iter_with_kv_scales: num_layers = {num_layers}")
             keys = []
             for layer_idx in range(num_layers):
                 keys.append(f"model.layers.{layer_idx}.self_attn.attn.q_scale")
                 keys.append(f"model.layers.{layer_idx}.self_attn.k_scale")
                 keys.append(f"model.layers.{layer_idx}.self_attn.v_scale")
-            return keys
-
-        def iter_with_kv_scales():
-            for name, tensor in hf_params_generator:
                 yield name, tensor
             # Always append kv-scale entries to match metadata; use provided value or default 1.0
-            for param_name in _enumerate_kv_scale_keys():
+            for param_name in keys:
                 if kv_scales and param_name in kv_scales:
                     scale_value = kv_scales[param_name]
                 else:

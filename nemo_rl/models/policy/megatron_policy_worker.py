@@ -110,6 +110,7 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.models.generation.fp8 import get_vllm_qkv_scale_names
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -1927,29 +1928,15 @@ class MegatronPolicyWorker:
             refit_param_info_hf[name] = metadata
         # Also include KV/Q scale metadata so consumer can rely solely on state_dict_info
         try:
-            import re
-            # Infer number of layers by scanning existing parameter names (robust to various prefixes)
-            max_layer_idx = -1
-            
-            for k in refit_param_info_hf.keys():
-                # print(f"[@@KV_SCALES@@] prepare_refit_info: k = {k}")
-                idx = self._extract_layer_key(k)
-                if idx > max_layer_idx:
-                    max_layer_idx = idx
-
-            num_layers = (max_layer_idx + 1) if max_layer_idx >= 0 else 0
+            # Get number of layers directly from transformer config
+            num_layers = self.megatron_bridge.transformer_config.num_layers
             print(f"[@@KV_SCALES@@] prepare_refit_info: num_layers = {num_layers}")
             # Append q/k/v scale placeholders (shape [1], dtype float32)
             for layer_idx in range(num_layers):
-                q_key = f"model.layers.{layer_idx}.self_attn.attn.q_scale"
-                k_key = f"model.layers.{layer_idx}.self_attn.k_scale"
-                v_key = f"model.layers.{layer_idx}.self_attn.v_scale"
-                if q_key not in refit_param_info_hf:
-                    refit_param_info_hf[q_key] = ([1], torch.float32)
-                if k_key not in refit_param_info_hf:
-                    refit_param_info_hf[k_key] = ([1], torch.float32)
-                if v_key not in refit_param_info_hf:
-                    refit_param_info_hf[v_key] = ([1], torch.float32)
+                scale_names = get_vllm_qkv_scale_names(layer_idx)
+                for param_name in scale_names.values():
+                    if param_name not in refit_param_info_hf:
+                        refit_param_info_hf[param_name] = ([1], torch.float32)
         except Exception:
             pass
         return refit_param_info_hf
@@ -2028,21 +2015,17 @@ class MegatronPolicyWorker:
         )
 
         def iter_with_kv_scales():
-            max_layer_idx = -1
+            # First yield all model weights
             for name, tensor in hf_params_generator:
-                idx = self._extract_layer_key(name)
-                if idx > max_layer_idx:
-                    max_layer_idx = idx
-                
                 yield name, tensor
 
-            num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+            # Get number of layers directly from transformer config
+            num_layers = self.megatron_bridge.transformer_config.num_layers
             print(f"[@@KV_SCALES@@] iter_with_kv_scales: num_layers = {num_layers}")
             keys = []
             for layer_idx in range(num_layers):
-                keys.append(f"model.layers.{layer_idx}.self_attn.attn.q_scale")
-                keys.append(f"model.layers.{layer_idx}.self_attn.k_scale")
-                keys.append(f"model.layers.{layer_idx}.self_attn.v_scale")
+                scale_names = get_vllm_qkv_scale_names(layer_idx)
+                keys.extend(scale_names.values())
             # Always append kv-scale entries to match metadata; use provided value or default 1.0
             for param_name in keys:
                 if kv_scales and param_name in kv_scales:
@@ -2073,19 +2056,17 @@ class MegatronPolicyWorker:
         )
 
         def iter_with_kv_scales():
-            max_layer_idx = -1
+            # First yield all model weights
             for name, tensor in hf_params_generator:
-                idx = self._extract_layer_key(name)
-                if idx > max_layer_idx:
-                    max_layer_idx = idx
-            num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+                yield name, tensor
+            
+            # Get number of layers directly from transformer config
+            num_layers = self.megatron_bridge.transformer_config.num_layers
             print(f"[@@KV_SCALES@@] iter_with_kv_scales: num_layers = {num_layers}")
             keys = []
             for layer_idx in range(num_layers):
-                keys.append(f"model.layers.{layer_idx}.self_attn.attn.q_scale")
-                keys.append(f"model.layers.{layer_idx}.self_attn.k_scale")
-                keys.append(f"model.layers.{layer_idx}.self_attn.v_scale")
-                yield name, tensor
+                scale_names = get_vllm_qkv_scale_names(layer_idx)
+                keys.extend(scale_names.values())
             # Always append kv-scale entries to match metadata; use provided value or default 1.0
             for param_name in keys:
                 if kv_scales and param_name in kv_scales:

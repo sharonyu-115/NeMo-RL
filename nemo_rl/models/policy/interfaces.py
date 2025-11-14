@@ -189,5 +189,7 @@ class ColocatablePolicyInterface(PolicyInterface):
         pass
 
     @abstractmethod
-    def broadcast_weights_for_collective(self, kv_scales: Optional[dict[str, float]] = None) -> list[ray.ObjectRef]:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
         pass

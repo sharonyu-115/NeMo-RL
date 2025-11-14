@@ -106,19 +106,22 @@ def monkey_patch_vllm_ray_executor(fp8_config):
 
 
 def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-    """
-    Modified version of BaseKVCacheMethod.process_weights_after_loading that doesn't delete
-    k_scale, v_scale, q_scale, and prob_scale parameters to allow for dynamic updates.
+    """Modified version of BaseKVCacheMethod.process_weights_after_loading.
+
+    Doesn't delete k_scale, v_scale, q_scale, and prob_scale parameters to allow
+    for dynamic updates.
     """
     import torch
     from vllm.logger import init_logger
     from vllm.platforms import current_platform
-    
+
     logger = init_logger(__name__)
 
     # print(f"[KV_SCALES] kv_cache_process_weights_after_loading: layer.k_scale = {layer.k_scale}, layer.v_scale = {layer.v_scale}")
-    print(f"[@@KV_SCALES@@] [fp8.py] kv_cache_process_weights_after_loading: layer.k_scale = {layer.k_scale}, layer.v_scale = {layer.v_scale}")
-    
+    print(
+        f"[@@KV_SCALES@@] [fp8.py] kv_cache_process_weights_after_loading: layer.k_scale = {layer.k_scale}, layer.v_scale = {layer.v_scale}"
+    )
+
     # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
     # regardless whether the kv-scale is available in the checkpoint.
     # No need to process kv scales after loading if we are going to
@@ -148,16 +151,15 @@ def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None
                 k_scale *= 2
                 v_scale *= 2
 
-        if not isinstance(k_scale, float) or not isinstance(
-                v_scale, float):
-            raise ValueError("Only support per-tensor scaling factor "
-                                "for fp8 KV cache")
+        if not isinstance(k_scale, float) or not isinstance(v_scale, float):
+            raise ValueError("Only support per-tensor scaling factor for fp8 KV cache")
 
         if layer.q_scale < 0.0:
             logger.warning_once(
                 "Checkpoint does not provide a q scaling factor. "
                 "Setting it to k_scale. This only matters for "
-                "the flash-attn backend.")
+                "the flash-attn backend."
+            )
             layer._q_scale.copy_(k_scale)
             layer._q_scale_float = k_scale
 
@@ -166,12 +168,12 @@ def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None
         layer._v_scale.copy_(v_scale)
         layer._k_scale_float = k_scale
         layer._v_scale_float = v_scale
-        if (k_scale == 1.0 and v_scale == 1.0
-                and "e5m2" not in layer.kv_cache_dtype):
+        if k_scale == 1.0 and v_scale == 1.0 and "e5m2" not in layer.kv_cache_dtype:
             logger.warning_once(
                 "Using KV cache scaling factor 1.0 for fp8_e4m3. This "
                 "may cause accuracy issues. Please make sure k/v_scale "
-                "scaling factors are available in the fp8 checkpoint.")
+                "scaling factors are available in the fp8 checkpoint."
+            )
 
     if layer.q_scale > 0.0:
         q_scale = layer.q_scale
@@ -187,52 +189,59 @@ def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None
     else:
         prob_scale = 1.0
 
-    is_singleton_float = lambda x: isinstance(x, float) or isinstance(
-        x, torch.Tensor) and x.numel() == 1 and x.is_floating_point()
-    if not is_singleton_float(q_scale) or not is_singleton_float(
-            prob_scale):
-        raise ValueError("Only support per-tensor scaling factor"
-                            "for fp8-quantized Q/prob")
+    is_singleton_float = (
+        lambda x: isinstance(x, float)
+        or isinstance(x, torch.Tensor)
+        and x.numel() == 1
+        and x.is_floating_point()
+    )
+    if not is_singleton_float(q_scale) or not is_singleton_float(prob_scale):
+        raise ValueError(
+            "Only support per-tensor scaling factorfor fp8-quantized Q/prob"
+        )
 
     # These are used in the final Attention.forward()
     layer._q_scale.copy_(q_scale)
-    layer._q_scale_float = q_scale.item() if isinstance(
-        q_scale, torch.Tensor) else q_scale
+    layer._q_scale_float = (
+        q_scale.item() if isinstance(q_scale, torch.Tensor) else q_scale
+    )
 
     layer._prob_scale.copy_(prob_scale)
-    if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0
-                                            or prob_scale == 1.0):
+    if layer.kv_cache_dtype == "fp8" and (q_scale == 1.0 or prob_scale == 1.0):
         logger.warning_once(
             f"Using uncalibrated q_scale {q_scale} and/or prob_scale "
             f"{prob_scale} with fp8 attention. This may cause accuracy "
             "issues. Please make sure q/prob scaling factors are "
-            "available in the fp8 checkpoint.")
+            "available in the fp8 checkpoint."
+        )
 
     # IMPORTANT: We DON'T delete the parameters here to allow for dynamic updates
     # Original code deleted: layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
-    print(f"[KV_SCALES] Patched process_weights_after_loading: keeping k_scale, v_scale parameters for dynamic updates")
+    print(
+        "[KV_SCALES] Patched process_weights_after_loading: keeping k_scale, v_scale parameters for dynamic updates"
+    )
 
 
 def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
     """Get vLLM-compatible parameter names for Q/K/V FP8 scales.
-    
+
     This function centralizes the naming convention for Q/K/V scale parameters
     that vLLM expects. These names must match vLLM's internal parameter structure.
-    
+
     Args:
         layer_idx: The transformer layer index (0-based)
-    
+
     Returns:
         Dictionary mapping scale types to vLLM parameter names:
         - 'q_scale': Q activation scale name
-        - 'k_scale': K activation scale name  
+        - 'k_scale': K activation scale name
         - 'v_scale': V activation scale name
-    
+
     Note:
         The q_scale has an extra '.attn.' component compared to k_scale/v_scale.
         This matches vLLM's parameter remapping logic in:
         vllm.model_executor.model_loader.weight_utils.maybe_remap_kv_scale_name
-    
+
     Example:
         >>> get_vllm_qkv_scale_names(0)
         {
@@ -249,22 +258,22 @@ def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
 
 
 def convert_calibration_to_vllm_format(
-    calibration_results: dict[str, dict[str, float]]
+    calibration_results: dict[str, dict[str, float]],
 ) -> dict[str, float]:
     """Convert NeMo-RL calibration results to vLLM parameter format.
-    
+
     This function transforms the calibration output format (with layer_N keys)
     into the flat dictionary format that vLLM expects for parameter loading.
-    
+
     Args:
         calibration_results: Dict with keys like "layer_0", "layer_1", etc.
             Each value is a dict with keys: "q_scale", "k_scale", "v_scale"
             and corresponding float scale values.
-    
+
     Returns:
         Flat dictionary mapping vLLM parameter names to scale values.
         Keys follow vLLM's naming convention as defined in get_vllm_qkv_scale_names.
-    
+
     Example:
         >>> calib = {
         ...     "layer_0": {"q_scale": 1.0, "k_scale": 2.0, "v_scale": 3.0},
@@ -285,11 +294,11 @@ def convert_calibration_to_vllm_format(
         # Extract layer index from "layer_N" format
         layer_idx = int(layer_key.split("_")[1])
         param_names = get_vllm_qkv_scale_names(layer_idx)
-        
+
         vllm_scales[param_names["q_scale"]] = scales["q_scale"]
         vllm_scales[param_names["k_scale"]] = scales["k_scale"]
         vllm_scales[param_names["v_scale"]] = scales["v_scale"]
-    
+
     return vllm_scales
 
 
@@ -393,7 +402,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     vllm_kwargs = {
         "quantization": "fp8",
         # Conditionally set kv_cache_dtype to fp8 if global config kv_cache_dtype is fp8
-        "kv_cache_dtype": "fp8" if global_fp8_config.kv_cache_dtype == "fp8" else "auto",
+        "kv_cache_dtype": "fp8"
+        if global_fp8_config.kv_cache_dtype == "fp8"
+        else "auto",
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
     return vllm_kwargs
@@ -492,7 +503,9 @@ def load_weights(weights, model_runner):
 
     for k, v in weights:
         if "scale" in k:
-            print(f"[@@KV_SCALES@@] [fp8.py] load_weights: Parameter {k}, value = {v.item() if v.numel() == 1 else v}")
+            print(
+                f"[@@KV_SCALES@@] [fp8.py] load_weights: Parameter {k}, value = {v.item() if v.numel() == 1 else v}"
+            )
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue

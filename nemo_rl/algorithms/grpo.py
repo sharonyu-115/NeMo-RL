@@ -452,9 +452,15 @@ def setup(
         if generation_config["vllm_cfg"].get("kv_cache_dtype") == "fp8":
             # Temporary additional FP8 KV cache compatibility checks
             # TODO: Add the related support
-            assert policy_config["dtensor_cfg"]["enabled"] == False, "DTensor backend is not supported with kv cache fp8 enabled."
-            assert not _should_use_async_rollouts(master_config), "Async rollouts is not supported with kv cache fp8 enabled."
-            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, "Pipeline model parallel size must be 1 for megatron backend with kv cache fp8 enabled."
+            assert policy_config["dtensor_cfg"]["enabled"] == False, (
+                "DTensor backend is not supported with kv cache fp8 enabled."
+            )
+            assert not _should_use_async_rollouts(master_config), (
+                "Async rollouts is not supported with kv cache fp8 enabled."
+            )
+            assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
+                "Pipeline model parallel size must be 1 for megatron backend with kv cache fp8 enabled."
+            )
 
         ## make vllm hf overrides match the training policy
         generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
@@ -743,11 +749,11 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     generation_config = master_config["policy"]["generation"]
     if generation_config is None:
         return False
-    
+
     backend = generation_config.get("backend", "")
     if backend != "vllm":
         return False
-    
+
     vllm_cfg = generation_config.get("vllm_cfg", {})
     return vllm_cfg.get("async_engine", False)
 
@@ -777,24 +783,23 @@ def _should_use_penguin(master_config: MasterConfig) -> bool:
 
 # Function to check if KV cache scales should be calculated and synchronized during refit
 def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
-    """
-    Check if KV cache scales should be synchronized during refit.
-    
+    """Check if KV cache scales should be synchronized during refit.
+
     Returns True if:
     - vLLM precision is fp8 and kv_cache_dtype is fp8
     """
     generation_config = master_config["policy"]["generation"]
     if generation_config is None:
         return False
-    
+
     backend = generation_config.get("backend", "")
     if backend != "vllm":
         return False
-    
+
     vllm_cfg = generation_config.get("vllm_cfg", {})
     kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
     vllm_precision = vllm_cfg.get("precision", "auto")
-    
+
     return kv_cache_dtype == "fp8" and vllm_precision == "fp8"
 
 
@@ -907,12 +912,16 @@ def grpo_train(
 
     # Check if we need to sync KV cache scales (infer from config)
     sync_kv_scales = _should_sync_kv_scales(master_config)
-    kv_scales_cache = None  # Cache reused for computed kv scales 
-    
-    if sync_kv_scales:        
-        print(f"[KV_SCALES] FP8 KV cache detected, will sync q_scale, _k_scale and _v_scale during refit")
+    kv_scales_cache = None  # Cache reused for computed kv scales
+
+    if sync_kv_scales:
+        print(
+            "[KV_SCALES] FP8 KV cache detected, will sync q_scale, _k_scale and _v_scale during refit"
+        )
     else:
-        print("[KV_SCALES] KV cache scale sync not needed (non-FP8 mode or kv_cache_dtype is not fp8)")
+        print(
+            "[KV_SCALES] KV cache scale sync not needed (non-FP8 mode or kv_cache_dtype is not fp8)"
+        )
 
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
@@ -1007,25 +1016,36 @@ def grpo_train(
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         # Compute KV scales if needed for FP8 quantization
                         if sync_kv_scales and kv_scales_cache is None:
-                            print("[KV_SCALES] Computing KV cache scales for the first time...")
+                            print(
+                                "[KV_SCALES] Computing KV cache scales for the first time..."
+                            )
                             policy.prepare_for_lp_inference()
                             # Create calibration data from flattened messages
                             calibration_data = BatchedDataDict[ClippedPGLossDataDict](
                                 {
                                     "input_ids": batched_flat["token_ids"],
-                                    "input_lengths": input_lengths
+                                    "input_lengths": input_lengths,
                                 }
                             )
                             # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                            calibration_data.update(batched_flat.get_multimodal_dict(as_tensors=False))
+                            calibration_data.update(
+                                batched_flat.get_multimodal_dict(as_tensors=False)
+                            )
                             calibration_data.to("cpu")
-                            kv_scales = policy.calibrate_qkv_fp8_scales(calibration_data, include_q=True)["layers"]
+                            kv_scales = policy.calibrate_qkv_fp8_scales(
+                                calibration_data, include_q=True
+                            )["layers"]
                             # Convert calibration results to vLLM parameter format
-                            kv_scales_cache = convert_calibration_to_vllm_format(kv_scales)
-                        
+                            kv_scales_cache = convert_calibration_to_vllm_format(
+                                kv_scales
+                            )
+
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference, timer=timer,
-                            kv_scales=kv_scales_cache if sync_kv_scales else None
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            timer=timer,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -1226,8 +1246,12 @@ def grpo_train(
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
                     with timer.time("recompute_kv_scales"):
-                        print("[KV_SCALES] Recomputing KV cache scales after policy update...")
-                        kv_scales = policy.calibrate_qkv_fp8_scales(train_data, include_q=True)["layers"]
+                        print(
+                            "[KV_SCALES] Recomputing KV cache scales after policy update..."
+                        )
+                        kv_scales = policy.calibrate_qkv_fp8_scales(
+                            train_data, include_q=True
+                        )["layers"]
                         # Convert calibration results to vLLM parameter format
                         kv_scales_cache = convert_calibration_to_vllm_format(kv_scales)
                         # Set generation as stale to force refit with new scales

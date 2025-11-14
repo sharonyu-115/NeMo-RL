@@ -13,7 +13,8 @@
 # limitations under the License.
 import gc
 import traceback
-from typing import Any, Optional
+from typing import Any
+
 import torch
 import zmq
 
@@ -160,20 +161,22 @@ class VllmInternalWorkerExtension:
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
-            # When kv_scales is provided, we need to invoke process_weights_after_loading() 
+            # When kv_scales is provided, we need to invoke process_weights_after_loading()
             # to copy the kv scales to the _k_scale and _v_scale attributes used during inference
             # if kv_scales:
-            print(f"[@@KV_SCALES@@] [vllm_backend.py] update_weights_via_ipc_zmq: Processing KV cache scales after weight loading")
-            from vllm.model_executor.model_loader.utils import process_weights_after_loading
-            
+            print(
+                "[@@KV_SCALES@@] [vllm_backend.py] update_weights_via_ipc_zmq: Processing KV cache scales after weight loading"
+            )
+            from vllm.model_executor.model_loader.utils import (
+                process_weights_after_loading,
+            )
+
             # Get target device for processing
             target_device = next(self.model_runner.model.parameters()).device
-            
+
             # Call process_weights_after_loading to handle KV scales
             process_weights_after_loading(
-                self.model_runner.model, 
-                self.model_runner.model_config, 
-                target_device
+                self.model_runner.model, self.model_runner.model_config, target_device
             )
 
             gc.collect()

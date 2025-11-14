@@ -701,8 +701,8 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
     ) -> dict[str, Any]:
         """Trigger KV-cache FP8 scale calibration across Megatron workers and return results.
 
-        Note: The backend `MegatronPolicyWorker.calibrate_qkv_fp8_scales` already implements 
-        distributed reduction, returning results merged across ranks. Therefore, we shard the 
+        Note: The backend `MegatronPolicyWorker.calibrate_qkv_fp8_scales` already implements
+        distributed reduction, returning results merged across ranks. Therefore, we shard the
         input by DP and call in parallel, then take the result from the first worker.
         """
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
@@ -762,14 +762,20 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         free_memory_bytes = min(ray.get(future) for future in futures)
         return free_memory_bytes
 
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None) -> list[ray.ObjectRef]:
+    def stream_weights_via_ipc_zmq(
+        self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
         """Send the weights for IPC handles via ZMQ socket."""
         futures = self.worker_group.run_all_workers_single_data(
-            "stream_weights_via_ipc_zmq", buffer_size_bytes=buffer_size_bytes, kv_scales=kv_scales
+            "stream_weights_via_ipc_zmq",
+            buffer_size_bytes=buffer_size_bytes,
+            kv_scales=kv_scales,
         )
         return futures
 
-    def broadcast_weights_for_collective(self, kv_scales: Optional[dict[str, float]] = None) -> list[ray.ObjectRef]:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
         """Broadcast the weights for collective communication."""
         futures = self.worker_group.run_all_workers_single_data(
             "broadcast_weights_for_collective",

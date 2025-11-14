@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import json
 import math
 import os
+import re
 import time
 import warnings
 from collections import defaultdict
-import json
-import re
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import partial
 from typing import Any, Iterator, Optional, TypeVar
@@ -2001,7 +2001,9 @@ class MegatronPolicyWorker:
 
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
-    def stream_weights_via_ipc_zmq(self, buffer_size_bytes: int = 0,  kv_scales: Optional[dict[str, float]] = None) -> None:
+    def stream_weights_via_ipc_zmq(
+        self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
         self.maybe_init_zmq()
 
@@ -2047,7 +2049,9 @@ class MegatronPolicyWorker:
         )
 
     @torch.no_grad()
-    def broadcast_weights_for_collective(self, kv_scales: Optional[dict[str, float]] = None) -> None:
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
         """Broadcast the weights for collective communication."""
         hf_params_generator = self.megatron_bridge.export_hf_weights(
             [self.model],
@@ -2059,7 +2063,7 @@ class MegatronPolicyWorker:
             # First yield all model weights
             for name, tensor in hf_params_generator:
                 yield name, tensor
-            
+
             # Get number of layers directly from transformer config
             num_layers = self.megatron_bridge.transformer_config.num_layers
             print(f"[@@KV_SCALES@@] iter_with_kv_scales: num_layers = {num_layers}")
@@ -2265,7 +2269,9 @@ class MegatronPolicyWorker:
         # Temporary fix to avoid OOM after saving checkpoint
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-        print(f"GPU Memory before saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+        print(
+            f"GPU Memory before saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
@@ -2326,7 +2332,7 @@ class MegatronPolicyWorker:
 
             if not is_training:  # Restore training state if it was changed
                 self.model.train()
-            
+
             # Temporary fix to avoid OOM after saving checkpoint: https://github.com/NVIDIA-NeMo/RL/issues/1057
             torch.randn(1).cuda()  # wake up torch allocator
             if hasattr(self, "optimizer") and self.optimizer is not None:
@@ -2348,8 +2354,9 @@ class MegatronPolicyWorker:
 
             allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
             reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-            print(f"GPU Memory after saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-
+            print(
+                f"GPU Memory after saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+            )
 
         except Exception as e:
             print(f"Failed to save checkpoint to {weights_path}: {e}")
@@ -2507,11 +2514,19 @@ class MegatronPolicyWorker:
                     k = args[1]
                     v = args[2]
                     if include_q:
-                        layer_to_samples_q[layer_key].append(float(torch.amax(torch.abs(q)).item()))
-                    layer_to_samples_k[layer_key].append(float(torch.amax(torch.abs(k)).item()))
-                    layer_to_samples_v[layer_key].append(float(torch.amax(torch.abs(v)).item()))
+                        layer_to_samples_q[layer_key].append(
+                            float(torch.amax(torch.abs(q)).item())
+                        )
+                    layer_to_samples_k[layer_key].append(
+                        float(torch.amax(torch.abs(k)).item())
+                    )
+                    layer_to_samples_v[layer_key].append(
+                        float(torch.amax(torch.abs(v)).item())
+                    )
                 except Exception as e:
-                    print(f"[KV_SCALES] Error in core_attention pre-hook on {module_name}: {e}")
+                    print(
+                        f"[KV_SCALES] Error in core_attention pre-hook on {module_name}: {e}"
+                    )
                     pass
 
             return _pre_hook
@@ -2521,7 +2536,9 @@ class MegatronPolicyWorker:
         for name, module in self.model.named_modules():
             if "self_attention.core_attention" in name:
                 try:
-                    handle = module.register_forward_pre_hook(_pre_hook_builder_core_attention(name))
+                    handle = module.register_forward_pre_hook(
+                        _pre_hook_builder_core_attention(name)
+                    )
                     hook_handles.append(handle)
                     matched_modules.append((name, module.__class__.__name__, "pre"))
                 except Exception as e:
@@ -2529,7 +2546,9 @@ class MegatronPolicyWorker:
                     continue
 
         if not hook_handles:
-            print("[KV_SCALES] No QKV proj modules matched for hook. Example module/param names:")
+            print(
+                "[KV_SCALES] No QKV proj modules matched for hook. Example module/param names:"
+            )
             try:
                 # Print the first 10 modules and parameters to help locate the actual names
                 cnt = 0
@@ -2561,27 +2580,43 @@ class MegatronPolicyWorker:
                     h.remove()
                 except Exception as e:
                     print(f"[KV_SCALES] Error removing hook: {e}")
-                    pass    
+                    pass
 
         # Compute local percentile amax
         def _percentile(values: list[float], p: float) -> float:
             if not values:
                 return 0.0
             t = torch.tensor(sorted(values), device="cuda", dtype=torch.float32)
-            rank = max(0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1)))))
+            rank = max(
+                0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1))))
+            )
             return float(t[rank].item())
 
         local_layer_to_pamax = {}
-        for layer_key in set(list(layer_to_samples_k.keys()) + list(layer_to_samples_v.keys()) + (list(layer_to_samples_q.keys()) if include_q else [])):
+        for layer_key in set(
+            list(layer_to_samples_k.keys())
+            + list(layer_to_samples_v.keys())
+            + (list(layer_to_samples_q.keys()) if include_q else [])
+        ):
             entry = {}
             if include_q:
-                entry["q_amax_p"] = _percentile(layer_to_samples_q.get(layer_key, []), percentile)
-            entry["k_amax_p"] = _percentile(layer_to_samples_k.get(layer_key, []), percentile)
-            entry["v_amax_p"] = _percentile(layer_to_samples_v.get(layer_key, []), percentile)
+                entry["q_amax_p"] = _percentile(
+                    layer_to_samples_q.get(layer_key, []), percentile
+                )
+            entry["k_amax_p"] = _percentile(
+                layer_to_samples_k.get(layer_key, []), percentile
+            )
+            entry["v_amax_p"] = _percentile(
+                layer_to_samples_v.get(layer_key, []), percentile
+            )
             local_layer_to_pamax[layer_key] = entry
 
         # Merge across all ranks: take maximum of percentile amax (conservative approach)
-        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
         gathered = [None for _ in range(world_size)] if world_size > 1 else None
         if world_size > 1:
             torch.distributed.all_gather_object(gathered, local_layer_to_pamax)
@@ -2630,7 +2665,9 @@ class MegatronPolicyWorker:
                 final_result = obj_list[0]  # type: ignore
 
         # Optional save to JSON (only rank0)
-        if save_path is not None and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+        if save_path is not None and (
+            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        ):
             try:
                 with open(save_path, "w") as f:
                     json.dump(final_result, f)

@@ -502,7 +502,8 @@ def setup(
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
         if generation_config["vllm_cfg"].get("kv_cache_dtype") == "fp8":
-            # Temporary additional FP8 KV cache compatibility checks
+            # FP8 KV cache compatibility checks
+            # These checks are independent of model precision (can use bf16 or fp8 weights with fp8 KV cache)
             # TODO: Add the related support
             assert policy_config["dtensor_cfg"]["enabled"] == False, (
                 "DTensor backend is not supported with kv cache fp8 enabled."
@@ -882,7 +883,10 @@ def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
     """Check if KV cache scales should be synchronized during refit.
 
     Returns True if:
-    - vLLM precision is fp8 and kv_cache_dtype is fp8
+    - kv_cache_dtype is fp8 (independent of precision)
+    
+    Note: KV cache scales are only needed when kv_cache_dtype is FP8.
+    The model precision (fp8 or bf16) is independent of this requirement.
     """
     generation_config = master_config["policy"]["generation"]
     if generation_config is None:
@@ -894,9 +898,9 @@ def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
 
     vllm_cfg = generation_config.get("vllm_cfg", {})
     kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-    vllm_precision = vllm_cfg.get("precision", "auto")
-
-    return kv_cache_dtype == "fp8" and vllm_precision == "fp8"
+    
+    # Only check kv_cache_dtype, not precision. This allows: precision=bf16 with kv_cache_dtype=fp8
+    return kv_cache_dtype == "fp8"
 
 
 def refit_policy_generation(
@@ -1008,16 +1012,12 @@ def grpo_train(
 
     # Check if we need to sync KV cache scales (infer from config)
     sync_kv_scales = _should_sync_kv_scales(master_config)
-    kv_scales_cache = None  # Cache reused for computed kv scales
-
-    if sync_kv_scales:
-        print(
-            "[KV_SCALES] FP8 KV cache detected, will sync q_scale, _k_scale and _v_scale during refit"
-        )
+    kv_scales_cache = None  # Cache reused for computed kv scales 
+    
+    if sync_kv_scales:        
+        print(f"[KV_SCALES] FP8 KV cache enabled (kv_cache_dtype=fp8), will sync q_scale, k_scale and v_scale during refit")
     else:
-        print(
-            "[KV_SCALES] KV cache scale sync not needed (non-FP8 mode or kv_cache_dtype is not fp8)"
-        )
+        print("[KV_SCALES] KV cache scale sync not needed (kv_cache_dtype is not fp8, regardless of model precision)")
 
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)

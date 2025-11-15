@@ -161,23 +161,31 @@ class VllmInternalWorkerExtension:
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
-            # When kv_scales is provided, we need to invoke process_weights_after_loading()
-            # to copy the kv scales to the _k_scale and _v_scale attributes used during inference
-            # if kv_scales:
-            print(
-                "[@@KV_SCALES@@] [vllm_backend.py] update_weights_via_ipc_zmq: Processing KV cache scales after weight loading"
-            )
-            from vllm.model_executor.model_loader.utils import (
-                process_weights_after_loading,
-            )
-
-            # Get target device for processing
-            target_device = next(self.model_runner.model.parameters()).device
-
-            # Call process_weights_after_loading to handle KV scales
-            process_weights_after_loading(
-                self.model_runner.model, self.model_runner.model_config, target_device
-            )
+            # CHANGE: Only invoke process_weights_after_loading when kv_cache_dtype is FP8
+            # Check if KV cache is using FP8
+            use_fp8_kv_cache = False
+            if hasattr(self.model_runner.vllm_config, 'cache_config'):
+                kv_cache_dtype = getattr(self.model_runner.vllm_config.cache_config, 'cache_dtype', None)
+                print(f"[KV_SCALES] [vllm_backend.py] update_weights_via_ipc_zmq: kv_cache_dtype is {kv_cache_dtype}")
+                use_fp8_kv_cache = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
+            
+            if use_fp8_kv_cache:
+                # When kv_scales is provided, we need to invoke process_weights_after_loading() 
+                # to copy the kv scales to the _k_scale and _v_scale attributes used during inference
+                print(f"[@@KV_SCALES@@] [vllm_backend.py] update_weights_via_ipc_zmq: kv_cache_dtype is FP8, processing KV cache scales after weight loading")
+                from vllm.model_executor.model_loader.utils import process_weights_after_loading
+                
+                # Get target device for processing
+                target_device = next(self.model_runner.model.parameters()).device
+                
+                # Call process_weights_after_loading to handle KV scales
+                process_weights_after_loading(
+                    self.model_runner.model, 
+                    self.model_runner.model_config, 
+                    target_device
+                )
+            else:
+                print(f"[KV_SCALES] [vllm_backend.py] update_weights_via_ipc_zmq: kv_cache_dtype is not FP8, skipping process_weights_after_loading")
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -226,6 +234,32 @@ class VllmInternalWorkerExtension:
                 src=0,
                 post_unpack_func=load_model_weight_func,
             )
+            
+            # CHANGE: Only invoke process_weights_after_loading when kv_cache_dtype is FP8
+            # Check if KV cache is using FP8
+            use_fp8_kv_cache = False
+            if hasattr(self.model_runner.vllm_config, 'cache_config'):
+                kv_cache_dtype = getattr(self.model_runner.vllm_config.cache_config, 'cache_dtype', None)
+                use_fp8_kv_cache = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
+            
+            if use_fp8_kv_cache:
+                # When KV scales are broadcast, we need to invoke process_weights_after_loading() 
+                # to copy the kv scales to the _k_scale and _v_scale attributes used during inference
+                print(f"[@@KV_SCALES@@] [vllm_backend.py] update_weights_from_collective: kv_cache_dtype is FP8, processing KV cache scales after weight loading")
+                from vllm.model_executor.model_loader.utils import process_weights_after_loading
+                
+                # Get target device for processing
+                target_device = next(self.model_runner.model.parameters()).device
+                
+                # Call process_weights_after_loading to handle KV scales
+                process_weights_after_loading(
+                    self.model_runner.model, 
+                    self.model_runner.model_config, 
+                    target_device
+                )
+            else:
+                print(f"[KV_SCALES] [vllm_backend.py] update_weights_from_collective: kv_cache_dtype is not FP8, skipping process_weights_after_loading")
+                
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"

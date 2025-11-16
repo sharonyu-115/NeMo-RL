@@ -883,9 +883,13 @@ def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
     """Check if KV cache scales should be synchronized during refit.
 
     Returns True if:
-    - kv_cache_dtype is fp8 (independent of precision)
+    - kv_cache_dtype is fp8 AND
+    - calculate_kv_scales is False (static scales mode)
     
-    Note: KV cache scales are only needed when kv_cache_dtype is FP8.
+    When calculate_kv_scales=True (dynamic mode), vLLM calculates scales 
+    automatically during forward passes, so no sync is needed.
+    
+    Note: KV cache scales are only relevant when kv_cache_dtype is FP8.
     The model precision (fp8 or bf16) is independent of this requirement.
     """
     generation_config = master_config["policy"]["generation"]
@@ -898,9 +902,10 @@ def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
 
     vllm_cfg = generation_config.get("vllm_cfg", {})
     kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
+    calculate_kv_scales = vllm_cfg.get("calculate_kv_scales", False)
     
-    # Only check kv_cache_dtype, not precision. This allows: precision=bf16 with kv_cache_dtype=fp8
-    return kv_cache_dtype == "fp8"
+    # Only sync scales when using FP8 KV cache with static scales (not dynamic calculation)
+    return kv_cache_dtype == "fp8" and not calculate_kv_scales
 
 
 def refit_policy_generation(
@@ -1014,10 +1019,18 @@ def grpo_train(
     sync_kv_scales = _should_sync_kv_scales(master_config)
     kv_scales_cache = None  # Cache reused for computed kv scales 
     
+    vllm_cfg = master_config["policy"]["generation"].get("vllm_cfg", {})
+    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
+    calculate_kv_scales = vllm_cfg.get("calculate_kv_scales", False)
+    
     if sync_kv_scales:        
-        print(f"[KV_SCALES] FP8 KV cache enabled (kv_cache_dtype=fp8), will sync q_scale, k_scale and v_scale during refit")
+        print(f"[KV_SCALES] FP8 KV cache with static scales (kv_cache_dtype=fp8, calculate_kv_scales=False)")
+        print(f"[KV_SCALES] Will compute and sync q_scale, k_scale, v_scale during refit")
+    elif kv_cache_dtype == "fp8" and calculate_kv_scales:
+        print(f"[KV_SCALES] FP8 KV cache with dynamic calculation (kv_cache_dtype=fp8, calculate_kv_scales=True)")
+        print(f"[KV_SCALES] vLLM will calculate scales dynamically on each forward pass, no sync needed")
     else:
-        print("[KV_SCALES] KV cache scale sync not needed (kv_cache_dtype is not fp8, regardless of model precision)")
+        print("[KV_SCALES] KV cache scale sync not needed (kv_cache_dtype is not fp8)")
 
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)

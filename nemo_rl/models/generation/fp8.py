@@ -42,6 +42,7 @@ class FP8Config:
     model_parallel_size: int = None
     kv_cache_dtype: str = "auto"
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
+    calculate_kv_scales: bool = False  # Whether to dynamically calculate KV scales
 
 
 @dataclass()
@@ -303,6 +304,48 @@ def convert_calibration_to_vllm_format(
     return vllm_scales
 
 
+def reset_calculate_kv_scales_in_worker(worker):
+    """Reset calculate_kv_scales flag for all attention layers after wake_up.
+    
+    This is called after wake_up to ensure KV scales are recalculated with new weights.
+    """
+    print("[FP8_PATCHES] reset_calculate_kv_scales_in_worker called")
+    try:
+        model = worker.model_runner.model
+        print(f"[FP8_PATCHES] Searching for attention layers in model: {type(model).__name__}")
+        
+        # Iterate through all modules to find attention layers
+        attention_layers_found = 0
+        for name, module in model.named_modules():
+            # Check if this is an Attention layer with calculate_kv_scales attribute
+            if hasattr(module, 'calculate_kv_scales') and hasattr(module, 'kv_cache_dtype'):
+                if module.kv_cache_dtype == "fp8":
+                    print(f"[FP8_PATCHES] Found attention layer: {name}, kv_cache_dtype={module.kv_cache_dtype}, calculate_kv_scales={module.calculate_kv_scales}")
+                    module.calculate_kv_scales = True
+                    attention_layers_found += 1
+                    print(f"[FP8_PATCHES] Reset calculate_kv_scales=True for layer: {name}")
+        
+        print(f"[FP8_PATCHES] Total attention layers reset: {attention_layers_found}")
+    except Exception as e:
+        print(f"[FP8_PATCHES] Error in reset_calculate_kv_scales_in_worker: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def patched_wake_up(original_wake_up):
+    """Wrapper for Worker.wake_up that resets calculate_kv_scales after waking up."""
+    def wake_up_wrapper(self, tags=None):
+        print("[FP8_PATCHES] patched_wake_up called")
+        # Call original wake_up
+        result = original_wake_up(self, tags)
+        
+        # Reset calculate_kv_scales for all attention layers
+        reset_calculate_kv_scales_in_worker(self)
+        
+        return result
+    return wake_up_wrapper
+
+
 def apply_fp8_patches(self, fp8_config):
     global global_fp8_config, fp8_patches_applied
     assert not fp8_patches_applied
@@ -341,10 +384,20 @@ def apply_fp8_patches(self, fp8_config):
     if global_fp8_config.kv_cache_dtype == "fp8":
         print("[FP8_PATCHES] Applying FP8 KV cache patches (kv_cache_dtype=fp8)")
         
-        # Patch the vllm kv_cache.py process_weights_after_loading() to remove the deletion of k_scale and v_scale
-        func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
-        patcher5 = patch(func5_path, kv_cache_process_weights_after_loading)
-        fp8_state.vllm_patches.append(patcher5)
+        if global_fp8_config.calculate_kv_scales:
+            # Dynamic calculation mode: patch wake_up to reset calculate_kv_scales
+            print("[FP8_PATCHES] Enabling dynamic KV scale recalculation (calculate_kv_scales=True)")
+            from vllm.v1.worker.gpu_worker import Worker
+            original_wake_up = Worker.wake_up
+            Worker.wake_up = patched_wake_up(original_wake_up)
+            print("[FP8_PATCHES] Patched Worker.wake_up to reset calculate_kv_scales after wake_up")
+        else:
+            # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
+            print("[FP8_PATCHES] Using static KV scales (calculate_kv_scales=False)")
+            func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
+            patcher5 = patch(func5_path, kv_cache_process_weights_after_loading)
+            fp8_state.vllm_patches.append(patcher5)
+            print("[FP8_PATCHES] Patched process_weights_after_loading to preserve k_scale/v_scale for updates")
 
     for p in fp8_state.vllm_patches:
         p.start()
@@ -363,6 +416,17 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
     
+    # Extract calculate_kv_scales from config (default to False for backward compatibility)
+    calculate_kv_scales = vllm_cfg.get("calculate_kv_scales", False)
+    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
+    
+    # Validate configuration
+    if calculate_kv_scales and kv_cache_dtype != "fp8":
+        raise ValueError(
+            f"calculate_kv_scales=True requires kv_cache_dtype='fp8', "
+            f"but got kv_cache_dtype='{kv_cache_dtype}'"
+        )
+    
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
         use_activation_pow2_scale=vllm_cfg.get(
@@ -371,8 +435,9 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         num_first_layers_in_bf16=vllm_cfg.get("num_first_layers_in_bf16", 0),
         num_last_layers_in_bf16=vllm_cfg.get("num_last_layers_in_bf16", 0),
         model_parallel_size=model_parallel_size,
-        kv_cache_dtype=vllm_cfg.get("kv_cache_dtype", "auto"),
+        kv_cache_dtype=kv_cache_dtype,
         use_fp8_weights=use_fp8_weights,
+        calculate_kv_scales=calculate_kv_scales,
     )
 
     if vllm_cfg.get("use_deep_gemm", False):
@@ -390,7 +455,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     # create fp8 kwargs for vllm's LLM(...)
     num_first_layers_in_bf16 = vllm_cfg.get("num_first_layers_in_bf16", 0)
     num_last_layers_in_bf16 = vllm_cfg.get("num_last_layers_in_bf16", 0)
-    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
     fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
 
     if num_first_layers_in_bf16 > 0 or num_last_layers_in_bf16 > 0:
@@ -431,6 +495,11 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         vllm_kwargs = {
             "kv_cache_dtype": kv_cache_dtype,
         }
+    
+    # Add calculate_kv_scales to the kwargs if it's set
+    # This will be passed to vLLM's CacheConfig
+    if calculate_kv_scales:
+        vllm_kwargs["calculate_kv_scales"] = calculate_kv_scales
     
     return vllm_kwargs
 

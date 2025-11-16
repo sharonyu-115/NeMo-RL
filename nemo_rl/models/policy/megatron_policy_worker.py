@@ -1927,20 +1927,24 @@ class MegatronPolicyWorker:
             metadata = (tensor.shape, tensor.dtype)
             refit_param_info_hf[name] = metadata
         
-        # Only include KV/Q scale metadata when kv_cache_dtype is FP8
-        # Check if we're using FP8 KV cache
-        use_fp8_kv_cache = False
+        # Only include KV/Q scale metadata when using static FP8 KV cache scales
+        # (kv_cache_dtype=fp8 AND calculate_kv_scales=False)
+        # When calculate_kv_scales=True, vLLM calculates scales dynamically, no need to sync
+        use_static_fp8_kv_scales = False
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
             kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-            use_fp8_kv_cache = kv_cache_dtype == "fp8"
+            calculate_kv_scales = vllm_cfg.get("calculate_kv_scales", False)
+            # Only use static scales when kv_cache is fp8 but NOT dynamically calculated
+            use_static_fp8_kv_scales = kv_cache_dtype == "fp8" and not calculate_kv_scales
         
-        if use_fp8_kv_cache:
-            # Include KV/Q scale metadata so consumer can rely solely on state_dict_info
+        if use_static_fp8_kv_scales:
+            # Static FP8 KV scale mode: Include KV/Q scale metadata for syncing
             try:
                 # Get number of layers directly from transformer config
                 num_layers = self.megatron_bridge.transformer_config.num_layers
-                print(f"[@@KV_SCALES@@] prepare_refit_info: kv_cache_dtype=fp8, adding scale metadata for {num_layers} layers")
+                print(f"[KV_SCALES] prepare_refit_info: Static FP8 KV scales mode (kv_cache_dtype=fp8, calculate_kv_scales=False)")
+                print(f"[KV_SCALES] Adding scale metadata for {num_layers} layers")
                 # Append q/k/v scale placeholders (shape [1], dtype float32)
                 for layer_idx in range(num_layers):
                     scale_names = get_vllm_qkv_scale_names(layer_idx)
@@ -1950,7 +1954,7 @@ class MegatronPolicyWorker:
             except Exception:
                 pass
         else:
-            print(f"[KV_SCALES] prepare_refit_info: kv_cache_dtype is not fp8, skipping KV scale metadata")
+            print(f"[KV_SCALES] prepare_refit_info: Not using static FP8 KV scales, skipping KV scale metadata")
         
         return refit_param_info_hf
 
@@ -2029,23 +2033,27 @@ class MegatronPolicyWorker:
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
-        # CHANGE: Only check and stream KV scales when kv_cache_dtype is FP8
-        use_fp8_kv_cache = False
+        # CHANGE: Only stream KV scales in static FP8 KV scale mode
+        # (kv_cache_dtype=fp8 AND calculate_kv_scales=False)
+        # When calculate_kv_scales=True, vLLM calculates scales dynamically, no need to stream
+        use_static_fp8_kv_scales = False
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
             kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-            use_fp8_kv_cache = kv_cache_dtype == "fp8"
+            calculate_kv_scales = vllm_cfg.get("calculate_kv_scales", False)
+            # Only use static scales when kv_cache is fp8 but NOT dynamically calculated
+            use_static_fp8_kv_scales = kv_cache_dtype == "fp8" and not calculate_kv_scales
 
         def iter_with_kv_scales():
             # First yield all model weights
             for name, tensor in hf_params_generator:
                 yield name, tensor
 
-            # CHANGE: Only append KV scales when kv_cache_dtype is FP8
-            if use_fp8_kv_cache:
+            # CHANGE: Only append KV scales in static mode
+            if use_static_fp8_kv_scales:
                 # Get number of layers directly from transformer config
                 num_layers = self.megatron_bridge.transformer_config.num_layers
-                print(f"[@@KV_SCALES@@] stream_weights_via_ipc_zmq: kv_cache_dtype=fp8, streaming KV scales for {num_layers} layers")
+                print(f"[KV_SCALES] stream_weights_via_ipc_zmq: Static FP8 KV scales mode, streaming scales for {num_layers} layers")
                 keys = []
                 for layer_idx in range(num_layers):
                     scale_names = get_vllm_qkv_scale_names(layer_idx)
@@ -2061,7 +2069,7 @@ class MegatronPolicyWorker:
                     ).reshape(1)
                     yield param_name, scale_tensor
             else:
-                print(f"[KV_SCALES] stream_weights_via_ipc_zmq: kv_cache_dtype is not fp8, skipping KV scales")
+                print(f"[KV_SCALES] stream_weights_via_ipc_zmq: Not using static FP8 KV scales, skipping KV scales")
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
@@ -2083,23 +2091,27 @@ class MegatronPolicyWorker:
             conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
         )
 
-        # CHANGE: Only check and broadcast KV scales when kv_cache_dtype is FP8
-        use_fp8_kv_cache = False
+        # CHANGE: Only broadcast KV scales in static FP8 KV scale mode
+        # (kv_cache_dtype=fp8 AND calculate_kv_scales=False)
+        # When calculate_kv_scales=True, vLLM calculates scales dynamically, no need to broadcast
+        use_static_fp8_kv_scales = False
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
             kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-            use_fp8_kv_cache = kv_cache_dtype == "fp8"
+            calculate_kv_scales = vllm_cfg.get("calculate_kv_scales", False)
+            # Only use static scales when kv_cache is fp8 but NOT dynamically calculated
+            use_static_fp8_kv_scales = kv_cache_dtype == "fp8" and not calculate_kv_scales
 
         def iter_with_kv_scales():
             # First yield all model weights
             for name, tensor in hf_params_generator:
                 yield name, tensor
             
-            # CHANGE: Only append KV scales when kv_cache_dtype is FP8
-            if use_fp8_kv_cache:
+            # CHANGE: Only append KV scales in static mode
+            if use_static_fp8_kv_scales:
                 # Get number of layers directly from transformer config
                 num_layers = self.megatron_bridge.transformer_config.num_layers
-                print(f"[@@KV_SCALES@@] broadcast_weights_for_collective: kv_cache_dtype=fp8, broadcasting KV scales for {num_layers} layers")
+                print(f"[KV_SCALES] broadcast_weights_for_collective: Static FP8 KV scales mode, broadcasting scales for {num_layers} layers")
                 keys = []
                 for layer_idx in range(num_layers):
                     scale_names = get_vllm_qkv_scale_names(layer_idx)
@@ -2115,7 +2127,7 @@ class MegatronPolicyWorker:
                     ).reshape(1)
                     yield param_name, scale_tensor
             else:
-                print(f"[KV_SCALES] broadcast_weights_for_collective: kv_cache_dtype is not fp8, skipping KV scales")
+                print(f"[KV_SCALES] broadcast_weights_for_collective: Not using static FP8 KV scales, skipping KV scales")
 
         # param_iterator will return (name, tensor), we only need tensor
         packed_broadcast_producer(

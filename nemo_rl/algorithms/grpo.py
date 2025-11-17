@@ -927,9 +927,6 @@ def refit_policy_generation(
         policy.offload_before_refit()
         policy_generation.prepare_for_generation(tags=["weights"])
 
-    if kv_scales:
-        print(f"[KV_SCALES] Refit: Adding {len(kv_scales)} KV scales to weight update")
-
     # Create a context manager that does nothing when timer is None
     timer_context = (
         timer.time("prepare_for_generation/transfer_and_update_weights")
@@ -1014,14 +1011,6 @@ def grpo_train(
     # Check if we need to sync KV cache scales (infer from config)
     sync_kv_scales = _should_sync_kv_scales(master_config)
     kv_scales_cache = None  # Cache reused for computed kv scales
-
-    if sync_kv_scales:
-        print("[KV_SCALES] FP8 KV cache enabled (kv_cache_dtype=fp8, precision=fp8)")
-        print(
-            "[KV_SCALES] Will compute and sync q_scale, k_scale, v_scale during refit"
-        )
-    else:
-        print("[KV_SCALES] KV cache scale sync not needed (kv_cache_dtype is not fp8)")
 
     NEED_REFIT = True
     # If policy_generation is None, use the policy as the generation interface (megatron framework backend)
@@ -1116,9 +1105,7 @@ def grpo_train(
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         # Compute KV scales if needed for FP8 quantization
                         if sync_kv_scales and kv_scales_cache is None:
-                            print(
-                                "[KV_SCALES] Computing KV cache scales for the first time..."
-                            )
+                            print("▶ Computing KV cache scales...", flush=True)
                             policy.prepare_for_lp_inference()
                             # Create calibration data from flattened messages
                             calibration_data = BatchedDataDict[ClippedPGLossDataDict](
@@ -1347,7 +1334,8 @@ def grpo_train(
                 if sync_kv_scales:
                     with timer.time("recompute_kv_scales"):
                         print(
-                            "[KV_SCALES] Recomputing KV cache scales after policy update..."
+                            "▶ Recomputing KV cache scales after policy update...",
+                            flush=True,
                         )
                         kv_scales = policy.calibrate_qkv_fp8_scales(
                             train_data, include_q=True

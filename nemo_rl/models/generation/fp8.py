@@ -118,11 +118,6 @@ def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None
 
     logger = init_logger(__name__)
 
-    # print(f"[KV_SCALES] kv_cache_process_weights_after_loading: layer.k_scale = {layer.k_scale}, layer.v_scale = {layer.v_scale}")
-    print(
-        f"[@@KV_SCALES@@] [fp8.py] kv_cache_process_weights_after_loading: layer.k_scale = {layer.k_scale}, layer.v_scale = {layer.v_scale}"
-    )
-
     # If the kv-cache dtype is auto, we enforce the k/v_scale to be 1.0
     # regardless whether the kv-scale is available in the checkpoint.
     if layer.kv_cache_dtype != "auto":
@@ -215,9 +210,6 @@ def kv_cache_process_weights_after_loading(self, layer: torch.nn.Module) -> None
 
     # IMPORTANT: We DON'T delete the parameters here to allow for dynamic updates
     # Original code deleted: layer.k_scale, layer.v_scale, layer.q_scale, layer.prob_scale
-    print(
-        "[KV_SCALES] Patched process_weights_after_loading: keeping k_scale, v_scale parameters for dynamic updates"
-    )
 
 
 def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
@@ -312,8 +304,6 @@ def apply_fp8_patches(self, fp8_config):
 
     # Apply weight-related patches only when using FP8 weights (precision=fp8)
     if global_fp8_config.use_fp8_weights:
-        print("[FP8_PATCHES] Applying FP8 weight quantization patches (precision=fp8)")
-
         # This patch is used to support torch.compile with vllm parameter subclasses, such as
         # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
         # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
@@ -336,15 +326,10 @@ def apply_fp8_patches(self, fp8_config):
 
     # Apply KV cache patches only when using FP8 KV cache (kv_cache_dtype=fp8)
     if global_fp8_config.kv_cache_dtype == "fp8":
-        print("[FP8_PATCHES] Applying FP8 KV cache patches (kv_cache_dtype=fp8)")
         # Static scales mode: patch process_weights_after_loading to preserve k_scale/v_scale for manual updates
-        print("[FP8_PATCHES] Using static KV scales")
         func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
         patcher5 = patch(func5_path, kv_cache_process_weights_after_loading)
         fp8_state.vllm_patches.append(patcher5)
-        print(
-            "[FP8_PATCHES] Patched process_weights_after_loading to preserve k_scale/v_scale for updates"
-        )
 
     for p in fp8_state.vllm_patches:
         p.start()
@@ -421,9 +406,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
             bf16_params.append(_get_params_in_layers(param_names, layers))
 
         fp8_block_quant_kwargs["ignored_layers"] = bf16_params
-
-    # TODO: Remove this after debugging.
-    print(f"[KV_SCALES] Global FP8 config: {global_fp8_config}")
 
     # Return FP8 kwargs (precision=fp8 is required at this point)
     # kv_cache_dtype can be "auto" or "fp8"
@@ -528,14 +510,9 @@ def load_weights(weights, model_runner):
     model = model_runner.model
 
     for k, v in weights:
-        if "scale" in k:
-            print(
-                f"[@@KV_SCALES@@] [fp8.py] load_weights: Parameter {k}, value = {v.item() if v.numel() == 1 else v}"
-            )
         if not _is_fp8_weight(k, model):
             weights_quantized.append((k, v))
             continue
-        print(f"[@@KV_SCALES@@] [fp8.py] load_weights: Casting weight {k} into fp8")
         # Cast the weight into fp8 and its scale factor
         param_lp, param_scale = cast_tensor_to_fp8_blockwise(
             v.to(torch.float),

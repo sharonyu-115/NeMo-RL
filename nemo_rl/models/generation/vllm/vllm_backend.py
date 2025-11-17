@@ -173,9 +173,6 @@ class VllmInternalWorkerExtension:
 
             if use_fp8_kv_cache:
                 # FP8 KV cache: process KV scales after weight loading
-                print(
-                    "[KV_SCALES] update_weights_via_ipc_zmq: FP8 KV cache detected, processing scales after weight loading"
-                )
                 from vllm.model_executor.model_loader.utils import (
                     process_weights_after_loading,
                 )
@@ -250,9 +247,6 @@ class VllmInternalWorkerExtension:
 
             if use_fp8_kv_cache:
                 # FP8 KV cache: process KV scales after weight loading
-                print(
-                    "[KV_SCALES] update_weights_from_collective: FP8 KV cache detected, processing scales after weight loading"
-                )
                 from vllm.model_executor.model_loader.utils import (
                     process_weights_after_loading,
                 )

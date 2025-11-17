@@ -899,7 +899,7 @@ def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
 
     vllm_cfg = generation_config.get("vllm_cfg", {})
     kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-    
+
     # Sync scales when using FP8 KV cache (always static in this design)
     return kv_cache_dtype == "fp8"
 
@@ -1013,11 +1013,13 @@ def grpo_train(
 
     # Check if we need to sync KV cache scales (infer from config)
     sync_kv_scales = _should_sync_kv_scales(master_config)
-    kv_scales_cache = None  # Cache reused for computed kv scales 
-    
-    if sync_kv_scales:        
-        print(f"[KV_SCALES] FP8 KV cache enabled (kv_cache_dtype=fp8, precision=fp8)")
-        print(f"[KV_SCALES] Will compute and sync q_scale, k_scale, v_scale during refit")
+    kv_scales_cache = None  # Cache reused for computed kv scales
+
+    if sync_kv_scales:
+        print("[KV_SCALES] FP8 KV cache enabled (kv_cache_dtype=fp8, precision=fp8)")
+        print(
+            "[KV_SCALES] Will compute and sync q_scale, k_scale, v_scale during refit"
+        )
     else:
         print("[KV_SCALES] KV cache scale sync not needed (kv_cache_dtype is not fp8)")
 

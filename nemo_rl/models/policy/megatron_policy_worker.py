@@ -1926,20 +1926,22 @@ class MegatronPolicyWorker:
         for name, tensor in hf_params_generator:
             metadata = (tensor.shape, tensor.dtype)
             refit_param_info_hf[name] = metadata
-        
+
         # Include KV/Q scale metadata when using FP8 KV cache
         use_fp8_kv_cache = False
         if "generation" in self.cfg and self.cfg["generation"] is not None:
             vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
             kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
             use_fp8_kv_cache = kv_cache_dtype == "fp8"
-        
+
         if use_fp8_kv_cache:
             # FP8 KV cache: Include KV/Q scale metadata for syncing
             try:
                 # Get number of layers directly from transformer config
                 num_layers = self.megatron_bridge.transformer_config.num_layers
-                print(f"[KV_SCALES] prepare_refit_info: FP8 KV cache enabled (kv_cache_dtype=fp8)")
+                print(
+                    "[KV_SCALES] prepare_refit_info: FP8 KV cache enabled (kv_cache_dtype=fp8)"
+                )
                 print(f"[KV_SCALES] Adding scale metadata for {num_layers} layers")
                 # Append q/k/v scale placeholders (shape [1], dtype float32)
                 for layer_idx in range(num_layers):
@@ -1950,8 +1952,10 @@ class MegatronPolicyWorker:
             except Exception:
                 pass
         else:
-            print(f"[KV_SCALES] prepare_refit_info: FP8 KV cache not enabled, skipping KV scale metadata")
-        
+            print(
+                "[KV_SCALES] prepare_refit_info: FP8 KV cache not enabled, skipping KV scale metadata"
+            )
+
         return refit_param_info_hf
 
     def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
@@ -2045,7 +2049,9 @@ class MegatronPolicyWorker:
             if use_fp8_kv_cache:
                 # Get number of layers directly from transformer config
                 num_layers = self.megatron_bridge.transformer_config.num_layers
-                print(f"[KV_SCALES] stream_weights_via_ipc_zmq: FP8 KV cache enabled, streaming scales for {num_layers} layers")
+                print(
+                    f"[KV_SCALES] stream_weights_via_ipc_zmq: FP8 KV cache enabled, streaming scales for {num_layers} layers"
+                )
                 keys = []
                 for layer_idx in range(num_layers):
                     scale_names = get_vllm_qkv_scale_names(layer_idx)
@@ -2061,7 +2067,9 @@ class MegatronPolicyWorker:
                     ).reshape(1)
                     yield param_name, scale_tensor
             else:
-                print(f"[KV_SCALES] stream_weights_via_ipc_zmq: FP8 KV cache not enabled, skipping KV scales")
+                print(
+                    "[KV_SCALES] stream_weights_via_ipc_zmq: FP8 KV cache not enabled, skipping KV scales"
+                )
 
         # Use the shared implementation
         stream_weights_via_ipc_zmq_impl(
@@ -2094,12 +2102,14 @@ class MegatronPolicyWorker:
             # First yield all model weights
             for name, tensor in hf_params_generator:
                 yield name, tensor
-            
+
             # Append KV scales for FP8 KV cache
             if use_fp8_kv_cache:
                 # Get number of layers directly from transformer config
                 num_layers = self.megatron_bridge.transformer_config.num_layers
-                print(f"[KV_SCALES] broadcast_weights_for_collective: FP8 KV cache enabled, broadcasting scales for {num_layers} layers")
+                print(
+                    f"[KV_SCALES] broadcast_weights_for_collective: FP8 KV cache enabled, broadcasting scales for {num_layers} layers"
+                )
                 keys = []
                 for layer_idx in range(num_layers):
                     scale_names = get_vllm_qkv_scale_names(layer_idx)
@@ -2115,7 +2125,9 @@ class MegatronPolicyWorker:
                     ).reshape(1)
                     yield param_name, scale_tensor
             else:
-                print(f"[KV_SCALES] broadcast_weights_for_collective: FP8 KV cache not enabled, skipping KV scales")
+                print(
+                    "[KV_SCALES] broadcast_weights_for_collective: FP8 KV cache not enabled, skipping KV scales"
+                )
 
         # param_iterator will return (name, tensor), we only need tensor
         packed_broadcast_producer(

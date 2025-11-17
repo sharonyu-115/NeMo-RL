@@ -309,11 +309,11 @@ def apply_fp8_patches(self, fp8_config):
     # Apply patches conditionally based on configuration
     # Only apply weight patches if using FP8 weights
     # Only apply KV cache patches if using FP8 KV cache
-    
+
     # Apply weight-related patches only when using FP8 weights (precision=fp8)
     if global_fp8_config.use_fp8_weights:
         print("[FP8_PATCHES] Applying FP8 weight quantization patches (precision=fp8)")
-        
+
         # This patch is used to support torch.compile with vllm parameter subclasses, such as
         # PerTensorScaleParameter. Because we need weight loaders to update fp8 weights each
         # refit, we patch fp8 parameters to have a reference to their weight loader. Eventually
@@ -322,7 +322,7 @@ def apply_fp8_patches(self, fp8_config):
         func1_path = "vllm.model_executor.layers.quantization.fp8.Fp8LinearMethod.process_weights_after_loading"
         patcher1 = patch(func1_path, process_weights_after_loading)
         fp8_state.vllm_patches.append(patcher1)
-        
+
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
         # SNR compared to plain fp32 scaling factors. This feature is still under active research.
         if global_fp8_config.use_activation_pow2_scale:
@@ -342,7 +342,9 @@ def apply_fp8_patches(self, fp8_config):
         func5_path = "vllm.model_executor.layers.quantization.kv_cache.BaseKVCacheMethod.process_weights_after_loading"
         patcher5 = patch(func5_path, kv_cache_process_weights_after_loading)
         fp8_state.vllm_patches.append(patcher5)
-        print("[FP8_PATCHES] Patched process_weights_after_loading to preserve k_scale/v_scale for updates")
+        print(
+            "[FP8_PATCHES] Patched process_weights_after_loading to preserve k_scale/v_scale for updates"
+        )
 
     for p in fp8_state.vllm_patches:
         p.start()
@@ -361,14 +363,14 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     # Determine if we're using FP8 weights based on precision setting
     use_fp8_weights = vllm_cfg.get("precision") == "fp8"
     kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-    
+
     # Validate configuration: kv_cache_dtype=fp8 requires precision=fp8
     if kv_cache_dtype == "fp8" and not use_fp8_weights:
         raise ValueError(
             "kv_cache_dtype='fp8' requires precision='fp8'. "
             "FP8 KV cache can only be used together with FP8 model weights."
         )
-    
+
     global_fp8_config = FP8Config(
         use_weight_pow2_scale=vllm_cfg.get("pow2_weight_scaling_factors", False),
         use_activation_pow2_scale=vllm_cfg.get(
@@ -422,7 +424,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
 
     # TODO: Remove this after debugging.
     print(f"[KV_SCALES] Global FP8 config: {global_fp8_config}")
-    
+
     # Return FP8 kwargs (precision=fp8 is required at this point)
     # kv_cache_dtype can be "auto" or "fp8"
     vllm_kwargs = {
@@ -430,7 +432,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
-    
+
     return vllm_kwargs
 
 

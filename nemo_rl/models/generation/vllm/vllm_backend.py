@@ -163,23 +163,31 @@ class VllmInternalWorkerExtension:
 
             # Process weights after loading for FP8 KV cache (static scales)
             use_fp8_kv_cache = False
-            if hasattr(self.model_runner.vllm_config, 'cache_config'):
-                kv_cache_dtype = getattr(self.model_runner.vllm_config.cache_config, 'cache_dtype', None)
-                use_fp8_kv_cache = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
-            
+            if hasattr(self.model_runner.vllm_config, "cache_config"):
+                kv_cache_dtype = getattr(
+                    self.model_runner.vllm_config.cache_config, "cache_dtype", None
+                )
+                use_fp8_kv_cache = (
+                    kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+                )
+
             if use_fp8_kv_cache:
                 # FP8 KV cache: process KV scales after weight loading
-                print(f"[KV_SCALES] update_weights_via_ipc_zmq: FP8 KV cache detected, processing scales after weight loading")
-                from vllm.model_executor.model_loader.utils import process_weights_after_loading
-                
+                print(
+                    "[KV_SCALES] update_weights_via_ipc_zmq: FP8 KV cache detected, processing scales after weight loading"
+                )
+                from vllm.model_executor.model_loader.utils import (
+                    process_weights_after_loading,
+                )
+
                 # Get target device for processing
                 target_device = next(self.model_runner.model.parameters()).device
-                
+
                 # Call process_weights_after_loading to handle KV scales
                 process_weights_after_loading(
-                    self.model_runner.model, 
-                    self.model_runner.model_config, 
-                    target_device
+                    self.model_runner.model,
+                    self.model_runner.model_config,
+                    target_device,
                 )
 
             gc.collect()
@@ -229,28 +237,36 @@ class VllmInternalWorkerExtension:
                 src=0,
                 post_unpack_func=load_model_weight_func,
             )
-            
+
             # Process weights after loading for FP8 KV cache (static scales)
             use_fp8_kv_cache = False
-            if hasattr(self.model_runner.vllm_config, 'cache_config'):
-                kv_cache_dtype = getattr(self.model_runner.vllm_config.cache_config, 'cache_dtype', None)
-                use_fp8_kv_cache = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
-            
+            if hasattr(self.model_runner.vllm_config, "cache_config"):
+                kv_cache_dtype = getattr(
+                    self.model_runner.vllm_config.cache_config, "cache_dtype", None
+                )
+                use_fp8_kv_cache = (
+                    kv_cache_dtype is not None and "fp8" in str(kv_cache_dtype).lower()
+                )
+
             if use_fp8_kv_cache:
                 # FP8 KV cache: process KV scales after weight loading
-                print(f"[KV_SCALES] update_weights_from_collective: FP8 KV cache detected, processing scales after weight loading")
-                from vllm.model_executor.model_loader.utils import process_weights_after_loading
-                
+                print(
+                    "[KV_SCALES] update_weights_from_collective: FP8 KV cache detected, processing scales after weight loading"
+                )
+                from vllm.model_executor.model_loader.utils import (
+                    process_weights_after_loading,
+                )
+
                 # Get target device for processing
                 target_device = next(self.model_runner.model.parameters()).device
-                
+
                 # Call process_weights_after_loading to handle KV scales
                 process_weights_after_loading(
-                    self.model_runner.model, 
-                    self.model_runner.model_config, 
-                    target_device
+                    self.model_runner.model,
+                    self.model_runner.model_config,
+                    target_device,
                 )
-                
+
         except Exception as e:
             print(
                 f"Error in VllmInternalWorkerExtension.update_weights_from_collective: {e}"

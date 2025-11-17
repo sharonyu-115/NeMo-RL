@@ -287,25 +287,18 @@ class BaseVllmGenerationWorker:
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
 
-        # Call init_fp8 when either precision is fp8 OR kv_cache_dtype is fp8
-        # This ensures vLLM patches are applied for KV cache FP8 even with bf16 weights
-        if self.cfg["vllm_cfg"]["precision"] == "fp8" or self.cfg["vllm_cfg"].get("kv_cache_dtype") == "fp8":
+        # Call init_fp8 when precision is fp8
+        # (kv_cache_dtype can be fp8 or auto, validated in init_fp8)
+        if self.cfg["vllm_cfg"]["precision"] == "fp8":
             from nemo_rl.models.generation.fp8 import init_fp8
 
             fp8_kwargs = init_fp8(
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
             )
             
-            # For FP8 precision, we need quantization="fp8" and weight quantization config
-            if self.cfg["vllm_cfg"]["precision"] == "fp8":
-                vllm_kwargs.update(fp8_kwargs)
-                # overriden by quant config, however vllm complains if this not passed
-                self.precision = "bfloat16"
-            else:
-                # For non-FP8 precision with FP8 KV cache, only set kv_cache_dtype
-                # Don't set quantization="fp8" as weights are not quantized
-                vllm_kwargs["kv_cache_dtype"] = fp8_kwargs["kv_cache_dtype"]
-                print(f"[KV_SCALES] Using FP8 KV cache with precision={self.precision} (weights not quantized)")
+            vllm_kwargs.update(fp8_kwargs)
+            # overriden by quant config, however vllm complains if this not passed
+            self.precision = "bfloat16"
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}

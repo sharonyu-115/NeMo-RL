@@ -502,9 +502,12 @@ def setup(
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
         if generation_config["vllm_cfg"].get("kv_cache_dtype") == "fp8":
+            # FP8 KV cache requires FP8 model precision
+            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
+                "kv_cache_dtype='fp8' requires precision='fp8'. "
+                "FP8 KV cache can only be used together with FP8 model weights."
+            )
             # FP8 KV cache compatibility checks
-            # These checks are independent of model precision (can use bf16 or fp8 weights with fp8 KV cache)
-            # TODO: Add the related support
             assert policy_config["dtensor_cfg"]["enabled"] == False, (
                 "DTensor backend is not supported with kv cache fp8 enabled."
             )
@@ -882,15 +885,9 @@ def _should_use_penguin(master_config: MasterConfig) -> bool:
 def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
     """Check if KV cache scales should be synchronized during refit.
 
-    Returns True if:
-    - kv_cache_dtype is fp8 AND
-    - calculate_kv_scales is False (static scales mode)
-    
-    When calculate_kv_scales=True (dynamic mode), vLLM calculates scales 
-    automatically during forward passes, so no sync is needed.
-    
-    Note: KV cache scales are only relevant when kv_cache_dtype is FP8.
-    The model precision (fp8 or bf16) is independent of this requirement.
+    Returns True if kv_cache_dtype is fp8 (which requires precision=fp8).
+    KV scales are always computed and synced statically during training
+    when using FP8 KV cache.
     """
     generation_config = master_config["policy"]["generation"]
     if generation_config is None:
@@ -902,10 +899,9 @@ def _should_sync_kv_scales(master_config: MasterConfig) -> bool:
 
     vllm_cfg = generation_config.get("vllm_cfg", {})
     kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-    calculate_kv_scales = vllm_cfg.get("calculate_kv_scales", False)
     
-    # Only sync scales when using FP8 KV cache with static scales (not dynamic calculation)
-    return kv_cache_dtype == "fp8" and not calculate_kv_scales
+    # Sync scales when using FP8 KV cache (always static in this design)
+    return kv_cache_dtype == "fp8"
 
 
 def refit_policy_generation(
@@ -1019,16 +1015,9 @@ def grpo_train(
     sync_kv_scales = _should_sync_kv_scales(master_config)
     kv_scales_cache = None  # Cache reused for computed kv scales 
     
-    vllm_cfg = master_config["policy"]["generation"].get("vllm_cfg", {})
-    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-    calculate_kv_scales = vllm_cfg.get("calculate_kv_scales", False)
-    
     if sync_kv_scales:        
-        print(f"[KV_SCALES] FP8 KV cache with static scales (kv_cache_dtype=fp8, calculate_kv_scales=False)")
+        print(f"[KV_SCALES] FP8 KV cache enabled (kv_cache_dtype=fp8, precision=fp8)")
         print(f"[KV_SCALES] Will compute and sync q_scale, k_scale, v_scale during refit")
-    elif kv_cache_dtype == "fp8" and calculate_kv_scales:
-        print(f"[KV_SCALES] FP8 KV cache with dynamic calculation (kv_cache_dtype=fp8, calculate_kv_scales=True)")
-        print(f"[KV_SCALES] vLLM will calculate scales dynamically on each forward pass, no sync needed")
     else:
         print("[KV_SCALES] KV cache scale sync not needed (kv_cache_dtype is not fp8)")
 

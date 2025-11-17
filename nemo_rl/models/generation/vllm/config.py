@@ -29,7 +29,6 @@ class VllmSpecificArgs(TypedDict):
     load_format: NotRequired[str]
     precision: NotRequired[str]
     kv_cache_dtype: NotRequired[str]
-    calculate_kv_scales: NotRequired[bool]
     enforce_eager: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.

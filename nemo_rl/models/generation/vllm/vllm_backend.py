@@ -161,27 +161,15 @@ class VllmInternalWorkerExtension:
                 buffer = None
                 self.zmq_socket.send(IPCProtocol.ACK.value.encode())
 
-            # CHANGE: Only invoke process_weights_after_loading for static FP8 KV scales
-            # (kv_cache_dtype=fp8 AND calculate_kv_scales=False)
-            # When calculate_kv_scales=True, vLLM calculates scales dynamically, no need to process
-            use_static_fp8_kv_scales = False
+            # Process weights after loading for FP8 KV cache (static scales)
+            use_fp8_kv_cache = False
             if hasattr(self.model_runner.vllm_config, 'cache_config'):
                 kv_cache_dtype = getattr(self.model_runner.vllm_config.cache_config, 'cache_dtype', None)
-                is_fp8 = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
-                
-                if is_fp8:
-                    from nemo_rl.models.generation import fp8
-                    calculate_kv_scales_enabled = fp8.global_fp8_config.calculate_kv_scales if fp8.global_fp8_config else False
-                    
-                    # Only use static scales when kv_cache is fp8 AND NOT using dynamic calculation
-                    use_static_fp8_kv_scales = not calculate_kv_scales_enabled
-                    print(f"[KV_SCALES] update_weights_via_ipc_zmq: kv_cache_dtype={kv_cache_dtype}, calculate_kv_scales={calculate_kv_scales_enabled}, use_static_fp8_kv_scales={use_static_fp8_kv_scales}")
-                else:
-                    print(f"[KV_SCALES] update_weights_via_ipc_zmq: kv_cache_dtype={kv_cache_dtype}, not FP8")
+                use_fp8_kv_cache = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
             
-            if use_static_fp8_kv_scales:
-                # Static FP8 KV scale mode: process KV scales after weight loading
-                print(f"[KV_SCALES] update_weights_via_ipc_zmq: Static FP8 KV scales mode, processing scales after weight loading")
+            if use_fp8_kv_cache:
+                # FP8 KV cache: process KV scales after weight loading
+                print(f"[KV_SCALES] update_weights_via_ipc_zmq: FP8 KV cache detected, processing scales after weight loading")
                 from vllm.model_executor.model_loader.utils import process_weights_after_loading
                 
                 # Get target device for processing
@@ -193,8 +181,6 @@ class VllmInternalWorkerExtension:
                     self.model_runner.model_config, 
                     target_device
                 )
-            else:
-                print(f"[KV_SCALES] update_weights_via_ipc_zmq: Not using static FP8 KV scales, skipping process_weights_after_loading")
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -244,27 +230,15 @@ class VllmInternalWorkerExtension:
                 post_unpack_func=load_model_weight_func,
             )
             
-            # CHANGE: Only invoke process_weights_after_loading for static FP8 KV scales
-            # (kv_cache_dtype=fp8 AND calculate_kv_scales=False)
-            # When calculate_kv_scales=True, vLLM calculates scales dynamically, no need to process
-            use_static_fp8_kv_scales = False
+            # Process weights after loading for FP8 KV cache (static scales)
+            use_fp8_kv_cache = False
             if hasattr(self.model_runner.vllm_config, 'cache_config'):
                 kv_cache_dtype = getattr(self.model_runner.vllm_config.cache_config, 'cache_dtype', None)
-                is_fp8 = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
-                
-                if is_fp8:
-                    from nemo_rl.models.generation import fp8
-                    calculate_kv_scales_enabled = fp8.global_fp8_config.calculate_kv_scales if fp8.global_fp8_config else False
-                    
-                    # Only use static scales when kv_cache is fp8 AND NOT using dynamic calculation
-                    use_static_fp8_kv_scales = not calculate_kv_scales_enabled
-                    print(f"[KV_SCALES] update_weights_from_collective: kv_cache_dtype={kv_cache_dtype}, calculate_kv_scales={calculate_kv_scales_enabled}, use_static_fp8_kv_scales={use_static_fp8_kv_scales}")
-                else:
-                    print(f"[KV_SCALES] update_weights_from_collective: kv_cache_dtype={kv_cache_dtype}, not FP8")
+                use_fp8_kv_cache = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
             
-            if use_static_fp8_kv_scales:
-                # Static FP8 KV scale mode: process KV scales after weight loading
-                print(f"[KV_SCALES] update_weights_from_collective: Static FP8 KV scales mode, processing scales after weight loading")
+            if use_fp8_kv_cache:
+                # FP8 KV cache: process KV scales after weight loading
+                print(f"[KV_SCALES] update_weights_from_collective: FP8 KV cache detected, processing scales after weight loading")
                 from vllm.model_executor.model_loader.utils import process_weights_after_loading
                 
                 # Get target device for processing
@@ -276,8 +250,6 @@ class VllmInternalWorkerExtension:
                     self.model_runner.model_config, 
                     target_device
                 )
-            else:
-                print(f"[KV_SCALES] update_weights_from_collective: Not using static FP8 KV scales, skipping process_weights_after_loading")
                 
         except Exception as e:
             print(

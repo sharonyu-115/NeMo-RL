@@ -1903,13 +1903,6 @@ class MegatronPolicyWorker:
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
             self.zmq_socket.bind(self.get_zmq_address())
 
-    def _extract_layer_key(self, module_name: str) -> int:
-        # Expected format: "module.decoder.layers.<idx>.self_attention.query_key_value"
-        m = re.search(r"model\.layers\.(\d+)", module_name)
-        if m is not None:
-            return int(m.group(1))
-        return -1
-
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
@@ -1918,43 +1911,9 @@ class MegatronPolicyWorker:
 
         # Collect tensor metadata for refit / hf side info
         refit_param_info_hf = {}
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
-        for name, tensor in hf_params_generator:
-            metadata = (tensor.shape, tensor.dtype)
-            refit_param_info_hf[name] = metadata
-
-        # Include KV/Q scale metadata when using FP8 KV cache
-        use_fp8_kv_cache = False
-        if "generation" in self.cfg and self.cfg["generation"] is not None:
-            vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
-            kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-            use_fp8_kv_cache = kv_cache_dtype == "fp8"
-
-        if use_fp8_kv_cache:
-            # FP8 KV cache: Include KV/Q scale metadata for syncing
-            try:
-                # Get number of layers directly from transformer config
-                num_layers = self.megatron_bridge.transformer_config.num_layers
-                print(
-                    "[KV_SCALES] prepare_refit_info: FP8 KV cache enabled (kv_cache_dtype=fp8)"
-                )
-                print(f"[KV_SCALES] Adding scale metadata for {num_layers} layers")
-                # Append q/k/v scale placeholders (shape [1], dtype float32)
-                for layer_idx in range(num_layers):
-                    scale_names = get_vllm_qkv_scale_names(layer_idx)
-                    for param_name in scale_names.values():
-                        if param_name not in refit_param_info_hf:
-                            refit_param_info_hf[param_name] = ([1], torch.float32)
-            except Exception:
-                pass
-        else:
-            print(
-                "[KV_SCALES] prepare_refit_info: FP8 KV cache not enabled, skipping KV scale metadata"
-            )
+        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
+        for name, tensor in self._iter_params_with_optional_kv_scales():
+            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         return refit_param_info_hf
 
@@ -2016,6 +1975,52 @@ class MegatronPolicyWorker:
         device_idx = torch.cuda.current_device()
         return get_free_memory_bytes(device_idx)
 
+    def _iter_params_with_optional_kv_scales(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
+
+        This helper is used by both IPC-based streaming and collective broadcast
+        so that the logic for adding KV scales stays consistent in one place.
+        """
+        base_iter = self.megatron_bridge.export_hf_weights(
+            [self.model],
+            show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+        )
+
+        # Yield the original parameters first.
+        for name, tensor in base_iter:
+            yield name, tensor
+
+        # Check whether FP8 KV cache is enabled.
+        use_fp8_kv_cache = False
+        if "generation" in self.cfg and self.cfg["generation"] is not None:
+            vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
+            kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
+            use_fp8_kv_cache = kv_cache_dtype == "fp8"
+
+        if not use_fp8_kv_cache:
+            return
+
+        # Append KV (and potentially Q) scale entries to match metadata.
+        num_layers = self.megatron_bridge.transformer_config.num_layers
+        keys: list[str] = []
+        for layer_idx in range(num_layers):
+            scale_names = get_vllm_qkv_scale_names(layer_idx)
+            keys.extend(scale_names.values())
+
+        for param_name in keys:
+            if kv_scales and param_name in kv_scales:
+                scale_value = kv_scales[param_name]
+            else:
+                scale_value = 1.0
+            scale_tensor = torch.tensor(
+                scale_value, dtype=torch.float32, device="cuda"
+            ).reshape(1)
+            yield param_name, scale_tensor
+
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
     def stream_weights_via_ipc_zmq(
@@ -2026,54 +2031,11 @@ class MegatronPolicyWorker:
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
-        # Generate HF parameters for streaming
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
-
-        # Stream KV scales when using FP8 KV cache
-        use_fp8_kv_cache = False
-        if "generation" in self.cfg and self.cfg["generation"] is not None:
-            vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
-            kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-            use_fp8_kv_cache = kv_cache_dtype == "fp8"
-
-        def iter_with_kv_scales():
-            # First yield all model weights
-            for name, tensor in hf_params_generator:
-                yield name, tensor
-
-            # Append KV scales for FP8 KV cache
-            if use_fp8_kv_cache:
-                # Get number of layers directly from transformer config
-                num_layers = self.megatron_bridge.transformer_config.num_layers
-                print(
-                    f"[KV_SCALES] stream_weights_via_ipc_zmq: FP8 KV cache enabled, streaming scales for {num_layers} layers"
-                )
-                keys = []
-                for layer_idx in range(num_layers):
-                    scale_names = get_vllm_qkv_scale_names(layer_idx)
-                    keys.extend(scale_names.values())
-                # Append kv-scale entries to match metadata; use provided value or default 1.0
-                for param_name in keys:
-                    if kv_scales and param_name in kv_scales:
-                        scale_value = kv_scales[param_name]
-                    else:
-                        scale_value = 1.0
-                    scale_tensor = torch.tensor(
-                        scale_value, dtype=torch.float32, device="cuda"
-                    ).reshape(1)
-                    yield param_name, scale_tensor
-            else:
-                print(
-                    "[KV_SCALES] stream_weights_via_ipc_zmq: FP8 KV cache not enabled, skipping KV scales"
-                )
-
-        # Use the shared implementation
+        # Use the shared implementation to append optional KV scales.
         stream_weights_via_ipc_zmq_impl(
-            params_generator=iter_with_kv_scales(),
+            params_generator=self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales
+            ),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
@@ -2085,53 +2047,9 @@ class MegatronPolicyWorker:
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Broadcast the weights for collective communication."""
-        hf_params_generator = self.megatron_bridge.export_hf_weights(
-            [self.model],
-            show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
-        )
-
-        # Broadcast KV scales when using FP8 KV cache
-        use_fp8_kv_cache = False
-        if "generation" in self.cfg and self.cfg["generation"] is not None:
-            vllm_cfg = self.cfg["generation"].get("vllm_cfg", {})
-            kv_cache_dtype = vllm_cfg.get("kv_cache_dtype", "auto")
-            use_fp8_kv_cache = kv_cache_dtype == "fp8"
-
-        def iter_with_kv_scales():
-            # First yield all model weights
-            for name, tensor in hf_params_generator:
-                yield name, tensor
-
-            # Append KV scales for FP8 KV cache
-            if use_fp8_kv_cache:
-                # Get number of layers directly from transformer config
-                num_layers = self.megatron_bridge.transformer_config.num_layers
-                print(
-                    f"[KV_SCALES] broadcast_weights_for_collective: FP8 KV cache enabled, broadcasting scales for {num_layers} layers"
-                )
-                keys = []
-                for layer_idx in range(num_layers):
-                    scale_names = get_vllm_qkv_scale_names(layer_idx)
-                    keys.extend(scale_names.values())
-                # Append kv-scale entries to match metadata; use provided value or default 1.0
-                for param_name in keys:
-                    if kv_scales and param_name in kv_scales:
-                        scale_value = kv_scales[param_name]
-                    else:
-                        scale_value = 1.0
-                    scale_tensor = torch.tensor(
-                        scale_value, dtype=torch.float32, device="cuda"
-                    ).reshape(1)
-                    yield param_name, scale_tensor
-            else:
-                print(
-                    "[KV_SCALES] broadcast_weights_for_collective: FP8 KV cache not enabled, skipping KV scales"
-                )
-
-        # param_iterator will return (name, tensor), we only need tensor
+        # param_iterator will return (name, tensor), we only need tensor.
         packed_broadcast_producer(
-            iterator=iter_with_kv_scales(),
+            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
             group=self.model_update_group,
             src=0,
             post_iter_func=lambda x: x[1],

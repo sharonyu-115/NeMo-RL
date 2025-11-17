@@ -170,15 +170,8 @@ class VllmInternalWorkerExtension:
                 is_fp8 = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
                 
                 if is_fp8:
-                    # Check if dynamic calculation is enabled by examining attention layers
-                    # If any attention layer has calculate_kv_scales attribute, we're in dynamic mode
-                    calculate_kv_scales_enabled = False
-                    for module in self.model_runner.model.modules():
-                        if hasattr(module, 'calculate_kv_scales') and hasattr(module, 'kv_cache_dtype'):
-                            if module.kv_cache_dtype == "fp8":
-                                # If calculate_kv_scales is True, we're in dynamic mode
-                                calculate_kv_scales_enabled = True
-                                break
+                    from nemo_rl.models.generation import fp8
+                    calculate_kv_scales_enabled = fp8.global_fp8_config.calculate_kv_scales if fp8.global_fp8_config else False
                     
                     # Only use static scales when kv_cache is fp8 AND NOT using dynamic calculation
                     use_static_fp8_kv_scales = not calculate_kv_scales_enabled
@@ -260,15 +253,8 @@ class VllmInternalWorkerExtension:
                 is_fp8 = kv_cache_dtype is not None and 'fp8' in str(kv_cache_dtype).lower()
                 
                 if is_fp8:
-                    # Check if dynamic calculation is enabled by examining attention layers
-                    # If any attention layer has calculate_kv_scales attribute, we're in dynamic mode
-                    calculate_kv_scales_enabled = False
-                    for module in self.model_runner.model.modules():
-                        if hasattr(module, 'calculate_kv_scales') and hasattr(module, 'kv_cache_dtype'):
-                            if module.kv_cache_dtype == "fp8":
-                                # If calculate_kv_scales is True, we're in dynamic mode
-                                calculate_kv_scales_enabled = True
-                                break
+                    from nemo_rl.models.generation import fp8
+                    calculate_kv_scales_enabled = fp8.global_fp8_config.calculate_kv_scales if fp8.global_fp8_config else False
                     
                     # Only use static scales when kv_cache is fp8 AND NOT using dynamic calculation
                     use_static_fp8_kv_scales = not calculate_kv_scales_enabled

@@ -2230,12 +2230,6 @@ class MegatronPolicyWorker:
             weights_path: The specific directory path where the checkpoint will be saved.
             optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
         """
-        # Temporary fix to avoid OOM after saving checkpoint
-        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
-        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-        print(
-            f"GPU Memory before saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
-        )
         if not torch.distributed.is_initialized():
             raise RuntimeError(
                 "Distributed process group is not initialized. Cannot save checkpoint."
@@ -2296,31 +2290,6 @@ class MegatronPolicyWorker:
 
             if not is_training:  # Restore training state if it was changed
                 self.model.train()
-
-            # Temporary fix to avoid OOM after saving checkpoint: https://github.com/NVIDIA-NeMo/RL/issues/1057
-            torch.randn(1).cuda()  # wake up torch allocator
-            if hasattr(self, "optimizer") and self.optimizer is not None:
-                # Iterate through the state dictionaries for each parameter group
-                if isinstance(self.optimizer, ChainedOptimizer):
-                    optimizer_state = self.optimizer.state
-                else:
-                    optimizer_state = self.optimizer._get_state()
-                for _, state in optimizer_state.items():
-                    # Iterate through the state items (e.g., momentum, variance) for a parameter
-                    for k, v in state.items():
-                        # Check if the item is a tensor and on the GPU
-                        if torch.is_tensor(v) and v.is_cuda:
-                            # Move the tensor to CPU and update the state dictionary
-                            state[k] = v.to("cpu")
-
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
-            reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
-            print(
-                f"GPU Memory after saving checkpoint: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
-            )
 
         except Exception as e:
             print(f"Failed to save checkpoint to {weights_path}: {e}")

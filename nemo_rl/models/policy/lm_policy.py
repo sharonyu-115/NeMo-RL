@@ -696,7 +696,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         micro_batch_size: Optional[int] = None,
         percentile: float = 99.9,
         margin: float = 1.05,
-        save_path: Optional[str] = None,
         include_q: bool = False,
     ) -> dict[str, Any]:
         """Trigger KV-cache FP8 scale calibration across Megatron workers and return results.
@@ -748,7 +747,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "micro_batch_size": micro_batch_size,
                 "percentile": percentile,
                 "margin": margin,
-                "save_path": save_path,
                 "include_q": include_q,
             },
         )

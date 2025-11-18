@@ -128,7 +128,6 @@ class PolicyInterface(ABC):
         micro_batch_size: Optional[int] = None,
         percentile: float = 99.9,
         margin: float = 1.05,
-        save_path: Optional[str] = None,
         include_q: bool = False,
     ) -> dict[str, Any]:
         """Calibrate FP8 scales for Q/K/V activations used by KV cache.
@@ -138,7 +137,6 @@ class PolicyInterface(ABC):
             micro_batch_size: Optional override for micro batch size during calibration.
             percentile: Percentile for per-tensor amax estimation.
             margin: Safety margin multiplier applied to amax.
-            save_path: If provided, rank0 will write JSON results to this path.
             include_q: Whether to also compute scale for Q in addition to K/V.
 
         Returns:

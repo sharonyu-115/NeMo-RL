@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
-import json
 import math
 import os
 import re
@@ -2414,7 +2413,6 @@ class MegatronPolicyWorker:
         micro_batch_size: Optional[int] = None,
         percentile: float = 99.9,
         margin: float = 1.05,
-        save_path: Optional[str] = None,
         include_q: bool = False,
     ) -> dict[str, Any]:
         """One-shot calibration of Q/K/V activation scales (for FP8 KV cache).
@@ -2470,29 +2468,23 @@ class MegatronPolicyWorker:
             layer_key = _extract_layer_key(module_name)
 
             def _pre_hook(module, inputs):
-                try:
-                    args = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
-                    if len(args) == 1 and isinstance(args[0], (tuple, list)):
-                        args = args[0]
-                    # Expected first 3 args to be q, k, v (typical signature for Megatron CoreAttention)
-                    q = args[0]
-                    k = args[1]
-                    v = args[2]
-                    if include_q:
-                        layer_to_samples_q[layer_key].append(
-                            float(torch.amax(torch.abs(q)).item())
-                        )
-                    layer_to_samples_k[layer_key].append(
-                        float(torch.amax(torch.abs(k)).item())
+                args = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
+                if len(args) == 1 and isinstance(args[0], (tuple, list)):
+                    args = args[0]
+                # Expected first 3 args to be q, k, v (typical signature for Megatron CoreAttention)
+                q = args[0]
+                k = args[1]
+                v = args[2]
+                if include_q:
+                    layer_to_samples_q[layer_key].append(
+                        float(torch.amax(torch.abs(q)).item())
                     )
-                    layer_to_samples_v[layer_key].append(
-                        float(torch.amax(torch.abs(v)).item())
-                    )
-                except Exception as e:
-                    print(
-                        f"[KV_SCALES] Error in core_attention pre-hook on {module_name}: {e}"
-                    )
-                    pass
+                layer_to_samples_k[layer_key].append(
+                    float(torch.amax(torch.abs(k)).item())
+                )
+                layer_to_samples_v[layer_key].append(
+                    float(torch.amax(torch.abs(v)).item())
+                )
 
             return _pre_hook
 
@@ -2507,34 +2499,12 @@ class MegatronPolicyWorker:
                     hook_handles.append(handle)
                     matched_modules.append((name, module.__class__.__name__, "pre"))
                 except Exception as e:
-                    print(f"[KV_SCALES] Error registering pre-hook on {name}: {e}")
-                    continue
-
-        if not hook_handles:
-            print(
-                "[KV_SCALES] No QKV proj modules matched for hook. Example module/param names:"
-            )
-            try:
-                # Print the first 10 modules and parameters to help locate the actual names
-                cnt = 0
-                for n, _m in self.model.named_modules():
-                    if cnt >= 10:
-                        break
-                    print(f"    [module] {n}")
-                    cnt += 1
-                cnt = 0
-                for n, _p in self.model.named_parameters():
-                    if cnt >= 10:
-                        break
-                    print(f"    [param]  {n}")
-                    cnt += 1
-            except Exception:
-                pass
-        else:
-            # Lightly print the first few modules and parameters to confirm hits
-            print("[KV_SCALES] Registered hooks on modules (showing up to 8):")
-            for i, (mn, cls, kind) in enumerate(matched_modules[:8]):
-                print(f"    {i:02d}: {mn}  <{cls}>  [{kind}]")
+                    print(
+                        f"Error registering pre-hook for qkv scale calibration on {name}: {e}"
+                        " Please check if the model is compatible with the current calibration logic. "
+                        "The expected module name is 'self_attention.core_attention'."
+                    )
+                    raise
 
         # Run a forward pass to trigger hooks (reuse get_logprobs forward path)
         try:
@@ -2544,8 +2514,8 @@ class MegatronPolicyWorker:
                 try:
                     h.remove()
                 except Exception as e:
-                    print(f"[KV_SCALES] Error removing hook: {e}")
-                    pass
+                    print(f"Error removing hook for qkv scale calibration: {e}")
+                    raise
 
         # Compute local percentile amax
         def _percentile(values: list[float], p: float) -> float:
@@ -2616,7 +2586,6 @@ class MegatronPolicyWorker:
             "margin": margin,
             "layers": result_layers,
         }
-        print(f"[KV_SCALES] Calibrated KV cache scales: {final_result}")
 
         # Sync results across all ranks (broadcast rank0's result)
         if world_size > 1:
@@ -2628,16 +2597,6 @@ class MegatronPolicyWorker:
                 obj_list = [None]
                 torch.distributed.broadcast_object_list(obj_list, src=0)
                 final_result = obj_list[0]  # type: ignore
-
-        # Optional save to JSON (only rank0)
-        if save_path is not None and (
-            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-        ):
-            try:
-                with open(save_path, "w") as f:
-                    json.dump(final_result, f)
-            except Exception:
-                pass
 
         return final_result
 

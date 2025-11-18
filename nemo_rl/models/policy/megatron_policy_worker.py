@@ -109,7 +109,10 @@ from nemo_rl.distributed.model_utils import (
     from_parallel_logits_to_logprobs_packed_sequences,
 )
 from nemo_rl.distributed.named_sharding import NamedSharding
-from nemo_rl.models.generation.fp8 import get_vllm_qkv_scale_names
+from nemo_rl.models.generation.fp8 import (
+    convert_calibration_to_vllm_format,
+    get_vllm_qkv_scale_names,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationOutputSpec,
@@ -2549,11 +2552,13 @@ class MegatronPolicyWorker:
             out_entry["v_scale"] = float(v_scale)
             result_layers[layer_key] = out_entry
 
+        vllm_format_scales = convert_calibration_to_vllm_format(result_layers)
+
         final_result = {
             "format": "fp8",
             "percentile": percentile,
             "margin": margin,
-            "layers": result_layers,
+            "layers": vllm_format_scales,
         }
 
         # Sync results across all ranks (broadcast rank0's result)

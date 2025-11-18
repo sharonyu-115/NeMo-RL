@@ -59,7 +59,6 @@ from nemo_rl.experience.rollouts import (
     run_async_penguin_rollout,
     run_multi_turn_rollout,
 )
-from nemo_rl.models.generation.fp8 import convert_calibration_to_vllm_format
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.policy import PolicyConfig
@@ -1119,13 +1118,9 @@ def grpo_train(
                                 batched_flat.get_multimodal_dict(as_tensors=False)
                             )
                             calibration_data.to("cpu")
-                            kv_scales = policy.calibrate_qkv_fp8_scales(
+                            kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                                 calibration_data, include_q=True
                             )["layers"]
-                            # Convert calibration results to vLLM parameter format
-                            kv_scales_cache = convert_calibration_to_vllm_format(
-                                kv_scales
-                            )
 
                         refit_policy_generation(
                             policy,
@@ -1337,11 +1332,9 @@ def grpo_train(
                             "▶ Recomputing KV cache scales after policy update...",
                             flush=True,
                         )
-                        kv_scales = policy.calibrate_qkv_fp8_scales(
+                        kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                             train_data, include_q=True
                         )["layers"]
-                        # Convert calibration results to vLLM parameter format
-                        kv_scales_cache = convert_calibration_to_vllm_format(kv_scales)
                         # Set generation as stale to force refit with new scales
                         POLICY_GENERATION_STALE = True
 

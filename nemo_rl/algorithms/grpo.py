@@ -1344,7 +1344,6 @@ def grpo_train(
                 )
 
                 # Run validation if it's a validation step
-                # TODO: Add validation with kv scales if needed
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(

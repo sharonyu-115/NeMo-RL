@@ -124,6 +124,12 @@ class VllmInternalWorkerExtension:
             self.model_runner.model_config,
             target_device,
         )
+        
+        print("[SHARON] After process_weights_after_loading, collecting garbage and emptying cache")
+        print(f"[SHARON] Before gc.collect(), torch.cuda.memory_allocated(): {torch.cuda.memory_allocated()}")
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"[SHARON] After gc.collect() and torch.cuda.empty_cache(), torch.cuda.memory_allocated(): {torch.cuda.memory_allocated()}")
 
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:

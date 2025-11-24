@@ -1121,6 +1121,7 @@ def grpo_train(
                             kv_scales_cache = policy.calibrate_qkv_fp8_scales(
                                 calibration_data, include_q=True
                             )["layers"]
+                            print(f"[SHARON] KV scales: {kv_scales_cache}")
 
                         refit_policy_generation(
                             policy,
@@ -1344,11 +1345,13 @@ def grpo_train(
                 )
 
                 # Run validation if it's a validation step
-                # TODO: Add validation with kv scales if needed
                 if val_period > 0 and (total_steps + 1) % val_period == 0:
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                            policy,
+                            policy_generation,
+                            colocated_inference,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
                     else:

@@ -47,7 +47,7 @@ class PY_EXECUTABLES:
     BASE = f"uv run --locked --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and vllm.
-    VLLM = f"uv run --locked --extra vllm --directory {git_root}"
+    VLLM = f"uv run --locked --extra vllm --no-group transformers-v4 --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and fsdp.
     FSDP = f"uv run --locked --extra fsdp --directory {git_root}"

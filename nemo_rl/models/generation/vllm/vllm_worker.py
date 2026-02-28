@@ -273,6 +273,26 @@ class BaseVllmGenerationWorker:
 
         _patch_vllm_speculative_decoding_post_step()
 
+        # Patch for transformers Qwen3.5 RoPE bug: ignore_keys_at_rope_validation
+        # can arrive as a list from JSON deserialization, but the code uses set union
+        # which fails with TypeError on list | set. Wrap in set() to normalize.
+        # Upstream fix: https://github.com/huggingface/transformers/pull/44272 (merged)
+        # TODO: Remove once transformers >= 5.3.0 (or whichever release includes the fix) is on PyPI.
+        try:
+            from transformers import modeling_rope_utils
+
+            _orig_convert = modeling_rope_utils.PretrainedConfig.convert_rope_params_to_dict
+
+            def _patched_convert_rope_params_to_dict(self, ignore_keys_at_rope_validation=None):
+                if ignore_keys_at_rope_validation is not None and not isinstance(ignore_keys_at_rope_validation, set):
+                    ignore_keys_at_rope_validation = set(ignore_keys_at_rope_validation)
+                return _orig_convert(self, ignore_keys_at_rope_validation)
+
+            modeling_rope_utils.PretrainedConfig.convert_rope_params_to_dict = _patched_convert_rope_params_to_dict
+            logger.info("Successfully patched transformers convert_rope_params_to_dict for Qwen3.5 RoPE fix.")
+        except (ImportError, AttributeError):
+            pass
+
         try:
             import vllm
 

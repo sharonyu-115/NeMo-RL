@@ -65,7 +65,7 @@ automodel = [
   "flash-attn==2.8.1",
   "transformers>=5.0.0",
 ]
-vllm = ["cuda-python", "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c", "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480", "num2words>=0.5.14", "vllm", "flashinfer-python==0.6.4"]
+vllm = ["cuda-python", "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@7b6b5563b9d4c1ae07ffbce7f78ad3ac9204827c", "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480", "num2words>=0.5.14", "vllm", "flashinfer-python==0.6.4", "transformers>=5.0.0"]
 sglang = [
   "sglang==0.5.7",
   "orjson",
@@ -179,8 +179,6 @@ mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 sgl-kernel = { git = "https://github.com/sgl-project/sglang", rev = "3167bcc01c3074d5739e8086757cd8c66077d508", subdirectory = "sgl-kernel" }
 vllm = {path = "3rdparty/vllm", editable = true}
-# Install transformers commit c58e711a8c688d5a154f6dbbfae54da2f31328bb for Qwen3.5 bug fix: https://github.com/huggingface/transformers/commit/c58e711a8c688d5a154f6dbbfae54da2f31328bb
-transformers = { git = "https://github.com/huggingface/transformers.git", rev = "c58e711a8c688d5a154f6dbbfae54da2f31328bb" }
 
 [tool.uv.workspace]
 members = [
@@ -299,6 +297,10 @@ conflicts = [
   [
     { extra = "vllm" },    # Add this to avoid dependencies conflict between vllm and mcore during vllm upgrade to v0.16
     { extra = "mcore" },
+  ],
+  [
+    { extra = "vllm" },    # vllm needs transformers v5 for Qwen3.5; default group pins v4
+    { group = "transformers-v4" },
   ],
 ]
 

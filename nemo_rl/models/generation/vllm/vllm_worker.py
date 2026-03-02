@@ -278,20 +278,20 @@ class BaseVllmGenerationWorker:
         # which fails with TypeError on list | set. Wrap in set() to normalize.
         # Upstream fix: https://github.com/huggingface/transformers/pull/44272 (merged)
         # TODO: Remove once transformers >= 5.3.0 (or whichever release includes the fix) is on PyPI.
-        try:
-            from transformers import modeling_rope_utils
+     #   try:
+     #       from transformers import PretrainedConfig as _HfPretrainedConfig
 
-            _orig_convert = modeling_rope_utils.PretrainedConfig.convert_rope_params_to_dict
+     #       _orig_convert = _HfPretrainedConfig.convert_rope_params_to_dict
 
-            def _patched_convert_rope_params_to_dict(self, ignore_keys_at_rope_validation=None):
-                if ignore_keys_at_rope_validation is not None and not isinstance(ignore_keys_at_rope_validation, set):
-                    ignore_keys_at_rope_validation = set(ignore_keys_at_rope_validation)
-                return _orig_convert(self, ignore_keys_at_rope_validation)
+     #       def _patched_convert_rope_params_to_dict(self, ignore_keys_at_rope_validation=None, **kwargs):
+     #           if ignore_keys_at_rope_validation is not None and not isinstance(ignore_keys_at_rope_validation, set):
+     #               ignore_keys_at_rope_validation = set(ignore_keys_at_rope_validation)
+     #           return _orig_convert(self, ignore_keys_at_rope_validation=ignore_keys_at_rope_validation, **kwargs)
 
-            modeling_rope_utils.PretrainedConfig.convert_rope_params_to_dict = _patched_convert_rope_params_to_dict
-            logger.info("Successfully patched transformers convert_rope_params_to_dict for Qwen3.5 RoPE fix.")
-        except (ImportError, AttributeError):
-            pass
+     #       _HfPretrainedConfig.convert_rope_params_to_dict = _patched_convert_rope_params_to_dict
+     #       logger.info("Successfully patched transformers convert_rope_params_to_dict for Qwen3.5 RoPE fix.")
+     #   except (ImportError, AttributeError):
+     #       pass
 
         try:
             import vllm
@@ -394,12 +394,14 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
-        elif "Gemma3ForConditionalGeneration" in getattr(
-            hf_config, "architectures", []
+        elif any(
+            arch in getattr(hf_config, "architectures", [])
+            for arch in ("Gemma3ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration")
         ):
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
-                print(
-                    "Gemma3ForConditionalGeneration models may crash when skip_tokenizer_init is True. NeMo-RL is forcing it to False for this architecture. See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
+                logger.info(
+                    "ForConditionalGeneration architectures require a tokenizer for multimodal "
+                    "processor init. Forcing skip_tokenizer_init to False."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 

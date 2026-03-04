@@ -150,7 +150,7 @@ overrides = [
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.10.0", index = "https://pypi.org/simple" },
     { name = "torchaudio", specifier = "==2.9.0" },
     { name = "transformer-engine", extras = ["pytorch"], specifier = "==2.10.0" },
-    { name = "transformers", specifier = ">=4.57.1" },
+    { name = "transformers", git = "https://github.com/huggingface/transformers.git?rev=c58e711a8c688d5a154f6dbbfae54da2f31328bb" },
 ]
 
 [[manifest.dependency-metadata]]
@@ -4919,8 +4919,8 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform != 'darwin'", specifier = ">=0.25.0", index = "https://download.pytorch.org/whl/cu129" },
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = ">=0.25.0", index = "https://pypi.org/simple" },
     { name = "transformer-engine", extras = ["pytorch"], marker = "extra == 'mcore'", specifier = ">=2.9.0a0,<2.12.0" },
-    { name = "transformers", marker = "extra == 'automodel'", specifier = ">=5.0.0" },
-    { name = "transformers", marker = "extra == 'vllm'", specifier = ">=5.0.0" },
+    { name = "transformers", marker = "extra == 'automodel'", git = "https://github.com/huggingface/transformers.git?rev=c58e711a8c688d5a154f6dbbfae54da2f31328bb" },
+    { name = "transformers", marker = "extra == 'vllm'", git = "https://github.com/huggingface/transformers.git?rev=c58e711a8c688d5a154f6dbbfae54da2f31328bb" },
     { name = "triton", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", index = "https://download.pytorch.org/whl/cu129" },
     { name = "uvloop", marker = "extra == 'sglang'" },
     { name = "vllm", marker = "extra == 'vllm'", git = "https://github.com/zpqiu/vllm.git?branch=qwen35" },
@@ -4967,7 +4967,10 @@ test = [
     { name = "pytest-testmon" },
     { name = "pytest-timeout" },
 ]
-transformers-v4 = [{ name = "transformers", specifier = "==4.57.1" }]
+transformers-v4 = [
+    { name = "transformers", specifier = "==4.57.1", index = "https://pypi.org/simple", conflict = { package = "nemo-rl", group = "transformers-v4" } },
+    { name = "transformers", git = "https://github.com/huggingface/transformers.git?rev=c58e711a8c688d5a154f6dbbfae54da2f31328bb" },
+]
 
 [[package]]
 name = "nest-asyncio"
@@ -9083,8 +9086,8 @@ sdist = { url = "https://files.pythonhosted.org/packages/18/94/609a7772569d3acdb
 
 [[package]]
 name = "transformers"
-version = "5.2.0"
-source = { registry = "https://pypi.org/simple" }
+version = "5.3.0.dev0"
+source = { git = "https://github.com/huggingface/transformers.git?rev=c58e711a8c688d5a154f6dbbfae54da2f31328bb#c58e711a8c688d5a154f6dbbfae54da2f31328bb" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-fsdp') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-fsdp' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-vllm' and extra == 'group-7-nemo-rl-transformers-v4') or (extra != 'extra-7-nemo-rl-fsdp' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -9095,11 +9098,7 @@ dependencies = [
     { name = "safetensors" },
     { name = "tokenizers" },
     { name = "tqdm" },
-    { name = "typer-slim" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/bd/7e/8a0c57d562015e5b16c97c1f0b8e0e92ead2c7c20513225dc12c2043ba9f/transformers-5.2.0.tar.gz", hash = "sha256:0088b8b46ccc9eff1a1dca72b5d618a5ee3b1befc3e418c9512b35dea9f9a650", size = 8618176, upload-time = "2026-02-16T18:54:02.867Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/4e/93/79754b0ca486e556c2b95d4f5afc66aaf4b260694f3d6e1b51da2d036691/transformers-5.2.0-py3-none-any.whl", hash = "sha256:9ecaf243dc45bee11a7d93f8caf03746accc0cb069181bbf4ad8566c53e854b4", size = 10403304, upload-time = "2026-02-16T18:53:59.699Z" },
+    { name = "typer" },
 ]
 
 [[package]]
@@ -9141,18 +9140,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f5/24/cb09efec5cc954f7f9b930bf8279447d24618bb6758d4f6adf2574c41780/typer-0.24.1.tar.gz", hash = "sha256:e39b4732d65fbdcde189ae76cf7cd48aeae72919dea1fdfc16593be016256b45", size = 118613, upload-time = "2026-02-21T16:54:40.609Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4a/91/48db081e7a63bb37284f9fbcefda7c44c277b18b0e13fbc36ea2335b71e6/typer-0.24.1-py3-none-any.whl", hash = "sha256:112c1f0ce578bfb4cab9ffdabc68f031416ebcc216536611ba21f04e9aa84c9e", size = 56085, upload-time = "2026-02-21T16:54:41.616Z" },
-]
-
-[[package]]
-name = "typer-slim"
-version = "0.24.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "typer" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a7/a7/e6aecc4b4eb59598829a3b5076a93aff291b4fdaa2ded25efc4e1f4d219c/typer_slim-0.24.0.tar.gz", hash = "sha256:f0ed36127183f52ae6ced2ecb2521789995992c521a46083bfcdbb652d22ad34", size = 4776, upload-time = "2026-02-16T22:08:51.2Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a7/24/5480c20380dfd18cf33d14784096dca45a24eae6102e91d49a718d3b6855/typer_slim-0.24.0-py3-none-any.whl", hash = "sha256:d5d7ee1ee2834d5020c7c616ed5e0d0f29b9a4b1dd283bdebae198ec09778d0e", size = 3394, upload-time = "2026-02-16T22:08:49.92Z" },
 ]
 
 [[package]]

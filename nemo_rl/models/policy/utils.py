@@ -399,9 +399,39 @@ def stream_weights_via_ipc_zmq_impl(
                 current_buffer = buffer_a
 
             aligned_size = calculate_aligned_size(tensor.nbytes)
-            assert aligned_size <= buffer_size_bytes, (
-                f"Parameter {name} too large for buffer: {aligned_size} > {buffer_size_bytes}"
-            )
+
+            # When a single parameter exceeds the buffer size, send it directly via
+            # its own IPC handle instead of copying to the ping-pong buffer. This avoids
+            # needing larger buffers which would compete with full_tensor() for GPU memory.
+            # Common for MoE models where EP-sharded expert weights become large after
+            # full_tensor() all-gather, while free memory is limited due to colocated vLLM.
+            if aligned_size > buffer_size_bytes:
+                # Flush any pending data in the current buffer first
+                if param_names:
+                    await_recv = send_buffer_group_overlap(
+                        current_buffer, param_names, used_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    used_bytes, param_names = 0, []
+
+                # Send the tensor directly using its own GPU memory (zero-copy).
+                # View as flat uint8 to match the buffer format the receiver expects.
+                direct_tensor = tensor.contiguous().view(-1).view(dtype=torch.uint8)
+                torch.cuda.current_stream().synchronize()
+                cuda_ipc_handle = get_handle_from_tensor(direct_tensor)
+                if await_recv:
+                    zmq_socket.recv()
+                payload = (cuda_ipc_handle, [name], aligned_size)
+                zmq_socket.send_pyobj(payload)
+                # Must wait for ACK synchronously: the tensor memory belongs to the
+                # generator and will be freed on the next iteration when full_tensor()
+                # is called for the next param. Waiting ensures the receiver has
+                # finished copying before we proceed.
+                zmq_socket.recv()
+                await_recv = False
+                count_of_groups += 1
+                del direct_tensor
+                continue
 
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:

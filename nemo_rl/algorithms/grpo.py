@@ -1086,6 +1086,31 @@ def refit_policy_generation(
                 buffer_size_bytes = int(
                     policy.get_free_memory_bytes() * float(memory_ratio)
                 )
+                max_buffer_size_gb = os.getenv("NRL_REFIT_BUFFER_MAX_GB")
+                if max_buffer_size_gb is not None and max_buffer_size_gb.strip():
+                    try:
+                        max_buffer_size_bytes = int(
+                            float(max_buffer_size_gb) * (1024**3)
+                        )
+                    except ValueError:
+                        print(
+                            "[WARNING] Invalid NRL_REFIT_BUFFER_MAX_GB="
+                            f"{max_buffer_size_gb!r}; ignoring cap."
+                        )
+                    else:
+                        if max_buffer_size_bytes <= 0:
+                            print(
+                                "[WARNING] NRL_REFIT_BUFFER_MAX_GB must be > 0; "
+                                f"got {max_buffer_size_gb!r}. Ignoring cap."
+                            )
+                        elif buffer_size_bytes > max_buffer_size_bytes:
+                            print(
+                                "Capping refit buffer size from "
+                                f"{buffer_size_bytes / (1024**3):.2f}GB to "
+                                f"{max_buffer_size_bytes / (1024**3):.2f}GB "
+                                "via NRL_REFIT_BUFFER_MAX_GB."
+                            )
+                            buffer_size_bytes = max_buffer_size_bytes
 
             if isinstance(policy_generation, SGLangGeneration):
                 sglang_url_to_gpu_uuids = (

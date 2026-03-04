@@ -25,6 +25,7 @@ from typing import (
 
 import numpy as np
 import ray
+import torch
 from ray.util.placement_group import PlacementGroup
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
@@ -482,6 +483,36 @@ class VllmGeneration(GenerationInterface):
         # this function should co-work with lm_policy, so we should wait for all futures to complete outside
         return futures
 
+    @staticmethod
+    def _shuffle_batch(
+        data: BatchedDataDict, dp_size: int
+    ) -> tuple[BatchedDataDict, np.ndarray | None]:
+        """Randomly shuffle data before sharding to balance load across engines.
+
+        Without shuffling, shard_by_batch_size splits contiguously, so one
+        engine may get a cluster of prompts that all produce long responses,
+        causing KV-cache saturation and stragglers.  A random permutation
+        breaks this correlation.
+
+        Returns the shuffled data and the inverse permutation to restore the
+        original order (None when dp_size <= 1).
+        """
+        if dp_size <= 1:
+            return data, None
+
+        sample_val = next(iter(data.data.values()))
+        batch_size = sample_val.size(0) if isinstance(sample_val, torch.Tensor) else len(sample_val)
+
+        if batch_size <= dp_size:
+            return data, None
+
+        perm = np.random.permutation(batch_size)
+        inverse = np.empty(batch_size, dtype=np.int64)
+        inverse[perm] = np.arange(batch_size)
+
+        shuffled_data = data.select_indices(torch.from_numpy(perm).long())
+        return shuffled_data, inverse
+
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
@@ -493,8 +524,11 @@ class VllmGeneration(GenerationInterface):
             "input_ids and input_lengths are required in data for vLLM generation"
         )
 
-        # Shard the data across the tied worker groups
+        # Shuffle data to balance prompt lengths across engines
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        data, inverse_indices = self._shuffle_batch(data, dp_size)
+
+        # Shard the data across the tied worker groups
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
@@ -514,6 +548,12 @@ class VllmGeneration(GenerationInterface):
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
             results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
+
+        # Restore original order
+        if inverse_indices is not None:
+            combined = combined.select_indices(
+                torch.from_numpy(inverse_indices).long()
+            )
 
         # Verify the output has all required fields
         required_keys = [
@@ -544,8 +584,11 @@ class VllmGeneration(GenerationInterface):
                 "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
             )
 
-        # Shard the data across the tied worker groups
+        # Shuffle data to balance prompt lengths across engines
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
+        data, inverse_indices = self._shuffle_batch(data, dp_size)
+
+        # Shard the data across the tied worker groups
         sharded_data: list[SlicedDataDict] = data.shard_by_batch_size(
             dp_size, allow_uneven_shards=True
         )
@@ -565,6 +608,12 @@ class VllmGeneration(GenerationInterface):
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
             results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
         )
+
+        # Restore original order
+        if inverse_indices is not None:
+            combined = combined.select_indices(
+                torch.from_numpy(inverse_indices).long()
+            )
 
         # Verify the output has all required fields
         required_keys = ["texts"]

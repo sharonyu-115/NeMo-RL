@@ -14,6 +14,7 @@
 
 import contextlib
 import gc
+import os
 import warnings
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import Any, Generator, Optional
@@ -1028,12 +1029,103 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
         torch.randn(1).cuda()  # wake up torch allocator
         self.offload_before_refit()  # rerun the old offload function
 
+        # Force-release orphan CUDA tensors not referenced by model/optimizer.
+        # After model.to("cpu") and optimizer offload, various internal buffers
+        # (FSDP2 _sharded_param_data, gradients, IPC handles, etc.) may still
+        # hold GPU memory. This catches all of them in one pass.
+        self._maybe_release_orphan_cuda_tensors()
+
         # Print memory stats after offloading
         allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
         reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
         print(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
+
+    def _collect_preserved_cuda_storage_ptrs(self) -> set[int]:
+        """Collect CUDA storage pointers that must not be force-freed."""
+        preserved: set[int] = set()
+
+        def _add_tensor_storage(t: Any) -> None:
+            if not isinstance(t, torch.Tensor):
+                return
+            if not t.is_cuda:
+                return
+            try:
+                storage = t.untyped_storage()
+                if storage.size() > 0:
+                    preserved.add(storage.data_ptr())
+            except Exception:
+                return
+
+        for p in self.model.parameters():
+            _add_tensor_storage(p.data)
+            if p.grad is not None:
+                _add_tensor_storage(p.grad)
+        for b in self.model.buffers():
+            _add_tensor_storage(b)
+
+        if self.optimizer is not None:
+            stack: list[Any] = list(self.optimizer.state.values())
+            seen_obj_ids: set[int] = set()
+            while stack:
+                obj = stack.pop()
+                obj_id = id(obj)
+                if obj_id in seen_obj_ids:
+                    continue
+                seen_obj_ids.add(obj_id)
+                if isinstance(obj, dict):
+                    stack.extend(obj.values())
+                elif isinstance(obj, (list, tuple, set)):
+                    stack.extend(list(obj))
+                else:
+                    _add_tensor_storage(obj)
+
+        return preserved
+
+    def _maybe_release_orphan_cuda_tensors(self) -> None:
+        """Force-release CUDA storages not referenced by model/optimizer (opt-in)."""
+        if os.environ.get("NRL_FORCE_FREE_ORPHAN_CUDA_TENSORS", "0") != "1":
+            return
+
+        preserved_ptrs = self._collect_preserved_cuda_storage_ptrs()
+        released_bytes = 0
+        released_tensors = 0
+        seen_storage_ptrs: set[int] = set()
+
+        for obj in gc.get_objects():
+            try:
+                if not isinstance(obj, torch.Tensor):
+                    continue
+                if not obj.is_cuda:
+                    continue
+                storage = obj.untyped_storage()
+                storage_size = storage.size()
+                if storage_size == 0:
+                    continue
+                storage_ptr = storage.data_ptr()
+                if storage_ptr in seen_storage_ptrs:
+                    continue
+                seen_storage_ptrs.add(storage_ptr)
+                if storage_ptr in preserved_ptrs:
+                    continue
+                storage.resize_(0)
+                released_bytes += storage_size
+                released_tensors += 1
+            except Exception:
+                continue
+
+        gc.collect()
+        torch.cuda.synchronize()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
+        torch.cuda.empty_cache()
+
+        if self.rank == 0:
+            print(
+                "Orphan CUDA tensor cleanup: "
+                f"released {released_tensors} storages, {released_bytes / (1024**3):.2f} GB"
+            )
 
     def move_optimizer_to_device(self, device: str | torch.device) -> None:
         for state in self.optimizer.state.values():

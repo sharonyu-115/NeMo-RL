@@ -1083,9 +1083,32 @@ class DTensorPolicyWorkerV2(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         return preserved
 
+    def _model_uses_transformer_engine(self) -> bool:
+        """Return True when the active model contains TransformerEngine modules.
+
+        TE modules can keep live CUDA tensors outside registered parameters/buffers.
+        Aggressively resizing "orphan" storages can invalidate those internal tensors
+        and break later GEMMs after the model is moved back to CUDA.
+        """
+        for module in self.model.modules():
+            module_name = type(module).__module__
+            if module_name.startswith("transformer_engine."):
+                return True
+        return False
+
     def _maybe_release_orphan_cuda_tensors(self) -> None:
         """Force-release CUDA storages not referenced by model/optimizer (opt-in)."""
         if os.environ.get("NRL_FORCE_FREE_ORPHAN_CUDA_TENSORS", "0") != "1":
+            return
+
+        allow_te_cleanup = os.environ.get("NRL_ALLOW_ORPHAN_CLEANUP_WITH_TE", "0") == "1"
+        if self._model_uses_transformer_engine() and not allow_te_cleanup:
+            if self.rank == 0:
+                print(
+                    "Skipping orphan CUDA tensor cleanup because TransformerEngine modules are active. "
+                    "TE may keep live CUDA tensors outside parameters/buffers, and force-freeing them "
+                    "can corrupt later GEMMs. Set NRL_ALLOW_ORPHAN_CLEANUP_WITH_TE=1 to override."
+                )
             return
 
         preserved_ptrs = self._collect_preserved_cuda_storage_ptrs()

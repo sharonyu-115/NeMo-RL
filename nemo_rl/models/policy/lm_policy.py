@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import os
 import warnings
 from collections import defaultdict
@@ -131,6 +132,22 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["dtensor_cfg"]["context_parallel_size"]
 
             env_vars = config["dtensor_cfg"].get("env_vars", {})
+
+            if cp_size > 1:
+                current_divisor = max(
+                    1, int(config.get("make_sequence_length_divisible_by", 1))
+                )
+                required_divisor = 2 * cp_size
+                adjusted_divisor = math.lcm(current_divisor, required_divisor)
+                if adjusted_divisor != current_divisor:
+                    warnings.warn(
+                        "DTensor context parallel requires sequence lengths to be divisible by "
+                        f"2 * cp_size ({required_divisor}) due to PyTorch load-balanced CP sharding. "
+                        "Adjusting policy.make_sequence_length_divisible_by from "
+                        f"{current_divisor} to {adjusted_divisor}.",
+                        stacklevel=2,
+                    )
+                    config["make_sequence_length_divisible_by"] = adjusted_divisor
 
         # Validate world_size compatibility with parallelism configuration
         model_parallel_size = pp_size * cp_size * tp_size

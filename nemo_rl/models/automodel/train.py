@@ -51,6 +51,44 @@ PostProcessingFunction = Union[
 ]
 
 
+# Keys used when passing flash attention kwargs as flat args for AutoModel custom models.
+_AUTOMODEL_FLASH_ATTN_KEYS = ("cu_seqlens", "cu_seqlens_padded", "max_seqlen", "qkv_format")
+
+
+def _add_flash_attn_kwargs(
+    model_args: dict[str, Any],
+    model: nn.Module,
+    flash_attn_kwargs: Any,
+) -> None:
+    """Add flash attention kwargs to model_args, translating format for AutoModel custom models.
+
+    HF models expect ``flash_attn_kwargs=FlashAttentionKwargs(...)`` as a single named kwarg.
+    AutoModel custom models (GLM4, Qwen3.5, etc.) expect flat kwargs
+    (``cu_seqlens``, ``max_seqlen``, ``qkv_format="thd"``) so that their forward() can
+    trigger ``squeeze_input_for_thd()`` and propagate cu_seqlens to the attention layers.
+    """
+    from nemo_rl.models.huggingface.common import FlashAttentionKwargs
+
+    # AutoModel custom models have a `backend` attribute (BackendConfig).
+    # HF models loaded via transformers do not.
+    is_automodel = hasattr(model, "backend")
+
+    if is_automodel and isinstance(flash_attn_kwargs, FlashAttentionKwargs):
+        cu_seqlens = flash_attn_kwargs.cu_seqlens_q.to(dtype=torch.int32)
+        model_args["cu_seqlens"] = cu_seqlens
+        model_args["cu_seqlens_padded"] = cu_seqlens
+        model_args["max_seqlen"] = flash_attn_kwargs.max_seqlen_q
+        model_args["qkv_format"] = "thd"
+    else:
+        model_args["flash_attn_kwargs"] = flash_attn_kwargs
+
+
+def _remove_flash_attn_kwargs(model_args: dict[str, Any]) -> None:
+    """Remove all flash attention kwargs from model_args (both HF and AutoModel formats)."""
+    for key in ("flash_attn_kwargs", *_AUTOMODEL_FLASH_ATTN_KEYS):
+        model_args.pop(key, None)
+
+
 def model_forward(
     model: nn.Module,
     processed_inputs: ProcessedInputs,
@@ -77,23 +115,20 @@ def model_forward(
 
     # Add flash attention kwargs if applicable
     if processed_inputs.has_flash_attention:
-        model_args["flash_attn_kwargs"] = processed_inputs.flash_attn_kwargs
+        _add_flash_attn_kwargs(model_args, model, processed_inputs.flash_attn_kwargs)
 
     # Add VLM kwargs if applicable
     if processed_inputs.is_multimodal:
         model_args.update(processed_inputs.vlm_kwargs)
-        # flash_attn_kwargs is not supported for multimodal
-        if "flash_attn_kwargs" in model_args:
-            del model_args["flash_attn_kwargs"]
+        _remove_flash_attn_kwargs(model_args)
 
     # Reward models don't support flash_attn_kwargs
     if is_reward_model:
-        if "flash_attn_kwargs" in model_args:
-            del model_args["flash_attn_kwargs"]
+        _remove_flash_attn_kwargs(model_args)
 
     # Remove flash_attn_kwargs if not allowed
-    if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
-        del model_args["flash_attn_kwargs"]
+    if not allow_flash_attn_args:
+        _remove_flash_attn_kwargs(model_args)
 
     outputs = model(**model_args)
     return outputs
@@ -676,12 +711,16 @@ class LogprobsPostProcessor:
         Returns:
             Token log probabilities
         """
+        # Shift logits and tokens so logits[t] aligns with input_ids[t+1]
+        next_tokens = input_ids[:, 1:]
+        logits = logits[:, :-1, :]
+
         if self.logprob_chunk_size is not None:
             logits_seq_len = int(logits.shape[1])
             num_chunks = (
                 logits_seq_len + self.logprob_chunk_size - 1
             ) // self.logprob_chunk_size
-            chunked_log_probs = []
+            chunked_token_logprobs = []
             for chunk_idx in range(num_chunks):
                 chunk_start = chunk_idx * self.logprob_chunk_size
                 chunk_end = min(
@@ -689,27 +728,22 @@ class LogprobsPostProcessor:
                     (chunk_idx + 1) * self.logprob_chunk_size,
                 )
                 chunk_logits = logits[:, chunk_start:chunk_end, :].to(torch.float32)
-                log_probs = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
-                chunked_log_probs.append(log_probs)
-            log_probs = torch.cat(chunked_log_probs, dim=1)
-            del chunked_log_probs
+                chunk_log_probs = torch.nn.functional.log_softmax(chunk_logits, dim=-1)
+                del chunk_logits
+                chunk_token_logprobs = chunk_log_probs.gather(
+                    dim=-1, index=next_tokens[:, chunk_start:chunk_end].unsqueeze(-1)
+                ).squeeze(-1)
+                del chunk_log_probs
+                chunked_token_logprobs.append(chunk_token_logprobs)
+            token_logprobs = torch.cat(chunked_token_logprobs, dim=1)
+            del chunked_token_logprobs
         else:
             logits = logits.to(torch.float32)
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-
-        # Extract logprobs for each token in the sequence by gathering the logprob
-        # corresponding to the next token at each position
-        # Input shapes:
-        #   log_probs: [batch_size, sequence_length, vocab_size] - logits for each position
-        #   token_ids: [batch_size, sequence_length] - actual tokens
-        # Output shape: [batch_size, sequence_length] - logprob of each token given previous
-        # We get logprob of token[t+1] from logits[t], prepending 0 to maintain sequence length
-        next_tokens = input_ids[:, 1:]
-        log_probs = log_probs[:, :-1]
-        token_logprobs = log_probs.gather(
-            dim=-1, index=next_tokens.unsqueeze(-1)
-        ).squeeze(-1)
-        del log_probs
+            token_logprobs = log_probs.gather(
+                dim=-1, index=next_tokens.unsqueeze(-1)
+            ).squeeze(-1)
+            del log_probs
 
         return token_logprobs
 

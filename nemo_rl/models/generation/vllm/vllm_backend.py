@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import os
+import time
 import traceback
 from typing import Any
 
@@ -38,6 +40,76 @@ except ImportError:
 
 
 class VllmInternalWorkerExtension:
+    # Race detection state (initialized lazily by _maybe_init_race_detection).
+    # Scalars are safe as class defaults; mutable list is created per-instance in init.
+    _race_detection_enabled: bool = False
+    _race_detection_initialized: bool = False
+    _race_overlap_count: int = 0
+
+    def _maybe_init_race_detection(self) -> None:
+        """Initialize race detection state if NRL_DETECT_WEIGHT_UPDATE_RACE=1."""
+        if self._race_detection_initialized:
+            return
+        self._race_detection_initialized = True
+        self._race_detection_enabled = (
+            os.environ.get("NRL_DETECT_WEIGHT_UPDATE_RACE", "0") == "1"
+        )
+        self._race_overlap_count = 0
+        self._race_overlap_details: list[dict[str, Any]] = []  # pyrefly: ignore[implicitly-defined-attribute]
+        if self._race_detection_enabled:
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+            print(f"[RaceDetect] Worker rank={rank}: race detection ENABLED")
+
+    def _check_race_before_weight_update(self, method_name: str) -> None:
+        """Check if CUDA stream has pending work before weight update.
+
+        If torch.cuda.current_stream().query() returns False, the GPU still
+        has pending kernels (likely from a forward pass), proving overlap.
+        """
+        self._maybe_init_race_detection()
+        if not self._race_detection_enabled:
+            return
+
+        stream = torch.cuda.current_stream()
+        stream_idle = stream.query()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        ts = time.perf_counter()
+
+        if not stream_idle:
+            self._race_overlap_count += 1
+            detail = {
+                "timestamp": ts,
+                "rank": rank,
+                "method": method_name,
+                "stream_idle": False,
+            }
+            self._race_overlap_details.append(detail)
+            print(
+                f"[RaceDetect] !! OVERLAP DETECTED !! rank={rank} method={method_name} "
+                f"stream.query()=False (GPU has pending work)"
+            )
+        else:
+            print(
+                f"[RaceDetect] rank={rank} method={method_name} "
+                f"stream.query()=True (GPU idle, no overlap)"
+            )
+
+    def get_race_detection_report(self) -> dict[str, Any]:
+        """Return race detection report for this worker."""
+        self._maybe_init_race_detection()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        return {
+            "rank": rank,
+            "enabled": self._race_detection_enabled,
+            "overlap_count": self._race_overlap_count,
+            "overlap_details": list(self._race_overlap_details),
+        }
+
+    def clear_race_detection_report(self) -> None:
+        """Clear race detection counters."""
+        self._race_overlap_count = 0
+        self._race_overlap_details = []
+
     def init_collective(
         self,
         rank_prefix: int,
@@ -129,6 +201,8 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if weights were successfully updated.
         """
+        self._check_race_before_weight_update("update_weights_via_ipc_zmq")
+
         buffer = None
         weights = None
 
@@ -212,6 +286,8 @@ class VllmInternalWorkerExtension:
     )
     def update_weights_from_collective(self) -> bool:
         """Update the model weights from collective communication."""
+        self._check_race_before_weight_update("update_weights_from_collective")
+
         assert self.state_dict_info is not None, (
             "state_dict_info is not prepared. "
             "Please call prepare_refit_info when initializing the worker."

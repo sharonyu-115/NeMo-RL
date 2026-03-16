@@ -1076,6 +1076,25 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             traceback.print_exc()
             return False
 
+    async def get_race_detection_report_async(self) -> list[dict]:
+        """Async version of get_race_detection_report."""
+        assert self.llm is not None
+        result_or_coro = await self.llm.collective_rpc(
+            "get_race_detection_report", args=tuple()
+        )
+        if asyncio.iscoroutine(result_or_coro):
+            return await result_or_coro
+        return result_or_coro
+
+    async def clear_race_detection_report_async(self) -> None:
+        """Async version of clear_race_detection_report."""
+        assert self.llm is not None
+        result_or_coro = await self.llm.collective_rpc(
+            "clear_race_detection_report", args=tuple()
+        )
+        if asyncio.iscoroutine(result_or_coro):
+            await result_or_coro
+
     async def reset_prefix_cache_async(self):
         """Async version of reset_prefix_cache."""
         assert self.llm is not None, (

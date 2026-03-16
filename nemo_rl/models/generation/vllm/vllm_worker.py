@@ -215,7 +215,7 @@ class BaseVllmGenerationWorker:
 
             new_lines = [
                 f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
+                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV", "NRL_DETECT_WEIGHT_UPDATE_RACE"}',
             ]
 
             need_replace = False
@@ -493,6 +493,26 @@ class BaseVllmGenerationWorker:
         torch.cuda.profiler.stop()
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
+
+    def get_race_detection_report(self) -> list[dict]:
+        """Get race detection reports from all vLLM engine workers."""
+        assert self.llm is not None
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "get_race_detection_report cannot be used with async_engine=True. "
+                "Use get_race_detection_report_async instead."
+            )
+        return self.llm.collective_rpc("get_race_detection_report", args=tuple())
+
+    def clear_race_detection_report(self) -> None:
+        """Clear race detection reports on all vLLM engine workers."""
+        assert self.llm is not None
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "clear_race_detection_report cannot be used with async_engine=True. "
+                "Use clear_race_detection_report_async instead."
+            )
+        self.llm.collective_rpc("clear_race_detection_report", args=tuple())
 
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get speculative decoding metrics from the vLLM engine.

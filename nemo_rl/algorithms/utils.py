@@ -320,6 +320,12 @@ def get_tokenizer(
         processor.bos_token_id = tokenizer.bos_token_id
         # copy name_or_path from tokenizer to processor for logging
         processor.name_or_path = tokenizer.name_or_path
+        # copy chat_template so processor.apply_chat_template() works for
+        # models whose processor doesn't ship its own template (e.g. Qwen3.5)
+        if not getattr(processor, "chat_template", None) and getattr(
+            tokenizer, "chat_template", None
+        ):
+            processor.chat_template = tokenizer.chat_template
 
     return tokenizer if processor is None else processor
 

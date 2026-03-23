@@ -53,6 +53,23 @@ STRING_TO_DTYPE = {
 }
 
 
+def _apply_nested_config_overrides(config: Any, overrides: dict[str, Any]) -> None:
+    """Recursively apply nested dict overrides to a HuggingFace config object.
+
+    AutoConfig.from_pretrained only handles flat top-level kwargs. For VLM
+    models with nested sub-configs (text_config, vision_config, etc.), nested
+    overrides like ``{"text_config": {"router_aux_loss_coef": 0}}`` must be
+    applied manually after loading.
+    """
+    for key, value in overrides.items():
+        if isinstance(value, dict):
+            sub_config = getattr(config, key, None)
+            if sub_config is not None and hasattr(sub_config, "__dict__"):
+                _apply_nested_config_overrides(sub_config, value)
+        else:
+            setattr(config, key, value)
+
+
 def get_tokenizer(
     tokenizer_config: TokenizerConfig, get_processor: bool = False
 ) -> Union[PreTrainedTokenizerBase, AutoProcessor]:
@@ -196,6 +213,12 @@ def validate_and_prepare_config(
     # Get HF config overrides
     hf_config_overrides = config.get("hf_config_overrides", {}) or {}
 
+    # Split overrides: flat kwargs go to AutoConfig.from_pretrained,
+    # nested dicts (e.g. text_config: {router_aux_loss_coef: 0}) are
+    # applied post-load so they reach sub-configs of VLM models.
+    flat_overrides = {k: v for k, v in hf_config_overrides.items() if not isinstance(v, dict)}
+    nested_overrides = {k: v for k, v in hf_config_overrides.items() if isinstance(v, dict)}
+
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
     # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
@@ -212,8 +235,13 @@ def validate_and_prepare_config(
         torch_dtype=torch.float32,  # Always load in float32 for master weights
         trust_remote_code=True,
         attn_implementation="flash_attention_2" if enable_seq_packing else None,
-        **hf_config_overrides,
+        **flat_overrides,
     )
+
+    # Apply nested overrides to sub-configs (e.g. text_config, vision_config).
+    # AutoConfig.from_pretrained only sets flat top-level attrs, so nested
+    # fields like text_config.router_aux_loss_coef are unreachable via kwargs.
+    _apply_nested_config_overrides(model_config, nested_overrides)
 
     # Check if model supports flash attention args
     allow_flash_attn_args = True
@@ -521,12 +549,12 @@ def setup_model_and_optimizer(
 
         cuda.enable_cudnn_sdp(False)
 
-    # Build from_pretrained kwargs from hf_config_overrides so from_pretrained
-    # applies them when loading the config internally (avoids passing config=
-    # which causes duplicate 'config' arg for custom model implementations).
-    hf_config_overrides = runtime_config.hf_config_overrides or {}
+    # Pass the pre-loaded model_config (with nested overrides already applied)
+    # directly to Automodel so it doesn't re-load from disk and lose overrides.
+    # Automodel's _init_model pops "config" from kwargs before forwarding to
+    # model_cls(), so this no longer causes a duplicate argument error.
     from_pretrained_kwargs: dict[str, Any] = {
-        **hf_config_overrides,
+        "config": model_config,
     }
     # Reward model num_labels override
     if is_reward_model and model_config.num_labels == 1:

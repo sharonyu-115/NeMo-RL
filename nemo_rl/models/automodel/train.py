@@ -23,7 +23,6 @@ Key differences from megatron approach:
 - automodel_forward_backward uses PyTorch autograd instead of Megatron's pipeline
 """
 
-import os
 import inspect
 from collections import defaultdict
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
@@ -70,25 +69,6 @@ def model_forward(
     Returns:
         torch.Tensor: Output tensor from the model (logits)
     """
-    debug_cp = os.getenv("NEMO_QWEN35_CP_DEBUG", "").strip().lower() not in ("", "0", "false", "off")
-    if debug_cp and not getattr(model, "_qwen35_cp_model_forward_debug_logged", False):
-        seq_index_shape = None if processed_inputs.seq_index is None else tuple(processed_inputs.seq_index.shape)
-        position_ids_shape = (
-            None if processed_inputs.position_ids is None else tuple(processed_inputs.position_ids.shape)
-        )
-        message = (
-            "Automodel model_forward debug model=%s position_ids_shape=%s seq_index_shape=%s input_ids_shape=%s train_file=%s"
-            % (
-                type(model).__name__,
-                position_ids_shape,
-                seq_index_shape,
-                tuple(processed_inputs.input_ids.shape),
-                __file__,
-            )
-        )
-        print(message, flush=True)
-        setattr(model, "_qwen35_cp_model_forward_debug_logged", True)
-
     position_ids = processed_inputs.position_ids
     if position_ids is None and processed_inputs.seq_index is not None:
         # CP-sharded runs still need global token positions. Fall back to seq_index
@@ -98,13 +78,6 @@ def model_forward(
             position_ids = position_ids.unsqueeze(0)
         if position_ids.ndim == 2 and position_ids.shape[0] == 1 and processed_inputs.input_ids.shape[0] > 1:
             position_ids = position_ids.expand(processed_inputs.input_ids.shape[0], -1)
-        if debug_cp and not getattr(model, "_qwen35_cp_model_forward_fallback_logged", False):
-            print(
-                "Automodel model_forward debug using seq_index as position_ids fallback shape=%s"
-                % (tuple(position_ids.shape),),
-                flush=True,
-            )
-            setattr(model, "_qwen35_cp_model_forward_fallback_logged", True)
 
     model_args = dict(
         input_ids=processed_inputs.input_ids,
@@ -115,6 +88,8 @@ def model_forward(
 
     forward_sig = inspect.signature(model.forward)
     supports_var_kwargs = any(param.kind == inspect.Parameter.VAR_KEYWORD for param in forward_sig.parameters.values())
+    # CP-aware Qwen3.5 linear attention needs seq_index to recover dense token order
+    # from the load-balanced attention layout.
     if processed_inputs.seq_index is not None and (supports_var_kwargs or "seq_index" in forward_sig.parameters):
         model_args["seq_index"] = processed_inputs.seq_index
 

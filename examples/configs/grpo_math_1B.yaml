@@ -281,6 +281,7 @@ policy:
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
     vllm_cfg:
       async_engine: false
+      pause_engine_for_weight_updates: false # Pause vLLM engine during weight updates to prevent race condition. Enable when in_flight_weight_updates is true.
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       tensor_parallel_size: 1

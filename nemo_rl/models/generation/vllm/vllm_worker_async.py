@@ -1042,6 +1042,55 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         """Async version of prepare_refit_info."""
         await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
 
+    @property
+    def _should_pause_engine_for_weight_updates(self) -> bool:
+        """Check if engine should be paused during weight updates.
+
+        Should be enabled when in_flight_weight_updates is true, to prevent
+        forward passes from overlapping with weight copies. When
+        in_flight_weight_updates is false, the trajectory collector drains
+        all pending generations before the weight update, so the engine is
+        already idle and pausing is unnecessary.
+        """
+        return self.cfg.get("vllm_cfg", {}).get(
+            "pause_engine_for_weight_updates", False
+        )
+
+    async def _pause_engine_for_weight_update(self) -> bool:
+        """Pause the vLLM engine to prevent forward passes during weight update.
+
+        Uses mode="keep" to freeze in-flight requests without aborting them.
+        Requests resume transparently after resume_generation() is called.
+        This prevents a race condition where collective_rpc (weight update)
+        runs on the Ray actor's main thread while a compiled DAG forward pass
+        runs on the background thread, potentially causing the forward pass
+        to read partially-updated weights.
+
+        Controlled by vllm_cfg.pause_engine_for_weight_updates (default: true).
+
+        Returns:
+            True if pause was successful or skipped, False on error.
+        """
+        if not self._should_pause_engine_for_weight_updates:
+            return True
+        try:
+            await self.llm.pause_generation(mode="keep", clear_cache=False)
+            print("[WeightUpdate] Paused vLLM engine (mode=keep) before weight update")
+            return True
+        except Exception as e:
+            print(f"Warning: Failed to pause engine before weight update: {e}")
+            return False
+
+    async def _resume_engine_after_weight_update(self) -> None:
+        """Resume the vLLM engine after weight update completes."""
+        if not self._should_pause_engine_for_weight_updates:
+            return
+        try:
+            await self.llm.resume_generation()
+            print("[WeightUpdate] Resumed vLLM engine after weight update")
+        except Exception as e:
+            print(f"Warning: Failed to resume engine after weight update: {e}")
+
     async def update_weights_via_ipc_zmq_async(
         self,
     ) -> bool:
@@ -1056,24 +1105,29 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     "update_weights_via_ipc_zmq_async can only be used with async_engine=True. Use update_weights_via_ipc_zmq instead."
                 )
 
-            # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
-            result_or_coro = await self.llm.collective_rpc(
-                "update_weights_via_ipc_zmq", args=tuple()
-            )
-
-            if asyncio.iscoroutine(result_or_coro):
-                worker_results = await result_or_coro
-            else:
-                worker_results = result_or_coro
-
-            worker_result = worker_results[0]
-
-            if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+            # Pause engine to prevent forward passes from overlapping with weight update
+            await self._pause_engine_for_weight_update()
+            try:
+                # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
+                result_or_coro = await self.llm.collective_rpc(
+                    "update_weights_via_ipc_zmq", args=tuple()
                 )
-                return False
-            return True
+
+                if asyncio.iscoroutine(result_or_coro):
+                    worker_results = await result_or_coro
+                else:
+                    worker_results = result_or_coro
+
+                worker_result = worker_results[0]
+
+                if not worker_result:
+                    print(
+                        f"Error: Worker failed to update weights. Result: {worker_result}"
+                    )
+                    return False
+                return True
+            finally:
+                await self._resume_engine_after_weight_update()
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback
@@ -1093,23 +1147,28 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     "update_weights_from_collective_async can only be used with async_engine=True. Use update_weights_from_collective instead."
                 )
 
-            result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
-            )
-
-            if asyncio.iscoroutine(result_or_coro):
-                worker_results = await result_or_coro
-            else:
-                worker_results = result_or_coro
-
-            worker_result = worker_results[0]
-
-            if not worker_result:
-                print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+            # Pause engine to prevent forward passes from overlapping with weight update
+            await self._pause_engine_for_weight_update()
+            try:
+                result_or_coro = await self.llm.collective_rpc(
+                    "update_weights_from_collective", args=tuple()
                 )
-                return False
-            return True
+
+                if asyncio.iscoroutine(result_or_coro):
+                    worker_results = await result_or_coro
+                else:
+                    worker_results = result_or_coro
+
+                worker_result = worker_results[0]
+
+                if not worker_result:
+                    print(
+                        f"Error: Worker failed to update weights. Result: {worker_result}"
+                    )
+                    return False
+                return True
+            finally:
+                await self._resume_engine_after_weight_update()
         except Exception as e:
             print(f"Exception during collective_rpc for weight update: {e}")
             import traceback

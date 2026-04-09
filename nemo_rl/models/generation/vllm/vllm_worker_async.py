@@ -317,6 +317,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
+        from vllm.entrypoints.serve.render.serving import OpenAIServingRender
         from vllm.entrypoints.serve.tokenize.serving import (
             OpenAIServingTokenization,
         )
@@ -357,8 +358,8 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
                 return super().model_post_init(context)
 
-        class NeMoRLOpenAIServingMixin:
-            async def _preprocess_chat(
+        class NeMoRLOpenAIServingRender(OpenAIServingRender):
+            async def preprocess_chat(
                 self,
                 request,
                 messages,
@@ -373,12 +374,12 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                # Deepcopy messages here since _preprocess_chat may be destructive.
+                # Deepcopy messages here since preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
                 # res is (conversation, [engine_prompt])
                 try:
-                    res = await super()._preprocess_chat(
+                    res = await super().preprocess_chat(
                         request=request,
                         messages=messages,
                         default_template=default_template,
@@ -430,7 +431,7 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 )
 
                 # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
-                corresponding_res = await super()._preprocess_chat(
+                corresponding_res = await super().preprocess_chat(
                     request=modified_request,
                     messages=messages_to_last_assistant_message,
                     default_template=default_template,
@@ -458,6 +459,16 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
 
                 return res
 
+        openai_serving_render = NeMoRLOpenAIServingRender(
+            model_config=model_config,
+            renderer=engine_client.renderer,
+            io_processor=engine_client.io_processor,
+            model_registry=openai_serving_models.registry,
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+        )
+
         ########################################
         # /v1/chat/completions endpoint
         ########################################
@@ -467,10 +478,6 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest
         ):
             required_prefix_token_ids: Optional[List[int]] = None
-
-        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingChat
-        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
-            pass
 
         serving_chat_default_kwargs = dict(
             response_role="assistant",
@@ -486,9 +493,10 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
                 engine_client=engine_client,
                 models=openai_serving_models,
                 return_tokens_as_token_ids=True,
+                openai_serving_render=openai_serving_render,
             )
         )
-        openai_serving_chat = NeMoRLOpenAIServingChat(**serving_chat_kwargs)
+        openai_serving_chat = OpenAIServingChat(**serving_chat_kwargs)
 
         generation_config = self.cfg
 
@@ -537,22 +545,17 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
         ]
 
-        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingTokenization
-        class NeMoRLOpenAIServingTokenization(
-            NeMoRLOpenAIServingMixin, OpenAIServingTokenization
-        ):
-            pass
-
         serving_tokenization_kwargs = dict(
+            engine_client=serving_chat_kwargs["engine_client"],
+            models=serving_chat_kwargs["models"],
+            openai_serving_render=openai_serving_render,
             request_logger=serving_chat_kwargs["request_logger"],
             chat_template=serving_chat_kwargs["chat_template"],
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
-            engine_client=serving_chat_kwargs["engine_client"],
-            models=serving_chat_kwargs["models"],
         )
-        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
+        openai_serving_tokenization = OpenAIServingTokenization(
             **serving_tokenization_kwargs
         )
 

@@ -686,22 +686,11 @@ def setup_model_and_optimizer(
     if is_tied_lm_head:
         model.tie_weights()
 
-    # Freeze visual/audio encoders when not doing VLM training.
-    # Without this, the optimizer creates state entries for visual/audio params that
-    # never receive gradients, causing a key mismatch when resuming from checkpoint.
-    # Note: encoders may be nested under model.model (e.g. model.model.visual for
-    # Qwen3_5MoeForConditionalGeneration), not directly on model.
-    if not is_vlm:
-        for attr in ("visual", "vision_tower", "audio_tower", "embed_vision", "embed_audio"):
-            # Handle both direct attributes and nested under model.model (FSDP wrapping)
-            module = getattr(model, attr, None)
-            if module is None:
-                module = getattr(getattr(model, "model", None), attr, None)
-            if module is not None:
-                for param in module.parameters():
-                    param.requires_grad_(False)
-                if rank == 0:
-                    print(f"Froze {attr} parameters for text-only training")
+    # Modality-tower freezing is now declarative in recipe YAML via the
+    # `policy.dtensor_cfg.freeze_config` block (handled by Automodel's
+    # apply_parameter_freezing). Frozen towers don't get optimizer state, so
+    # this also avoids the ckpt-resume key mismatch that the old hardcoded
+    # block was working around. Add freeze_config to text-only VLM recipes.
 
     # CPU offload if needed
     if cpu_offload:
@@ -714,7 +703,16 @@ def setup_model_and_optimizer(
     optimizer = None
     if init_optimizer:
         optimizer_cls = get_class(config["optimizer"]["name"])
-        optimizer = optimizer_cls(model.parameters(), **config["optimizer"]["kwargs"])
+        optimizer_kwargs = dict(config["optimizer"]["kwargs"])
+        # Drop kwargs set to None so defaults inherited from base configs
+        # (e.g. torch AdamW's foreach/fused) don't leak into optimizers that
+        # don't accept them (e.g. TE FusedAdam).
+        optimizer_kwargs = {k: v for k, v in optimizer_kwargs.items() if v is not None}
+        # Resolve string-valued torch dtypes (e.g. "torch.bfloat16" -> torch.bfloat16)
+        for key, value in optimizer_kwargs.items():
+            if isinstance(value, str) and value.startswith("torch."):
+                optimizer_kwargs[key] = getattr(torch, value.removeprefix("torch."))
+        optimizer = optimizer_cls(model.parameters(), **optimizer_kwargs)
 
     # Initialize scheduler
     scheduler = None

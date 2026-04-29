@@ -477,7 +477,6 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             enable_auto_tools=http_server_kwargs.get("enable_auto_tools", False),
             exclude_tools_when_tool_choice_none=http_server_kwargs.get("exclude_tools_when_tool_choice_none", False),
             tool_parser=http_server_kwargs.get("tool_parser", None),
-            reasoning_parser=http_server_kwargs.get("reasoning_parser", None),
             default_chat_template_kwargs=http_server_kwargs.get("default_chat_template_kwargs", None),
             log_error_stack=http_server_kwargs.get("log_error_stack", False),
         )

@@ -521,6 +521,7 @@ class BaseVllmGenerationWorker:
             for arch in (
                 "Gemma3ForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
+                "Mistral3ForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
             )
@@ -532,6 +533,7 @@ class BaseVllmGenerationWorker:
                 in (
                     "Gemma3ForConditionalGeneration",
                     "Gemma4ForConditionalGeneration",
+                    "Mistral3ForConditionalGeneration",
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
                 )
@@ -543,6 +545,38 @@ class BaseVllmGenerationWorker:
                     "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
+
+        # Mistral 3.5 (Mistral3ForConditionalGeneration) integration.
+        if "Mistral3ForConditionalGeneration" in getattr(hf_config, "architectures", []):
+            # Mistral 3.5 ships per-tensor FP8 (weight_block_size=null) with
+            # on-disk safetensors keys named *.activation_scale, which vLLM's
+            # FP8 loader has no remap for. NeMo-RL refits bf16 weights via ZMQ
+            # under load_format='dummy', so vLLM never reads FP8 weights from
+            # disk — but it still auto-detects quantization_config and tries
+            # to build Fp8Config. Clear it so vLLM allocates bf16 buffers.
+            if hasattr(hf_config, "quantization_config"):
+                assert load_format == "dummy", (
+                    "Loading FP8-quantized Mistral3 in vLLM is only supported "
+                    "with load_format='dummy' (NeMo-RL refits bf16 weights via "
+                    "ZMQ). Got load_format=%r." % load_format
+                )
+                vllm_kwargs["quantization"] = None
+                vllm_kwargs["hf_overrides"]["quantization_config"] = {}
+
+            # Force HF config parser. Mistral 3.5 ships both HF format
+            # (config.json + model*.safetensors) and Mistral native format
+            # (params.json + consolidated*.safetensors). vLLM auto-detect
+            # picks Mistral native and rewrites architectures to
+            # ["PixtralForConditionalGeneration"], routing weight loading
+            # through pixtral.py — whose key-prefix filter is incompatible
+            # with NeMo-RL's HF-format ZMQ refit keys.
+            vllm_kwargs["config_format"] = "hf"
+
+            # Declare zero images per prompt for text-only GRPO data. Without
+            # this, vLLM's MultiModalBudget preflight probes the model with
+            # text='[IMG]' but no image, triggering PixtralProcessor's
+            # _check_special_mm_tokens to raise on the token-count mismatch.
+            vllm_kwargs["limit_mm_per_prompt"] = {"image": 0}
 
         llm_kwargs = dict(
             model=self.model_name,

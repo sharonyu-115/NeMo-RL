@@ -259,9 +259,11 @@ def is_fp8_model(vllm_config):
     if hasattr(vllm_config, "quant_config") and isinstance(
         vllm_config.quant_config, Fp8Config
     ):
-        assert vllm_config.quant_config.weight_block_size is not None, (
-            "Only block scaling is currently supported in NeMo-RL!"
-        )
+        if vllm_config.quant_config.weight_block_size is None:
+            # Per-tensor FP8: the policy side dequantizes to bf16 before ZMQ
+            # refit, so vLLM receives bf16 weights and must use the standard
+            # load_weights path, not the block-FP8 weight-loader.
+            return False
         return True
 
     return False

@@ -75,6 +75,26 @@ from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
 
 
+def _is_unsynced_multimodal_module(name: str, model_config: Any) -> bool:
+    """Whether a state-dict key belongs to a multimodal sub-module that is
+    intentionally not refit to the generation backend (text-only training).
+
+    Mistral 3.5 (Mistral3ForConditionalGeneration) in vLLM routes weight loading
+    through PixtralForConditionalGeneration.load_weights, whose
+    llm_weights_generator filter does not strip every vision_tower /
+    multi_modal_projector key before delegating — buffers and certain conv
+    weights leak through and crash with KeyError. Skipping those keys at refit
+    is correct for text-only training: vLLM keeps the random buffers from
+    load_format="dummy" and they are unused.
+    """
+    arch = (getattr(model_config, "architectures", None) or [None])[0]
+    if arch != "Mistral3ForConditionalGeneration":
+        return False
+    return name.startswith("model.vision_tower.") or name.startswith(
+        "model.multi_modal_projector."
+    )
+
+
 def dtensor_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -88,9 +108,22 @@ def dtensor_params_generator(
     Yields:
         Tuples of (fully_qualified_name, tensor) where tensors are converted to target dtype and made contiguous.
     """
+    # Build the set of parameter names that are frozen (requires_grad=False).
+    # Frozen parameters (e.g. vision_tower, audio_tower) are never updated during
+    # training, so they do not need to be synced to the generation backend.
+    # vLLM's multimodal load_weights routes keys by prefix; sending frozen tower
+    # keys to the language-model sub-router causes a KeyError.
+    frozen_param_names: set[str] = {
+        n for n, p in model.named_parameters() if not p.requires_grad
+    }
+    model_config = getattr(model, "config", None)
     module_map = dict(model.named_modules())
     for name, tensor in model.state_dict().items():
         if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+            continue
+        if name in frozen_param_names:
+            continue
+        if _is_unsynced_multimodal_module(name, model_config):
             continue
         full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
@@ -848,9 +881,21 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        # Frozen parameters are excluded from refit: they are never updated during
+        # training so vLLM's copy already matches the policy. Sending them also
+        # triggers a KeyError in vLLM multimodal models (e.g. Pixtral/Mistral3)
+        # whose language_model.load_weights router does not expect tower keys.
+        frozen_param_names: set[str] = {
+            n for n, p in self.model.named_parameters() if not p.requires_grad
+        }
+        model_config = getattr(self.model, "config", None)
         state_dict_info = {}
         for name, tensor in self.model.state_dict().items():
             if name.endswith(".lora_A.weight") or name.endswith(".lora_B.weight"):
+                continue
+            if name in frozen_param_names:
+                continue
+            if _is_unsynced_multimodal_module(name, model_config):
                 continue
             full_tensor = (
                 tensor.full_tensor() if isinstance(tensor, DTensor) else tensor

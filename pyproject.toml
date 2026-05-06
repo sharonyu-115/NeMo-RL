@@ -19,7 +19,7 @@ dependencies = [
   "setuptools",
   "pip",                                                                                                              # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",                                                                                                            # for flash-attn parallel build
-  "torch==2.10.0",
+  "torch==2.11.0",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]==2.54.0",
@@ -42,7 +42,7 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.1.1",
-  "torchvision==0.25.0",
+  "torchvision==0.26.0",
   "transformers==5.5.0",
   "num2words>=0.5.14",                                                                                                # for SmolVLM
   "mlflow>=3.11.1",
@@ -80,10 +80,10 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@bfded34800dfec415b71503f8205181de90b2480",
-  "vllm==0.19.0",
+  "vllm==0.20.1rc1.dev159+ge6ff3e9c8.cu129",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.4",
-  "flashinfer-cubin==0.6.4",
+  "flashinfer-python==0.6.8.post1",
+  "flashinfer-cubin==0.6.8.post1",
   "nvidia-cutlass-dsl>=4.4.0.dev1",
 ]
 sglang = [
@@ -121,7 +121,7 @@ nemo_gym = ["nemo_gym"]
 # This is a default group so that we install these even with bare `uv sync`
 build = [
   # Build requirement for TE
-  "torch==2.10.0",
+  "torch==2.11.0",
   # Build requirement for TE
   "setuptools",
   "packaging",
@@ -184,6 +184,9 @@ triton = [
   { index = "pytorch-cu129", marker = "sys_platform != 'darwin'" },
   { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
+# vLLM 0.20.0+ PyPI wheel ships CUDA 13. Use vLLM's wheels.vllm.ai/cu129 build
+# to stay on CUDA 12.9 (matches torch+cu129 and the container CUDA toolkit).
+vllm = { index = "vllm-cu129" }
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "67e0a9dfe1518fc0036444e9ab5fe06ab78299e0" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "d68d16ed7d5d5164eb5a57c0285f3b7eb8394ec1" }
 nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
@@ -213,6 +216,11 @@ explicit = true
 [[tool.uv.index]]
 name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "vllm-cu129"
+url = "https://wheels.vllm.ai/e6ff3e9c83a6520c3793f4e0511ac8591a07c243/cu129/"
 explicit = true
 
 [tool.uv]
@@ -248,8 +256,8 @@ override-dependencies = [
   "opencv-python-headless>=4.11.0",
   "timm<=1.0.22",
   "nvidia-modelopt[torch]>=0.39.0",
-  "torch==2.10.0",
-  "torchaudio==2.10.0",
+  "torch==2.11.0",
+  "torchaudio==2.11.0",
   # sglang has conflicting llguidance versions than vllm, so enforcing vllm's version since it's newer
   "llguidance>=1.3.0,<1.4.0",
   # Override setuptools range in other dependencies to address CVE GHSA-58pv-8j8x-9vj2

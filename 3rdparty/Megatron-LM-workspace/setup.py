@@ -49,7 +49,8 @@ CACHED_DEPENDENCIES = [
     # Dev dependencies from pyproject.toml
     "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2111): upgrade to core_cu13 when we move to CUDA 13 base container
-    "transformer-engine[pytorch,core_cu12]",
+    "transformer-engine[pytorch,core_cu12]>=2.9.0a0,<2.12.0",
+    "nv-grouped-gemm~=1.1",
     # VCS dependency - must match pyproject.toml [tool.uv.sources]
     "nvidia-resiliency-ext @ git+https://github.com/NVIDIA/nvidia-resiliency-ext.git@15a851565a4ce846c04431ecb0cf09903ab4837e",
     "tqdm",
@@ -68,12 +69,13 @@ CACHED_DEPENDENCIES = [
     "onnxscript",
     "fastapi~=0.50",
     "datasets",
-    # VCS dependency - must match pyproject.toml [tool.uv.sources]
-    "emerging_optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.2.0",
+    # Upstream Megatron-LM dev HEAD lists this with a Python version marker (no inline git URL).
+    # The setup.py consistency check compares full strings, so we mirror it verbatim. uv resolves
+    # the actual git source via [tool.uv.sources] at install time.
+    "emerging_optimizers; python_version >= '3.12'",
     "hypercorn",
     "quart",
     "openai[aiohttp]",
-    "orjson",
 ]
 
 

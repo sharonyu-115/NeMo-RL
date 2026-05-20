@@ -469,12 +469,20 @@ class VllmAsyncGenerationWorkerImpl(BaseVllmGenerationWorker):
             model_registry=openai_serving_models.registry,
             request_logger=None,
             chat_template=http_server_kwargs.get("chat_template", None),
-            chat_template_content_format=http_server_kwargs.get("chat_template_content_format", "auto"),
-            trust_request_chat_template=http_server_kwargs.get("trust_request_chat_template", False),
+            chat_template_content_format=http_server_kwargs.get(
+                "chat_template_content_format", "auto"
+            ),
+            trust_request_chat_template=http_server_kwargs.get(
+                "trust_request_chat_template", False
+            ),
             enable_auto_tools=http_server_kwargs.get("enable_auto_tools", False),
-            exclude_tools_when_tool_choice_none=http_server_kwargs.get("exclude_tools_when_tool_choice_none", False),
+            exclude_tools_when_tool_choice_none=http_server_kwargs.get(
+                "exclude_tools_when_tool_choice_none", False
+            ),
             tool_parser=http_server_kwargs.get("tool_parser", None),
-            default_chat_template_kwargs=http_server_kwargs.get("default_chat_template_kwargs", None),
+            default_chat_template_kwargs=http_server_kwargs.get(
+                "default_chat_template_kwargs", None
+            ),
             log_error_stack=http_server_kwargs.get("log_error_stack", False),
         )
 

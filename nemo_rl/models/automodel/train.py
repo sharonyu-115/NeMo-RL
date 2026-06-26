@@ -283,30 +283,29 @@ def _cp_contiguous_allgather(
     return _ContiguousCPAllGather.apply(tensor, cp_group, seq_dim)
 
 
-def model_owned_cp_full_logits(
+def _model_owned_cp_shard_logits(
     model: nn.Module,
     input_ids: torch.Tensor,
     device_mesh: Any,
-    cp_group: Any,
-    original_seq_len: int,
     padding_token_id: int = 0,
     model_type: Optional[str] = None,
-    sequence_dim: int = 1,
     dtype: torch.dtype = torch.bfloat16,
     autocast_enabled: bool = True,
 ) -> torch.Tensor:
-    """Run a model-owned-CP forward (e.g. Gemma4) and return FULL-sequence logits.
+    """Run the model-owned-CP forward and return this rank's CONTIGUOUS seq-shard logits.
 
     Mirrors Automodel ``recipes/llm/train_ft.py::_forward_backward_step``: embed the
     full sequence (``prepare_model_inputs_for_cp`` -> inputs_embeds + per-layer /
     vision metadata + ``_cp_make_batch_fn``), let ``make_cp_batch_and_ctx`` install
-    the ring and keep one contiguous shard per CP rank, run the model on the local
-    shard (the flex ring moves K/V across CP ranks), then rank-order all-gather the
-    shard logits back to the full (padded) sequence and trim the CP padding. The
-    result is numerically equivalent to a non-CP forward, so the existing cp_size=1
-    post-processing can consume it unchanged.
+    the ring and keep one contiguous shard per CP rank, then run the model on the
+    local shard (the flex ring moves K/V across CP ranks). Returns the per-rank shard
+    logits ``[B, S_padded/cp, V]`` — NOT gathered, so memory stays O(S/cp * V) per
+    rank (the basis for long-context: never materialize full-seq logits anywhere).
     """
+    from contextlib import nullcontext
+
     from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+    from torch.distributed.fsdp import FSDPModule
 
     mm_token_type_ids = (
         torch.zeros_like(input_ids) if model_type == "gemma4" else None
@@ -317,31 +316,22 @@ def model_owned_cp_full_logits(
     batch: dict[str, Any] = {"input_ids": input_ids, "labels": input_ids}
     if mm_token_type_ids is not None:
         batch["mm_token_type_ids"] = mm_token_type_ids
-    # The model attaches inputs_embeds (+ _cp_make_batch_fn, per_layer_inputs, vision
-    # group ids, CP metadata). make_cp_batch_and_ctx requires exactly one of
-    # input_ids / inputs_embeds, so drop input_ids once embeds are present.
-    #
-    # prepare_model_inputs_for_cp embeds the full sequence by calling embedding
-    # submodules directly (outside the model's top-level forward), so FSDP2's
-    # all-gather forward hooks don't fire and the sharded DTensor embedding weights
-    # would mix with the plain input_ids ("got mixed torch.Tensor and DTensor").
-    # Unshard the model's FSDP2 params for the duration of the prep so the embedding
-    # runs on full (plain) weights; reshard immediately after (the sharded
-    # model(**sharded) forward re-gathers per layer via the normal FSDP2 hooks).
-    from torch.distributed.fsdp import FSDPModule
 
     # Match the non-CP path (get_train_context), which runs the forward under
-    # autocast: the policy holds fp32 master weights, so without autocast the
-    # bf16 compute tensors meet fp32 params ("mat1 and mat2 have the same dtype:
-    # float != BFloat16"). Wrap the embedding/prep + model forward in autocast.
-    from contextlib import nullcontext
-
+    # autocast: the policy holds fp32 master weights, so without autocast the bf16
+    # compute tensors meet fp32 params ("mat1 and mat2 ... float != BFloat16").
     autocast_ctx = (
         torch.autocast(device_type="cuda", dtype=dtype)
         if autocast_enabled
         else nullcontext()
     )
 
+    # prepare_model_inputs_for_cp embeds the full sequence by calling embedding
+    # submodules directly (outside the model's top-level forward), so FSDP2's
+    # all-gather forward hooks don't fire and the sharded DTensor embedding weights
+    # would mix with the plain input_ids ("got mixed torch.Tensor and DTensor").
+    # Unshard the model's FSDP2 params for the prep; reshard immediately after (the
+    # sharded model(**sharded) forward re-gathers per layer via normal FSDP2 hooks).
     _unsharded_fsdp_modules = []
     for _m in model.modules():
         if isinstance(_m, FSDPModule):
@@ -357,6 +347,7 @@ def model_owned_cp_full_logits(
     finally:
         for _m in reversed(_unsharded_fsdp_modules):
             _m.reshard()
+    # make_cp_batch_and_ctx requires exactly one of input_ids / inputs_embeds.
     if "inputs_embeds" in batch:
         batch.pop("input_ids", None)
 
@@ -367,15 +358,11 @@ def model_owned_cp_full_logits(
     sharded["use_cache"] = False
 
     # transformers 5.8.1's gemma4 KV-sharing threads a ``shared_kv_states`` dict
-    # kwarg through the decoder layers (the trailing num_kv_shared_layers reuse
-    # earlier layers' K/V). Under FSDP2 ``cast_forward_inputs`` copies a *plain
-    # dict* per wrapped layer, so the shared layers read an empty copy ->
+    # kwarg through the decoder layers; under FSDP2 ``cast_forward_inputs`` copies a
+    # plain dict per wrapped layer -> shared layers read an empty copy ->
     # ``KeyError: 'sliding_attention'``. HF only builds that dict when one is not
-    # passed in (``kwargs.pop("shared_kv_states", {})``), so inject Automodel's
-    # FSDP-safe (non-dict MutableMapping, passed through unchanged by FSDP) store
-    # — every layer then shares the same instance. Dense E2B/E4B need this; it is
-    # a harmless no-op for non-kv-sharing gemma4 (e.g. 31B). See the
-    # _FSDPSafeSharedKVStates docstring in Automodel's gemma4_moe/model.py.
+    # passed in, so inject Automodel's FSDP-safe (non-dict) store. No-op for
+    # non-kv-sharing gemma4 (e.g. 31B). See _FSDPSafeSharedKVStates in Automodel.
     if model_type == "gemma4":
         try:
             from nemo_automodel.components.models.gemma4_moe.model import (
@@ -388,11 +375,193 @@ def model_owned_cp_full_logits(
 
     with train_ctx(), autocast_ctx:
         outputs = model(**sharded)
-    logits = extract_logits(model, outputs)
+    return extract_logits(model, outputs)
 
+
+def model_owned_cp_full_logits(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    device_mesh: Any,
+    cp_group: Any,
+    original_seq_len: int,
+    padding_token_id: int = 0,
+    model_type: Optional[str] = None,
+    sequence_dim: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+    autocast_enabled: bool = True,
+) -> torch.Tensor:
+    """Model-owned-CP forward returning FULL-sequence logits (rank-order all-gather).
+
+    Convenience wrapper around :func:`_model_owned_cp_shard_logits` that gathers the
+    per-rank shards back to the full sequence. NOTE: this materializes ``[B, S, V]``
+    on every rank, so it is only viable at short sequence — long-context callers use
+    :func:`model_owned_cp_token_logprobs` (and the per-shard loss path) instead.
+    """
+    logits = _model_owned_cp_shard_logits(
+        model,
+        input_ids,
+        device_mesh,
+        padding_token_id=padding_token_id,
+        model_type=model_type,
+        dtype=dtype,
+        autocast_enabled=autocast_enabled,
+    )
     full_logits = _cp_contiguous_allgather(logits, cp_group, seq_dim=sequence_dim)
     # CP padded the sequence to a multiple of 2*cp_size; trim back to the real length.
     return full_logits.narrow(sequence_dim, 0, original_seq_len)
+
+
+def model_owned_cp_token_logprobs(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    input_lengths: torch.Tensor,
+    device_mesh: Any,
+    cp_group: Any,
+    original_seq_len: int,
+    padding_token_id: int = 0,
+    model_type: Optional[str] = None,
+    logprob_chunk_size: Optional[int] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    autocast_enabled: bool = True,
+) -> torch.Tensor:
+    """Per-shard token logprobs for model-owned CP — never materializes full-seq logits.
+
+    Each CP rank computes ``log_softmax`` over only its ``[B, S/cp, V]`` shard and
+    gathers the next-token target's logprob (the full, unsharded ``input_ids`` give
+    boundary-safe targets, including the last position of each shard). Only the cheap
+    ``[B, S]`` token logprobs are all-gathered — so peak memory is O(S/cp * V), which
+    is what makes long context (32k/64k) fit. Output matches LogprobsPostProcessor:
+    ``[B, original_seq_len]`` with a 0 at position 0 and padding positions masked.
+    """
+    pred_lp = _model_owned_cp_pred_logprobs(
+        model,
+        input_ids,
+        device_mesh,
+        cp_group,
+        original_seq_len,
+        padding_token_id=padding_token_id,
+        model_type=model_type,
+        logprob_chunk_size=logprob_chunk_size,
+        sampling_params=sampling_params,
+        dtype=dtype,
+        autocast_enabled=autocast_enabled,
+    )
+    # Shift into the [B, S] convention (prepend 0 for position 0) and mask padding.
+    token_logprobs = torch.cat(
+        [torch.zeros_like(pred_lp[:, :1]), pred_lp], dim=1
+    )  # [B, S]
+    mask = torch.zeros_like(token_logprobs, dtype=torch.bool)
+    for i, length in enumerate(input_lengths):
+        mask[i, : int(length)] = True
+    token_logprobs = token_logprobs * mask
+
+    if need_top_k_or_top_p_filtering(sampling_params):
+        token_logprobs = torch.where(
+            torch.isneginf(token_logprobs),
+            torch.zeros_like(token_logprobs),
+            token_logprobs,
+        )
+    return token_logprobs
+
+
+def _model_owned_cp_pred_logprobs(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    device_mesh: Any,
+    cp_group: Any,
+    original_seq_len: int,
+    padding_token_id: int = 0,
+    model_type: Optional[str] = None,
+    logprob_chunk_size: Optional[int] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    autocast_enabled: bool = True,
+) -> torch.Tensor:
+    """Per-shard next-token logprobs for model-owned CP, gathered to ``[B, S-1]``.
+
+    Shared core of the logprob (get_logprobs, no-grad) and curr-logprob (train, grad)
+    paths. Each CP rank computes ``log_softmax`` over only its ``[B, S/cp, V]`` shard
+    and gathers the target-token logprob; the differentiable contiguous all-gather
+    routes gradients back to each shard for the train path. Returns the logprob of
+    ``input_ids[1..S-1]`` (i.e. matches ``get_next_token_logprobs_from_logits``).
+    """
+    shard_logits = _model_owned_cp_shard_logits(
+        model,
+        input_ids,
+        device_mesh,
+        padding_token_id=padding_token_id,
+        model_type=model_type,
+        dtype=dtype,
+        autocast_enabled=autocast_enabled,
+    )
+    # Match forward_with_post_processing_fn, which temperature-scales logits before
+    # computing logprobs (no-op at temperature=1.0).
+    shard_logits = apply_temperature_scaling(shard_logits, sampling_params)
+
+    cp_size = torch.distributed.get_world_size(cp_group)
+    cp_rank = torch.distributed.get_rank(cp_group)
+    local_seq_len = int(shard_logits.shape[1])
+    padded_seq_len = local_seq_len * cp_size
+    seq_start = cp_rank * local_seq_len
+
+    # Next-token targets for this rank's contiguous positions, taken from the FULL
+    # input_ids (so the shard boundary — whose target lives in the next rank's shard
+    # — is handled). Pad to padded_seq_len + 1 so the last position has a target.
+    full_ids = torch.nn.functional.pad(
+        input_ids, (0, padded_seq_len + 1 - input_ids.shape[1]), value=padding_token_id
+    )
+    targets = full_ids[:, seq_start + 1 : seq_start + 1 + local_seq_len]  # [B, L]
+
+    # log_softmax on the shard only (chunk over the local seq dim if requested).
+    chunk = logprob_chunk_size or local_seq_len
+    parts = []
+    for s in range(0, local_seq_len, chunk):
+        e = min(local_seq_len, s + chunk)
+        cl = shard_logits[:, s:e, :].to(torch.float32)
+        cl = apply_top_k_top_p_filtering_for_local_logits(cl, sampling_params)
+        lp = torch.nn.functional.log_softmax(cl, dim=-1)
+        parts.append(lp.gather(-1, targets[:, s:e].unsqueeze(-1).long()).squeeze(-1))
+    shard_token_lp = torch.cat(parts, dim=1)  # [B, L] = logprob of input_ids[pos+1]
+
+    # Gather contiguous shards -> [B, padded_seq_len]; position p holds the logprob of
+    # input_ids[p+1]. Trim to the real predictions (positions 0..S-2).
+    gathered = _cp_contiguous_allgather(shard_token_lp, cp_group, seq_dim=1)
+    return gathered[:, : original_seq_len - 1]  # logprob of input_ids[1..S-1]
+
+
+def model_owned_cp_curr_logprobs(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    device_mesh: Any,
+    cp_group: Any,
+    original_seq_len: int,
+    padding_token_id: int = 0,
+    model_type: Optional[str] = None,
+    logprob_chunk_size: Optional[int] = None,
+    sampling_params: Optional[TrainingSamplingParams] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    autocast_enabled: bool = True,
+) -> torch.Tensor:
+    """Differentiable per-shard current-policy logprobs for the model-owned CP train
+    path: ``[B, S-1]`` next-token logprobs (grad flows to each CP rank's shard via the
+    differentiable gather). Fed to ClippedPGLoss as precomputed logprobs
+    (``use_linear_ce_fusion`` / ``LossInputType.LOGPROB``) so the loss never
+    materializes full-sequence logits — the basis for long-context training.
+    """
+    return _model_owned_cp_pred_logprobs(
+        model,
+        input_ids,
+        device_mesh,
+        cp_group,
+        original_seq_len,
+        padding_token_id=padding_token_id,
+        model_type=model_type,
+        logprob_chunk_size=logprob_chunk_size,
+        sampling_params=sampling_params,
+        dtype=dtype,
+        autocast_enabled=autocast_enabled,
+    )
 
 
 def prepare_data_for_cp(
@@ -453,7 +622,7 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
-    cp_full_logits_fn: Optional[Callable[[ProcessedInputs], torch.Tensor]] = None,
+    cp_curr_logprobs_fn: Optional[Callable[[ProcessedInputs], torch.Tensor]] = None,
 ) -> Tuple[Any, dict[str, Any], ProcessedMicrobatch]:
     """Perform forward pass with pre-processed microbatch and apply post-processing.
 
@@ -485,12 +654,16 @@ def forward_with_post_processing_fn(
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs
 
-    # Model forward pass. For model-owned CP (e.g. Gemma4), cp_full_logits_fn runs
-    # the model's own CP forward (contiguous shard + ring) and returns FULL-sequence
-    # logits (gathered, differentiable), so downstream post-processing runs exactly
-    # as the cp_size=1 path. Otherwise use the standard model_forward.
-    if cp_full_logits_fn is not None:
-        logits = cp_full_logits_fn(processed_inputs)
+    # Model forward pass. For model-owned CP (e.g. Gemma4) at long context,
+    # cp_curr_logprobs_fn runs the model's own CP forward (contiguous shard + ring)
+    # and returns PRECOMPUTED next-token logprobs [B, S-1] (per-shard log_softmax,
+    # differentiable gather) — never materializing full-sequence logits. These feed
+    # ClippedPGLoss's LossInputType.LOGPROB / use_linear_ce_fusion path as if they
+    # were the "logits" arg. Temperature scaling is already applied inside the fn, so
+    # it is skipped below. Otherwise use the standard model_forward + temp scaling.
+    cp_logprobs_mode = cp_curr_logprobs_fn is not None
+    if cp_logprobs_mode:
+        logits = cp_curr_logprobs_fn(processed_inputs)
     else:
         outputs = model_forward(
             model,
@@ -504,8 +677,9 @@ def forward_with_post_processing_fn(
         del outputs
 
     # Apply temperature scaling only for sampling-oriented post-processors
-    # Score computations should use unscaled logits
-    if isinstance(
+    # Score computations should use unscaled logits. Skip when the CP logprobs path
+    # already produced temperature-scaled logprobs.
+    if not cp_logprobs_mode and isinstance(
         post_processing_fn,
         (
             LossPostProcessor,
@@ -585,7 +759,7 @@ def automodel_forward_backward(
     train_context_fn: Optional[Callable[[ProcessedInputs], Any]] = None,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
-    cp_full_logits_fn: Optional[Callable[[ProcessedInputs], torch.Tensor]] = None,
+    cp_curr_logprobs_fn: Optional[Callable[[ProcessedInputs], torch.Tensor]] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -650,7 +824,7 @@ def automodel_forward_backward(
                 global_valid_toks=global_valid_toks,
                 sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
-                cp_full_logits_fn=cp_full_logits_fn,
+                cp_curr_logprobs_fn=cp_curr_logprobs_fn,
             )
 
             # Check if this is a dummy batch

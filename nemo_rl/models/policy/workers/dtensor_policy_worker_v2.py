@@ -58,11 +58,11 @@ from nemo_rl.models.automodel.train import (
     ScorePostProcessor,
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
-    apply_temperature_scaling,
     automodel_forward_backward,
     forward_with_post_processing_fn,
     model_has_model_owned_cp,
-    model_owned_cp_full_logits,
+    model_owned_cp_curr_logprobs,
+    model_owned_cp_token_logprobs,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -383,21 +383,23 @@ class DTensorPolicyWorkerV2Impl(
         sequence_dim, _ = check_sequence_dim(data, skip_keys=check_dim_skip_keys)
 
         # Model-owned CP (e.g. Gemma4): the model runs its own CP forward (contiguous
-        # shard + flex ring) and we gather to full-sequence logits, so the loss and the
-        # microbatch iterator run as cp_size=1 and the CP forward is supplied via
-        # cp_full_logits_fn. The torch-CP path (cp_buffers + create_context_parallel_ctx)
-        # cannot serve these models (head_dim 512 + GQA). Loss-scaling still uses the
-        # real cp_size so FSDP's gradient averaging over the dp_shard_cp mesh is
-        # cancelled (loss = result * dp_size * cp_size); the differentiable gather routes
-        # each CP rank its own shard's gradient.
+        # shard + flex ring). For long context we never gather full-sequence logits —
+        # each CP rank computes per-shard next-token logprobs and only the [B, S-1]
+        # logprobs are (differentiably) gathered, then fed to ClippedPGLoss as
+        # precomputed logprobs (LossInputType.LOGPROB / use_linear_ce_fusion). The
+        # loss + iterator run as cp_size=1; loss-scaling still uses the real cp_size so
+        # FSDP's gradient averaging over the dp_shard_cp mesh is cancelled
+        # (loss = result * dp_size * cp_size), and the differentiable gather routes
+        # each CP rank its own shard's gradient. The torch-CP path (cp_buffers +
+        # create_context_parallel_ctx) cannot serve these models (head_dim 512 + GQA).
         use_model_owned_cp = self.cp_size > 1 and model_has_model_owned_cp(self.model)
         effective_cp_size = 1 if use_model_owned_cp else self.cp_size
 
-        cp_full_logits_fn = None
+        cp_curr_logprobs_fn = None
         if use_model_owned_cp:
 
-            def cp_full_logits_fn(processed_inputs):
-                return model_owned_cp_full_logits(
+            def cp_curr_logprobs_fn(processed_inputs):
+                return model_owned_cp_curr_logprobs(
                     self.model,
                     processed_inputs.input_ids,
                     self.device_mesh,
@@ -405,7 +407,8 @@ class DTensorPolicyWorkerV2Impl(
                     processed_inputs.input_ids.shape[sequence_dim],
                     padding_token_id=(self.tokenizer.pad_token_id or 0),
                     model_type=getattr(self.model.config, "model_type", None),
-                    sequence_dim=sequence_dim,
+                    logprob_chunk_size=self.cfg.get("logprob_chunk_size"),
+                    sampling_params=self.sampling_params,
                     dtype=self.dtype,
                     autocast_enabled=self.autocast_enabled,
                 )
@@ -430,6 +433,11 @@ class DTensorPolicyWorkerV2Impl(
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
         )
+        if use_model_owned_cp:
+            # Feed the model-owned per-shard curr-logprobs to ClippedPGLoss as
+            # precomputed next-token logprobs (its LossInputType.LOGPROB path keys on
+            # use_linear_ce_fusion to skip the logits->logprobs step).
+            loss_fn.use_linear_ce_fusion = True
 
         # Create train context factory
         def train_context_fn(processed_inputs):
@@ -504,7 +512,7 @@ class DTensorPolicyWorkerV2Impl(
                     train_context_fn=(
                         None if use_model_owned_cp else train_context_fn
                     ),
-                    cp_full_logits_fn=cp_full_logits_fn,
+                    cp_curr_logprobs_fn=cp_curr_logprobs_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                 )
@@ -634,30 +642,22 @@ class DTensorPolicyWorkerV2Impl(
                 processed_inputs = processed_mb.processed_inputs
 
                 if use_model_owned_cp:
-                    # Full-seq embed -> contiguous CP shard + ring -> gather shard
-                    # logits to full seq -> cp_size=1 logprob math (parity with cp=1).
-                    full_logits = model_owned_cp_full_logits(
+                    # Per-shard logprobs (no full-seq logit gather): each CP rank
+                    # computes log_softmax on its own seq shard, only the [B,S] token
+                    # logprobs are gathered. O(S/cp * V) peak -> long context fits.
+                    token_logprobs = model_owned_cp_token_logprobs(
                         self.model,
                         processed_inputs.input_ids,
+                        processed_mb.data_dict["input_lengths"],
                         self.device_mesh,
                         self.cp_mesh.get_group(),
                         processed_mb.original_seq_len,
                         padding_token_id=(self.tokenizer.pad_token_id or 0),
                         model_type=getattr(self.model.config, "model_type", None),
-                        sequence_dim=sequence_dim,
+                        logprob_chunk_size=self.cfg.get("logprob_chunk_size"),
+                        sampling_params=self.sampling_params,
                         dtype=self.dtype,
                         autocast_enabled=self.autocast_enabled,
-                    )
-                    full_logits = apply_temperature_scaling(
-                        full_logits, self.sampling_params
-                    )
-                    token_logprobs = logprobs_post_processor(
-                        logits=full_logits,
-                        data_dict=processed_mb.data_dict,
-                        processed_inputs=processed_inputs,
-                        original_batch_size=processed_mb.original_batch_size,
-                        original_seq_len=processed_mb.original_seq_len,
-                        sequence_dim=sequence_dim,
                     )
                 else:
                     with get_train_context(

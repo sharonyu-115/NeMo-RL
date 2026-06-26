@@ -58,8 +58,11 @@ from nemo_rl.models.automodel.train import (
     ScorePostProcessor,
     TopkLogitsPostProcessor,
     aggregate_training_statistics,
+    apply_temperature_scaling,
     automodel_forward_backward,
     forward_with_post_processing_fn,
+    model_has_model_owned_cp,
+    model_owned_cp_full_logits,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -379,6 +382,34 @@ class DTensorPolicyWorkerV2Impl(
         # Validate sequence dimension
         sequence_dim, _ = check_sequence_dim(data, skip_keys=check_dim_skip_keys)
 
+        # Model-owned CP (e.g. Gemma4): the model runs its own CP forward (contiguous
+        # shard + flex ring) and we gather to full-sequence logits, so the loss and the
+        # microbatch iterator run as cp_size=1 and the CP forward is supplied via
+        # cp_full_logits_fn. The torch-CP path (cp_buffers + create_context_parallel_ctx)
+        # cannot serve these models (head_dim 512 + GQA). Loss-scaling still uses the
+        # real cp_size so FSDP's gradient averaging over the dp_shard_cp mesh is
+        # cancelled (loss = result * dp_size * cp_size); the differentiable gather routes
+        # each CP rank its own shard's gradient.
+        use_model_owned_cp = self.cp_size > 1 and model_has_model_owned_cp(self.model)
+        effective_cp_size = 1 if use_model_owned_cp else self.cp_size
+
+        cp_full_logits_fn = None
+        if use_model_owned_cp:
+
+            def cp_full_logits_fn(processed_inputs):
+                return model_owned_cp_full_logits(
+                    self.model,
+                    processed_inputs.input_ids,
+                    self.device_mesh,
+                    self.cp_mesh.get_group(),
+                    processed_inputs.input_ids.shape[sequence_dim],
+                    padding_token_id=(self.tokenizer.pad_token_id or 0),
+                    model_type=getattr(self.model.config, "model_type", None),
+                    sequence_dim=sequence_dim,
+                    dtype=self.dtype,
+                    autocast_enabled=self.autocast_enabled,
+                )
+
         if eval_mode:
             ctx: AbstractContextManager[Any] = torch.no_grad()
             self.model.eval()
@@ -394,7 +425,7 @@ class DTensorPolicyWorkerV2Impl(
             device_mesh=self.device_mesh,
             cp_mesh=self.cp_mesh,
             tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
+            cp_size=effective_cp_size,
             dp_size=self.dp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
@@ -452,7 +483,7 @@ class DTensorPolicyWorkerV2Impl(
                     mbs,
                     self.dp_mesh,
                     tokenizer=self.tokenizer,
-                    cp_size=self.cp_size,
+                    cp_size=effective_cp_size,
                 )
 
                 # Use automodel_forward_backward for the training loop
@@ -470,7 +501,10 @@ class DTensorPolicyWorkerV2Impl(
                     dp_size=self.dp_size,
                     cp_size=self.cp_size,
                     num_global_batches=num_global_batches,
-                    train_context_fn=train_context_fn,
+                    train_context_fn=(
+                        None if use_model_owned_cp else train_context_fn
+                    ),
+                    cp_full_logits_fn=cp_full_logits_fn,
                     num_valid_microbatches=iterator_len,
                     on_microbatch_start=on_microbatch_start,
                 )
@@ -564,13 +598,22 @@ class DTensorPolicyWorkerV2Impl(
         all_log_probs = []
         self.model.eval()
 
+        # Models with model-owned CP (e.g. Gemma4: head_dim=512 + GQA cannot use
+        # torch's generic CP SDPA) run a separate path: the model embeds the full
+        # sequence, contiguously shards it across CP ranks and runs its own ring
+        # attention; we gather the shard logits back to the full sequence and then
+        # reuse the standard cp_size=1 logprob math. So drive the iterator and the
+        # post-processor as cp_size=1 here and do the CP forward ourselves.
+        use_model_owned_cp = self.cp_size > 1 and model_has_model_owned_cp(self.model)
+        effective_cp_size = 1 if use_model_owned_cp else self.cp_size
+
         # Create logprobs post-processor
         logprobs_post_processor = LogprobsPostProcessor(
             cfg=self.cfg,
             device_mesh=self.device_mesh,
             cp_mesh=self.cp_mesh,
             tp_mesh=self.tp_mesh,
-            cp_size=self.cp_size,
+            cp_size=effective_cp_size,
             enable_seq_packing=self.enable_seq_packing,
             sampling_params=self.sampling_params,
         )
@@ -584,30 +627,57 @@ class DTensorPolicyWorkerV2Impl(
                 logprob_batch_size,
                 self.dp_mesh,
                 tokenizer=self.tokenizer,
-                cp_size=self.cp_size,
+                cp_size=effective_cp_size,
             )
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
 
-                with get_train_context(
-                    cp_size=self.cp_size,
-                    cp_mesh=self.cp_mesh,
-                    cp_buffers=processed_inputs.cp_buffers,
-                    sequence_dim=sequence_dim,
-                    dtype=self.dtype,
-                    autocast_enabled=self.autocast_enabled,
-                ):
-                    # Use forward_with_post_processing_fn for forward pass and post-processing
-                    token_logprobs, _metrics, _ = forward_with_post_processing_fn(
-                        model=self.model,
-                        post_processing_fn=logprobs_post_processor,
-                        processed_mb=processed_mb,
-                        is_reward_model=False,
-                        allow_flash_attn_args=self.allow_flash_attn_args,
-                        sampling_params=self.sampling_params,
+                if use_model_owned_cp:
+                    # Full-seq embed -> contiguous CP shard + ring -> gather shard
+                    # logits to full seq -> cp_size=1 logprob math (parity with cp=1).
+                    full_logits = model_owned_cp_full_logits(
+                        self.model,
+                        processed_inputs.input_ids,
+                        self.device_mesh,
+                        self.cp_mesh.get_group(),
+                        processed_mb.original_seq_len,
+                        padding_token_id=(self.tokenizer.pad_token_id or 0),
+                        model_type=getattr(self.model.config, "model_type", None),
+                        sequence_dim=sequence_dim,
+                        dtype=self.dtype,
+                        autocast_enabled=self.autocast_enabled,
+                    )
+                    full_logits = apply_temperature_scaling(
+                        full_logits, self.sampling_params
+                    )
+                    token_logprobs = logprobs_post_processor(
+                        logits=full_logits,
+                        data_dict=processed_mb.data_dict,
+                        processed_inputs=processed_inputs,
+                        original_batch_size=processed_mb.original_batch_size,
+                        original_seq_len=processed_mb.original_seq_len,
                         sequence_dim=sequence_dim,
                     )
+                else:
+                    with get_train_context(
+                        cp_size=self.cp_size,
+                        cp_mesh=self.cp_mesh,
+                        cp_buffers=processed_inputs.cp_buffers,
+                        sequence_dim=sequence_dim,
+                        dtype=self.dtype,
+                        autocast_enabled=self.autocast_enabled,
+                    ):
+                        # Use forward_with_post_processing_fn for forward pass and post-processing
+                        token_logprobs, _metrics, _ = forward_with_post_processing_fn(
+                            model=self.model,
+                            post_processing_fn=logprobs_post_processor,
+                            processed_mb=processed_mb,
+                            is_reward_model=False,
+                            allow_flash_attn_args=self.allow_flash_attn_args,
+                            sampling_params=self.sampling_params,
+                            sequence_dim=sequence_dim,
+                        )
 
                 # skip keeping the logprobs for the dummy batches
                 if batch_idx >= iterator_len:

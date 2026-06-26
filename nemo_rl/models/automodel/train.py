@@ -226,6 +226,175 @@ def redistribute_logits_for_cp(
     return logits
 
 
+def model_has_model_owned_cp(model: nn.Module) -> bool:
+    """Whether the model implements Automodel's model-owned CP protocol.
+
+    Models like Gemma4 (head_dim=512 + GQA) cannot use torch's generic
+    context-parallel SDPA and instead ship their own CP (flex-ring attention +
+    contiguous batch sharding) exposed via ``prepare_model_inputs_for_cp`` /
+    ``setup_cp_attention``, driven by ``cp_utils.make_cp_batch_and_ctx``. NeMo-RL's
+    default DTensor CP path (torch ``create_context_parallel_ctx`` + load-balanced
+    DTensor sharding) does not work for them, so we route these models through the
+    model-owned path instead. See docs/model-quirks.md.
+    """
+    return hasattr(model, "prepare_model_inputs_for_cp")
+
+
+class _ContiguousCPAllGather(torch.autograd.Function):
+    """Differentiable rank-ordered all-gather of contiguous CP sequence shards.
+
+    Gemma4's model-owned CP keeps a simple contiguous slice per CP rank
+    (``make_contiguous_shard_cp_batch_and_ctx``: ``x[:, r*L : (r+1)*L]``), so
+    forward reassembly to the full sequence is a plain rank-ordered all-gather +
+    cat (deliberately NOT ``allgather_cp_sharded_tensor``, which undoes the *zigzag*
+    load-balanced layout of torch's generic CP). The backward routes each CP rank
+    its own contiguous slice of the full-sequence gradient — so when every rank
+    computes the (identical) full-sequence loss on the gathered logits, each rank's
+    model still receives gradients only for the positions it produced, and FSDP's
+    reduce over the dp_shard_cp mesh sums the per-shard contributions into the
+    correct full gradient (standard CP training, no cp x over-count).
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, cp_group, seq_dim):  # type: ignore[override]
+        ctx.cp_group = cp_group
+        ctx.seq_dim = seq_dim
+        ctx.cp_size = torch.distributed.get_world_size(cp_group)
+        ctx.cp_rank = torch.distributed.get_rank(cp_group)
+        chunks = [torch.empty_like(tensor) for _ in range(ctx.cp_size)]
+        torch.distributed.all_gather(chunks, tensor.contiguous(), group=cp_group)
+        return torch.cat(chunks, dim=seq_dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # type: ignore[override]
+        shards = torch.chunk(grad_output, ctx.cp_size, dim=ctx.seq_dim)
+        return shards[ctx.cp_rank].contiguous(), None, None
+
+
+def _cp_contiguous_allgather(
+    tensor: torch.Tensor, cp_group: Any, seq_dim: int = 1
+) -> torch.Tensor:
+    """Differentiable rank-ordered all-gather of contiguous CP shards.
+
+    See :class:`_ContiguousCPAllGather`. No-op at cp_size 1.
+    """
+    if torch.distributed.get_world_size(cp_group) == 1:
+        return tensor
+    return _ContiguousCPAllGather.apply(tensor, cp_group, seq_dim)
+
+
+def model_owned_cp_full_logits(
+    model: nn.Module,
+    input_ids: torch.Tensor,
+    device_mesh: Any,
+    cp_group: Any,
+    original_seq_len: int,
+    padding_token_id: int = 0,
+    model_type: Optional[str] = None,
+    sequence_dim: int = 1,
+    dtype: torch.dtype = torch.bfloat16,
+    autocast_enabled: bool = True,
+) -> torch.Tensor:
+    """Run a model-owned-CP forward (e.g. Gemma4) and return FULL-sequence logits.
+
+    Mirrors Automodel ``recipes/llm/train_ft.py::_forward_backward_step``: embed the
+    full sequence (``prepare_model_inputs_for_cp`` -> inputs_embeds + per-layer /
+    vision metadata + ``_cp_make_batch_fn``), let ``make_cp_batch_and_ctx`` install
+    the ring and keep one contiguous shard per CP rank, run the model on the local
+    shard (the flex ring moves K/V across CP ranks), then rank-order all-gather the
+    shard logits back to the full (padded) sequence and trim the CP padding. The
+    result is numerically equivalent to a non-CP forward, so the existing cp_size=1
+    post-processing can consume it unchanged.
+    """
+    from nemo_automodel.components.distributed.cp_utils import make_cp_batch_and_ctx
+
+    mm_token_type_ids = (
+        torch.zeros_like(input_ids) if model_type == "gemma4" else None
+    )
+    # ``labels`` is required by make_cp_batch_and_ctx's manual CP prep (it is sharded
+    # alongside the inputs); for a pure forward we only need the logits, so a copy of
+    # input_ids is a harmless placeholder that we drop before the model call.
+    batch: dict[str, Any] = {"input_ids": input_ids, "labels": input_ids}
+    if mm_token_type_ids is not None:
+        batch["mm_token_type_ids"] = mm_token_type_ids
+    # The model attaches inputs_embeds (+ _cp_make_batch_fn, per_layer_inputs, vision
+    # group ids, CP metadata). make_cp_batch_and_ctx requires exactly one of
+    # input_ids / inputs_embeds, so drop input_ids once embeds are present.
+    #
+    # prepare_model_inputs_for_cp embeds the full sequence by calling embedding
+    # submodules directly (outside the model's top-level forward), so FSDP2's
+    # all-gather forward hooks don't fire and the sharded DTensor embedding weights
+    # would mix with the plain input_ids ("got mixed torch.Tensor and DTensor").
+    # Unshard the model's FSDP2 params for the duration of the prep so the embedding
+    # runs on full (plain) weights; reshard immediately after (the sharded
+    # model(**sharded) forward re-gathers per layer via the normal FSDP2 hooks).
+    from torch.distributed.fsdp import FSDPModule
+
+    # Match the non-CP path (get_train_context), which runs the forward under
+    # autocast: the policy holds fp32 master weights, so without autocast the
+    # bf16 compute tensors meet fp32 params ("mat1 and mat2 have the same dtype:
+    # float != BFloat16"). Wrap the embedding/prep + model forward in autocast.
+    from contextlib import nullcontext
+
+    autocast_ctx = (
+        torch.autocast(device_type="cuda", dtype=dtype)
+        if autocast_enabled
+        else nullcontext()
+    )
+
+    _unsharded_fsdp_modules = []
+    for _m in model.modules():
+        if isinstance(_m, FSDPModule):
+            _m.unshard()
+            _unsharded_fsdp_modules.append(_m)
+    try:
+        with autocast_ctx:
+            batch.update(
+                model.prepare_model_inputs_for_cp(
+                    input_ids=input_ids, mm_token_type_ids=mm_token_type_ids
+                )
+            )
+    finally:
+        for _m in reversed(_unsharded_fsdp_modules):
+            _m.reshard()
+    if "inputs_embeds" in batch:
+        batch.pop("input_ids", None)
+
+    train_ctx, sharded = make_cp_batch_and_ctx(
+        device_mesh, batch, padding_token_id=padding_token_id
+    )
+    sharded.pop("labels", None)  # not a model.forward kwarg
+    sharded["use_cache"] = False
+
+    # transformers 5.8.1's gemma4 KV-sharing threads a ``shared_kv_states`` dict
+    # kwarg through the decoder layers (the trailing num_kv_shared_layers reuse
+    # earlier layers' K/V). Under FSDP2 ``cast_forward_inputs`` copies a *plain
+    # dict* per wrapped layer, so the shared layers read an empty copy ->
+    # ``KeyError: 'sliding_attention'``. HF only builds that dict when one is not
+    # passed in (``kwargs.pop("shared_kv_states", {})``), so inject Automodel's
+    # FSDP-safe (non-dict MutableMapping, passed through unchanged by FSDP) store
+    # — every layer then shares the same instance. Dense E2B/E4B need this; it is
+    # a harmless no-op for non-kv-sharing gemma4 (e.g. 31B). See the
+    # _FSDPSafeSharedKVStates docstring in Automodel's gemma4_moe/model.py.
+    if model_type == "gemma4":
+        try:
+            from nemo_automodel.components.models.gemma4_moe.model import (
+                _FSDPSafeSharedKVStates,
+            )
+
+            sharded["shared_kv_states"] = _FSDPSafeSharedKVStates()
+        except ImportError:
+            pass
+
+    with train_ctx(), autocast_ctx:
+        outputs = model(**sharded)
+    logits = extract_logits(model, outputs)
+
+    full_logits = _cp_contiguous_allgather(logits, cp_group, seq_dim=sequence_dim)
+    # CP padded the sequence to a multiple of 2*cp_size; trim back to the real length.
+    return full_logits.narrow(sequence_dim, 0, original_seq_len)
+
+
 def prepare_data_for_cp(
     mb: BatchedDataDict[Any],
     processed_inputs: ProcessedInputs,
@@ -284,6 +453,7 @@ def forward_with_post_processing_fn(
     global_valid_toks: Optional[torch.Tensor] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     sequence_dim: int = 1,
+    cp_full_logits_fn: Optional[Callable[[ProcessedInputs], torch.Tensor]] = None,
 ) -> Tuple[Any, dict[str, Any], ProcessedMicrobatch]:
     """Perform forward pass with pre-processed microbatch and apply post-processing.
 
@@ -315,17 +485,23 @@ def forward_with_post_processing_fn(
     data_dict = processed_mb.data_dict
     processed_inputs = processed_mb.processed_inputs
 
-    # Model forward pass
-    outputs = model_forward(
-        model,
-        processed_inputs,
-        is_reward_model=is_reward_model,
-        allow_flash_attn_args=allow_flash_attn_args,
-    )
+    # Model forward pass. For model-owned CP (e.g. Gemma4), cp_full_logits_fn runs
+    # the model's own CP forward (contiguous shard + ring) and returns FULL-sequence
+    # logits (gathered, differentiable), so downstream post-processing runs exactly
+    # as the cp_size=1 path. Otherwise use the standard model_forward.
+    if cp_full_logits_fn is not None:
+        logits = cp_full_logits_fn(processed_inputs)
+    else:
+        outputs = model_forward(
+            model,
+            processed_inputs,
+            is_reward_model=is_reward_model,
+            allow_flash_attn_args=allow_flash_attn_args,
+        )
 
-    # Extract logits from model outputs
-    logits = extract_logits(model, outputs)
-    del outputs
+        # Extract logits from model outputs
+        logits = extract_logits(model, outputs)
+        del outputs
 
     # Apply temperature scaling only for sampling-oriented post-processors
     # Score computations should use unscaled logits
@@ -409,6 +585,7 @@ def automodel_forward_backward(
     train_context_fn: Optional[Callable[[ProcessedInputs], Any]] = None,
     num_valid_microbatches: Optional[int] = None,
     on_microbatch_start: Optional[Callable[[int], None]] = None,
+    cp_full_logits_fn: Optional[Callable[[ProcessedInputs], torch.Tensor]] = None,
 ) -> list[Tuple[Any, dict[str, Any]]]:
     """Execute forward and backward passes for automodel.
 
@@ -473,6 +650,7 @@ def automodel_forward_backward(
                 global_valid_toks=global_valid_toks,
                 sampling_params=sampling_params,
                 sequence_dim=sequence_dim,
+                cp_full_logits_fn=cp_full_logits_fn,
             )
 
             # Check if this is a dummy batch

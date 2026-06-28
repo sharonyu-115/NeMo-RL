@@ -120,7 +120,18 @@ def model_forward(
     if not allow_flash_attn_args and "flash_attn_kwargs" in model_args:
         del model_args["flash_attn_kwargs"]
 
-    outputs = model(**model_args)
+    # Native (non-HF) MoE gemma4 (e.g. 26B-A4B) runs with autocast disabled
+    # (setup.py: autocast_enabled = not (is_moe_model and not is_hf_model); TE/DeepEP
+    # manage their own kernel precision). But the model's fp32 RMSNorm output then
+    # meets the plain bf16 lm_head -> "mat1 and mat2 ... float != BFloat16". Run the
+    # gemma4 forward under bf16 autocast so that boundary is reconciled; this is a
+    # no-op nesting for dense gemma4 (E2B/31B), which already runs under autocast.
+    # Mirrors the model-owned CP forward fix in _model_owned_cp_shard_logits.
+    if getattr(getattr(model, "config", None), "model_type", None) == "gemma4":
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(**model_args)
+    else:
+        outputs = model(**model_args)
     return outputs
 
 

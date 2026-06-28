@@ -320,11 +320,18 @@ def _model_owned_cp_shard_logits(
     # Match the non-CP path (get_train_context), which runs the forward under
     # autocast: the policy holds fp32 master weights, so without autocast the bf16
     # compute tensors meet fp32 params ("mat1 and mat2 ... float != BFloat16").
-    autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=dtype)
-        if autocast_enabled
-        else nullcontext()
-    )
+    #
+    # The model-owned CP forward is ALWAYS run under autocast, overriding the
+    # caller's ``autocast_enabled``. Native (non-HF) MoE models set
+    # ``autocast_enabled=False`` (setup.py: ``not (is_moe_model and not is_hf_model)``)
+    # because their TE/DeepEP expert + attention kernels manage their own precision.
+    # But this CP forward routes an fp32 activation (the model's final RMSNorm upcasts
+    # to fp32) into the plain bf16 ``lm_head`` -> "mat1 and mat2 ... float != BFloat16".
+    # Autocast reconciles that boundary (and is a no-op for the TE kernels, which
+    # already ran correctly under it for the dense path). ``_ = autocast_enabled``
+    # keeps the parameter meaningful to callers while this path forces it on.
+    _ = autocast_enabled
+    autocast_ctx = torch.autocast(device_type="cuda", dtype=dtype)
 
     # prepare_model_inputs_for_cp embeds the full sequence by calling embedding
     # submodules directly (outside the model's top-level forward), so FSDP2's
@@ -347,6 +354,19 @@ def _model_owned_cp_shard_logits(
     finally:
         for _m in reversed(_unsharded_fsdp_modules):
             _m.reshard()
+    # prepare_model_inputs_for_cp embeds the sequence by calling the embedding
+    # submodules directly, outside the model's normal compute-dtype/autocast path.
+    # Backends that run the forward WITHOUT torch.autocast (e.g. the TE-backed MoE
+    # 26B, where autocast_enabled=False) then carry these fp32 embeds all the way to
+    # the bf16 lm_head -> "expected mat1 and mat2 to have the same dtype, but got:
+    # float != c10::BFloat16". The non-CP path avoids this by feeding input_ids and
+    # embedding inside the model's own dtype-consistent forward. Cast the float prep
+    # tensors to the compute dtype to restore that parity; no-op for the dense path
+    # where autocast already downcasts.
+    for _k in ("inputs_embeds", "per_layer_inputs"):
+        _v = batch.get(_k)
+        if isinstance(_v, torch.Tensor) and _v.is_floating_point():
+            batch[_k] = _v.to(dtype)
     # make_cp_batch_and_ctx requires exactly one of input_ids / inputs_embeds.
     if "inputs_embeds" in batch:
         batch.pop("input_ids", None)
@@ -363,7 +383,17 @@ def _model_owned_cp_shard_logits(
     # ``KeyError: 'sliding_attention'``. HF only builds that dict when one is not
     # passed in, so inject Automodel's FSDP-safe (non-dict) store. No-op for
     # non-kv-sharing gemma4 (e.g. 31B). See _FSDPSafeSharedKVStates in Automodel.
-    if model_type == "gemma4":
+    #
+    # MoE gemma4 (e.g. 26B-A4B) must be EXCLUDED: its decoder stack builds its own
+    # _FSDPSafeSharedKVStates and passes it explicitly to each layer alongside
+    # ``**kwargs`` (gemma4_moe/model.py), so an injected one arrives twice ->
+    # ``TypeError: got multiple values for keyword argument 'shared_kv_states'``.
+    # The injection is only needed by the dense HF forward path.
+    _text_cfg = getattr(
+        getattr(model, "config", None), "text_config", getattr(model, "config", None)
+    )
+    _is_moe_gemma4 = bool(getattr(_text_cfg, "enable_moe_block", False))
+    if model_type == "gemma4" and not _is_moe_gemma4:
         try:
             from nemo_automodel.components.models.gemma4_moe.model import (
                 _FSDPSafeSharedKVStates,

@@ -337,11 +337,20 @@ def _model_owned_cp_shard_logits(
     # submodules directly (outside the model's top-level forward), so FSDP2's
     # all-gather forward hooks don't fire and the sharded DTensor embedding weights
     # would mix with the plain input_ids ("got mixed torch.Tensor and DTensor").
-    # Unshard the model's FSDP2 params for the prep; reshard immediately after (the
-    # sharded model(**sharded) forward re-gathers per layer via normal FSDP2 hooks).
+    # Unshard the FSDP2 params for the prep; reshard immediately after (the sharded
+    # model(**sharded) forward re-gathers per layer via normal FSDP2 hooks).
+    #
+    # Unshard every FSDP unit EXCEPT the decoder layers (modules under ``.layers.``).
+    # The prep only reads embedding params (input embedding + any per-layer-input
+    # embedding), which never live under the decoder-layer ModuleList. Unsharding the
+    # layers too would gather essentially the whole model on every rank; even though
+    # we reshard immediately below, that transient peak leaves the caching allocator
+    # reserved near-full and downstream cublas allocations fail on large dense models
+    # (31B: ~62GB params/rank -> CUBLAS_STATUS_ALLOC_FAILED at the next matmul). The
+    # layer units are re-gathered per layer by the real forward's normal hooks.
     _unsharded_fsdp_modules = []
-    for _m in model.modules():
-        if isinstance(_m, FSDPModule):
+    for _name, _m in model.named_modules():
+        if isinstance(_m, FSDPModule) and ".layers." not in f".{_name}.":
             _m.unshard()
             _unsharded_fsdp_modules.append(_m)
     try:

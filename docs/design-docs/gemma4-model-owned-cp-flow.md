@@ -183,6 +183,106 @@ Key reasons:
   receives the real `cp_size` so `loss = result * dp_size * cp_size` cancels the
   FSDP averaging over the flattened DP/CP group.
 
+## bf16 Autocast Workaround for Native MoE Gemma4 (26B-A4B)
+
+Both the model-owned CP forward (`_model_owned_cp_shard_logits`, `cp_size > 1`)
+and the generic non-CP forward (`model_forward`, `cp_size == 1`) wrap the Gemma4
+model call in `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`. This is
+a workaround, not a design feature. This section records the analysis so the wrap
+can be removed once the underlying precision contract is fixed upstream.
+
+### Symptom
+
+Training or `get_logprobs` on the native (non-HF) MoE Gemma4 backend — 26B-A4B —
+fails at the `lm_head` projection with:
+
+```text
+RuntimeError: expected mat1 and mat2 to have the same dtype, but got: float != BFloat16
+```
+
+Dense Gemma4 (E2B / E4B / 31B) is unaffected.
+
+### Root cause
+
+Two independent facts combine:
+
+1. NeMo RL disables autocast for native MoE models. In `setup.py`:
+
+   ```python
+   is_moe_model = any("expert" in k for k in model_state_dict_keys)   # True for 26B-A4B
+   is_hf_model  = arch not in Automodel's custom ModelRegistry        # False (custom-registered)
+   autocast_enabled = not (is_moe_model and not is_hf_model)          # -> False for 26B-A4B
+   ```
+
+   The intent: native MoE backends run TE/DeepEP expert kernels that manage their
+   own precision, and blanket autocast was found to cause numerical issues.
+
+2. The native MoE Gemma4 forward delivers an **fp32** activation into a **bf16**
+   `lm_head`. The model's final `Gemma4RMSNorm` output is fp32, and Automodel's
+   `gemma4_moe` forward calls `self.lm_head(hidden_states[...])` directly with no
+   explicit downcast (it relies on an ambient autocast region to reconcile the
+   boundary).
+
+With autocast disabled (fact 1) and an fp32 → bf16 matmul (fact 2) and no explicit
+cast, the `lm_head` matmul raises. Dense Gemma4 keeps `autocast_enabled=True`, so
+the worker already runs its forward under autocast and never hits this.
+
+### Why this is effectively an Automodel-bump regression
+
+The `autocast_enabled` rule is identical on `gemma4-support` and `gemma4-cp`, so
+the disabled-autocast condition is *not* the new factor. The new factor is
+Automodel's precision contract:
+
+| Branch | Automodel pin | 26B-A4B at `lm_head` |
+| --- | --- | --- |
+| `gemma4-support` | `~6de0c361` | delivered bf16 -> no error, no wrap needed |
+| `gemma4-cp` | `1ff3afc9` | delivers fp32 -> crashes without the wrap |
+
+Four precision/dtype-contract commits landed in the native `gemma4_moe` path
+between those pins (present in the newer pin, not the older):
+
+```text
+#1896  fp32 master weights for custom MoE models under FSDP2
+#2419  dtype contract bug fixes for FSDP2 mixed-dtype loads
+#2549  keep RoPE frequency buffers fp32 under bf16 model cast
+#2359  cast dense params without casting buffers
+```
+
+These tightened the contract so the native MoE forward now carries fp32 hidden
+states into the bf16 `lm_head`, where the older Automodel handed it bf16. So the
+crash is the combination of a long-standing NeMo RL rule (autocast off for native
+MoE) and a *new* Automodel fp32 contract introduced by the dependency bump — not a
+NeMo RL design change.
+
+### Where the fix lives
+
+| Path | `cp_size` | Location | Landed in |
+| --- | --- | --- | --- |
+| Model-owned CP forward | `> 1` | `_model_owned_cp_shard_logits` (`with train_ctx(), autocast_ctx: model(**sharded)`) | model-owned CP commit |
+| Generic forward | `== 1` | `model_forward` (`if model_type == "gemma4": with torch.autocast(bf16): model(...)`) | `21c5e3c7b` |
+
+The earlier model-owned-CP fix only covered the `cp_size > 1` path; `21c5e3c7b`
+extends the identical remedy to the generic `cp_size == 1` path so 26B-A4B trains
+without CP too. The wrap is a no-op nesting for dense Gemma4, which already runs
+under autocast.
+
+### Evaluation and recommended upstream fix
+
+- **Consistent and low risk.** The generic-path wrap mirrors the already-validated
+  model-owned-CP wrap. Verified: 26B-A4B `cp=1` baseline trains; dense 31B
+  unaffected.
+- **Caveat.** Autocast was disabled for native MoE precisely because TE/DeepEP
+  kernels self-manage precision; re-enabling autocast over the whole forward
+  works slightly against that intent. It is fine empirically (autocast is a no-op
+  for the TE-internal ops and the boundary it fixes is the lm_head), but it is the
+  reason this is a workaround rather than the desired end state.
+- **Recommended upstream fix.** The clean fix belongs in Automodel: the
+  `gemma4_moe` forward should cast `hidden_states` to `lm_head.weight.dtype` before
+  the matmul, or route the projection through `compute_lm_head_logits` with explicit
+  dtype handling. Then the precision contract is self-consistent regardless of
+  caller, and the NeMo RL autocast wraps in both `_model_owned_cp_shard_logits` and
+  `model_forward` can be removed.
+
 ## Difference From Existing Generic CP Support
 
 | Aspect | Generic SDPA/TE CP | Gemma4 model-owned CP |

@@ -635,14 +635,14 @@ class TestSetupDistributed:
         return mock_mesh
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_basic(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
         mock_runtime_config,
@@ -655,7 +655,9 @@ class TestSetupDistributed:
         mock_moe_config_instance = MagicMock()
         mock_moe_config.return_value = mock_moe_config_instance
         mock_moe_mesh = MagicMock()
-        mock_create_mesh.return_value = (mock_device_mesh, mock_moe_mesh)
+        mock_mesh_context.build.return_value = MagicMock(
+            device_mesh=mock_device_mesh, moe_mesh=mock_moe_mesh
+        )
 
         result = setup_distributed(mock_config, mock_runtime_config)
 
@@ -667,14 +669,14 @@ class TestSetupDistributed:
         assert result.moe_config == mock_moe_config_instance
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_with_cpu_offload(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
         mock_device_mesh,
@@ -683,7 +685,9 @@ class TestSetupDistributed:
         mock_torch_dist.get_world_size.return_value = 4
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
-        mock_create_mesh.return_value = (mock_device_mesh, None)
+        mock_mesh_context.build.return_value = MagicMock(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
 
         runtime_config = RuntimeConfig(
             model_class=Mock,
@@ -709,14 +713,14 @@ class TestSetupDistributed:
         assert isinstance(result, DistributedContext)
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_world_size_one_cpu_offload_raises(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
     ):
@@ -747,52 +751,57 @@ class TestSetupDistributed:
             setup_distributed(mock_config, runtime_config)
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_passes_correct_params(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
         mock_runtime_config,
         mock_device_mesh,
     ):
-        """Test that FSDP2Config and create_device_mesh are called with correct parameters."""
+        """Test that FSDP2Config and MeshContext.build are called with correct parameters."""
         mock_torch_dist.get_world_size.return_value = 4
         mock_fsdp2_config.return_value = MagicMock()
         mock_moe_config.return_value = MagicMock()
-        mock_create_mesh.return_value = (mock_device_mesh, None)
+        mock_mesh_context.build.return_value = MagicMock(
+            device_mesh=mock_device_mesh, moe_mesh=None
+        )
         mock_config["dtensor_cfg"]["dp_replicate_size"] = 2
 
         setup_distributed(mock_config, mock_runtime_config)
 
         # Verify FSDP2Config was constructed with correct kwargs
+        # (automodel 2d946b0 dropped the backend kwarg).
         fsdp2_call_kwargs = mock_fsdp2_config.call_args[1]
         assert fsdp2_call_kwargs["sequence_parallel"] is False
         assert fsdp2_call_kwargs["activation_checkpointing"] is False
-        assert fsdp2_call_kwargs["backend"] == "nccl"
+        assert "backend" not in fsdp2_call_kwargs
 
-        # Verify create_device_mesh was called with correct size params
-        mesh_call_kwargs = mock_create_mesh.call_args[1]
-        assert mesh_call_kwargs["tp_size"] == 1
-        assert mesh_call_kwargs["pp_size"] == 1
-        assert mesh_call_kwargs["cp_size"] == 1
-        assert mesh_call_kwargs["ep_size"] == 1
-        assert mesh_call_kwargs["dp_replicate_size"] == 2
-        assert mesh_call_kwargs["world_size"] == 4
+        # Verify MeshContext.build was called with the right ParallelismSizes + world_size.
+        # The ParallelismSizes object is passed positionally; world_size is a kwarg.
+        build_args, build_kwargs = mock_mesh_context.build.call_args
+        sizes = build_args[1]
+        assert sizes.tp_size == 1
+        assert sizes.pp_size == 1
+        assert sizes.cp_size == 1
+        assert sizes.ep_size == 1
+        assert sizes.dp_replicate_size == 2
+        assert build_kwargs["world_size"] == 4
 
     @patch("nemo_rl.models.automodel.setup.MoEParallelizerConfig")
-    @patch("nemo_rl.models.automodel.setup.create_device_mesh")
+    @patch("nemo_rl.models.automodel.setup.MeshContext")
     @patch("nemo_rl.models.automodel.setup.FSDP2Config")
     @patch("nemo_rl.models.automodel.setup.torch.distributed")
     def test_setup_distributed_dp_replicate_size_requires_divisible_dp(
         self,
         mock_torch_dist,
         mock_fsdp2_config,
-        mock_create_mesh,
+        mock_mesh_context,
         mock_moe_config,
         mock_config,
         mock_runtime_config,
@@ -898,13 +907,18 @@ class TestSetupModelAndOptimizer:
         )
 
         assert isinstance(result, ModelAndOptimizerState)
-        # Verify from_pretrained was called with distributed kwargs
+        # Verify from_pretrained was called with a single DistributedSetup bundle
+        # (automodel 2d946b0 dropped the separate device_mesh/distributed_config kwargs).
         mock_runtime_config.model_class.from_pretrained.assert_called_once()
         call_kwargs = mock_runtime_config.model_class.from_pretrained.call_args[1]
-        assert call_kwargs["device_mesh"] == mock_distributed_context.device_mesh
+        assert "device_mesh" not in call_kwargs
+        assert "distributed_config" not in call_kwargs
+        distributed_setup = call_kwargs["distributed_setup"]
         assert (
-            call_kwargs["distributed_config"] == mock_distributed_context.fsdp2_config
+            distributed_setup.mesh_context.device_mesh
+            == mock_distributed_context.device_mesh
         )
+        assert distributed_setup.strategy_config == mock_distributed_context.fsdp2_config
         # Verify config= is NOT passed (avoids duplicate arg for custom models)
         assert "config" not in call_kwargs
 
@@ -2136,72 +2150,3 @@ class TestMaybeSetForceHf:
         config = self._make_config(arch)
         _maybe_set_force_hf(kwargs, config)
         assert "force_hf" not in kwargs
-
-
-@pytest.mark.automodel
-def test_automodel_dtype_restore_workaround_still_needed(monkeypatch):
-    """Tripwire for the temporary fp32 master-weight workaround in setup.py.
-
-    ``_disable_automodel_checkpoint_dtype_restore`` no-ops Automodel's
-    ``_restore_loaded_model_dtype`` because (pre PR #2419) it downgrades an explicitly-fp32
-    load back to the bf16 checkpoint dtype, breaking optimizer master weights. This test
-    reproduces that downgrade against the *live* pinned function (no model/checkpoint load).
-
-    It PASSES while the bug is present. It FAILS — telling us to delete the workaround in
-    ``nemo_rl/models/automodel/setup.py`` (and this test) — once Automodel either removes the
-    function or ships PR #2419 (honors the explicit fp32 via ``promote_types`` so the weight
-    stays fp32).
-    """
-    import inspect
-    import types
-
-    import nemo_automodel.components.checkpoint.utils as ckpt_utils
-    from nemo_automodel._transformers import model_init
-
-    restore = getattr(model_init, "_restore_loaded_model_dtype", None)
-    # An earlier test in this process may have triggered the setup.py workaround
-    # (_disable_automodel_checkpoint_dtype_restore), which globally and irreversibly
-    # replaces this symbol with a no-op. Recover the genuine upstream function it
-    # stashed so this tripwire exercises Automodel's real behavior, not our no-op.
-    restore = getattr(restore, "_nrl_original", restore)
-    if restore is None:
-        pytest.fail(
-            "Automodel removed _restore_loaded_model_dtype - remove the fp32 master-weight "
-            "workaround _disable_automodel_checkpoint_dtype_restore() in "
-            "nemo_rl/models/automodel/setup.py."
-        )
-
-    model = torch.nn.Linear(4, 4).float()
-    assert model.weight.dtype == torch.float32
-
-    # Pretend the checkpoint stored the weight in bf16.
-    monkeypatch.setattr(
-        ckpt_utils,
-        "_get_checkpoint_tensor_dtypes",
-        lambda *args, **kwargs: {"weight": torch.bfloat16},
-    )
-    # Reproduce NeMo-RL's explicit-fp32 load. PR #2419 honors the request ONLY via the
-    # new `requested_dtype` parameter (it ignores hf_config.torch_dtype / load_kwargs in
-    # this function): with requested_dtype=fp32 it promotes the bf16 checkpoint tensor up
-    # to fp32 and leaves the weight unchanged. The current pin predates #2419 and its
-    # signature has no such parameter, so pass it only when the signature accepts it:
-    #   pre-#2419  -> requested_dtype absent -> weight downgraded to bf16 (assert holds, workaround needed)
-    #   post-#2419 -> requested_dtype=fp32   -> weight stays fp32      (assert fails, fires the removal tripwire)
-    hf_config = types.SimpleNamespace(torch_dtype=torch.float32)
-    restore_kwargs = {}
-    if "requested_dtype" in inspect.signature(restore).parameters:
-        restore_kwargs["requested_dtype"] = torch.float32
-    restore(
-        model,
-        "dummy",
-        hf_config,
-        None,
-        {"torch_dtype": "torch.float32"},
-        **restore_kwargs,
-    )
-
-    assert model.weight.dtype == torch.bfloat16, (
-        "Automodel no longer downgrades an explicit-fp32 load (likely PR #2419 landed); the "
-        "_disable_automodel_checkpoint_dtype_restore() workaround in setup.py is obsolete - "
-        "remove it and this test."
-    )

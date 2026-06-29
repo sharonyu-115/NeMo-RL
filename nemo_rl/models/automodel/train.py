@@ -428,39 +428,6 @@ def _model_owned_cp_shard_logits(
     return extract_logits(model, outputs)
 
 
-def model_owned_cp_full_logits(
-    model: nn.Module,
-    input_ids: torch.Tensor,
-    device_mesh: Any,
-    cp_group: Any,
-    original_seq_len: int,
-    padding_token_id: int = 0,
-    model_type: Optional[str] = None,
-    sequence_dim: int = 1,
-    dtype: torch.dtype = torch.bfloat16,
-    autocast_enabled: bool = True,
-) -> torch.Tensor:
-    """Model-owned-CP forward returning FULL-sequence logits (rank-order all-gather).
-
-    Convenience wrapper around :func:`_model_owned_cp_shard_logits` that gathers the
-    per-rank shards back to the full sequence. NOTE: this materializes ``[B, S, V]``
-    on every rank, so it is only viable at short sequence — long-context callers use
-    :func:`model_owned_cp_token_logprobs` (and the per-shard loss path) instead.
-    """
-    logits = _model_owned_cp_shard_logits(
-        model,
-        input_ids,
-        device_mesh,
-        padding_token_id=padding_token_id,
-        model_type=model_type,
-        dtype=dtype,
-        autocast_enabled=autocast_enabled,
-    )
-    full_logits = _cp_contiguous_allgather(logits, cp_group, seq_dim=sequence_dim)
-    # CP padded the sequence to a multiple of 2*cp_size; trim back to the real length.
-    return full_logits.narrow(sequence_dim, 0, original_seq_len)
-
-
 def model_owned_cp_token_logprobs(
     model: nn.Module,
     input_ids: torch.Tensor,

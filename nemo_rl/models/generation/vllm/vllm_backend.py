@@ -226,6 +226,41 @@ class VllmInternalWorkerExtension:
             for idx, (key, weight) in enumerate(weights):
                 weights[idx] = (fix_gemma3_vision_weight_name(key), weight)
 
+        if any(
+            "Gemma4Unified" in arch
+            for arch in self.model_runner.vllm_config.model_config.architectures
+        ):
+            # The policy loads the full multimodal HF model (text + vision + audio), but
+            # vLLM runs text-only: its multimodal subtrees are encoder-free stubs whose
+            # parameter layout differs from HF (e.g. HF nests
+            # `embed_vision.multimodal_embedder.*` while vLLM keeps a flat
+            # `embed_vision.embedding_projection.weight`). These towers are frozen, never
+            # trained, and never invoked without image/audio tokens, so we drop ALL
+            # multimodal-subtree weights from refit (correctness-safe for text-only gen)
+            # and refit only the language model / embed_tokens / lm_head. Match the markers
+            # as substrings since incoming keys are HF names that may carry a `model.` prefix.
+            _MM_MARKERS = (
+                "embed_vision.",
+                "embed_audio.",
+                "vision_embedder.",
+                "audio_embedder.",
+                "vision_tower.",
+                "audio_tower.",
+                "multi_modal_projector.",
+            )
+
+            def _keep_gemma4_unified(key: str) -> bool:
+                return not any(m in key for m in _MM_MARKERS)
+
+            n_before = len(weights)
+            weights = [(k, w) for (k, w) in weights if _keep_gemma4_unified(k)]
+            n_dropped = n_before - len(weights)
+            if n_dropped:
+                print(
+                    f"[refit] gemma4_unified text-only: dropped {n_dropped} vision/audio-tower "
+                    f"weights absent from the vLLM model"
+                )
+
         policy_weights, draft_weights = self._split_policy_and_draft_weights(weights)
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             fp8.load_weights(policy_weights, self.model_runner)

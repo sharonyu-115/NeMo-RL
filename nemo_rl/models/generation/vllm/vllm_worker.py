@@ -622,6 +622,7 @@ class BaseVllmGenerationWorker:
             for arch in (
                 "Gemma3ForConditionalGeneration",
                 "Gemma4ForConditionalGeneration",
+                "Gemma4UnifiedForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
             )
@@ -633,6 +634,7 @@ class BaseVllmGenerationWorker:
                 in (
                     "Gemma3ForConditionalGeneration",
                     "Gemma4ForConditionalGeneration",
+                    "Gemma4UnifiedForConditionalGeneration",
                     "Qwen3_5ForConditionalGeneration",
                     "Qwen3_5MoeForConditionalGeneration",
                 )

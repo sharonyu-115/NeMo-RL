@@ -25,6 +25,10 @@ export PYTHONUNBUFFERED=1
 RUN_NAME=mopd-smoke-$(date +%m%d-%H%M)
 
 cd ${REPO}
+# Image baked from THIS checkout via submit_env_refresh_mopd.sbatch (matching
+# fingerprint — required; see env_refresh_mopd.sh header for why).
+# NOTE: the env-prefix block below must stay contiguous (no comment lines
+# between continuations) or sbatch won't receive the earlier variables.
 COMMAND="uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml \
     logger.wandb_enabled=True \
@@ -35,8 +39,6 @@ COMMAND="uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     logger.monitor_gpus=True \
     checkpointing.enabled=False \
     $*" \
-# Image baked from THIS checkout via submit_env_refresh_mopd.sbatch (matching
-# fingerprint — required; see env_refresh_mopd.sh header for why).
 CONTAINER=${USER_FS1}/images/nemo-rl-mopd-main-2026-07-15.sqsh \
 MOUNTS="${USER_FS1}:${USER_FS1},${USER_FSW}:${USER_FSW}" \
 UV_CACHE_DIR_OVERRIDE=${USER_FS1}/.uv-cache-main \

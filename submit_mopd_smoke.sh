@@ -29,10 +29,11 @@ cd ${REPO}
 # fingerprint — required; see env_refresh_mopd.sh header for why).
 # NOTE: the env-prefix block below must stay contiguous (no comment lines
 # between continuations) or sbatch won't receive the earlier variables.
-# The leading reinstall self-heals the base env: extras-flipping uv syncs
-# (conflict groups) can leave transformers as a broken namespace package
-# ('unknown location' ImportError); dist-info survives so a plain sync no-ops.
-COMMAND="uv sync --reinstall-package transformers && uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+# Do NOT set UV_CACHE_DIR_OVERRIDE here: the image's venv packages are
+# symlinks into /root/.cache/uv/archive-v0, and ray.sub mounts the override
+# over /root/.cache/uv — shadowing the archive store dangles every symlinked
+# package (transformers 'unknown location', missing ray._private.node, ...).
+COMMAND="uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml \
     logger.wandb_enabled=True \
     logger.wandb.project=mopd \
@@ -44,7 +45,6 @@ COMMAND="uv sync --reinstall-package transformers && uv run examples/nemo_gym/ru
     $*" \
 CONTAINER=${USER_FS1}/images/nemo-rl-mopd-main-2026-07-15.sqsh \
 MOUNTS="${USER_FS1}:${USER_FS1},${USER_FSW}:${USER_FSW}" \
-UV_CACHE_DIR_OVERRIDE=${USER_FS1}/.uv-cache-main \
 sbatch \
     --account=coreai_dlalgo_nemorl \
     --partition=batch \

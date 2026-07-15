@@ -9,6 +9,9 @@
 #SBATCH --output=/lustre/fsw/portfolios/coreai/users/shuangy/logs/env-refresh-mopd-%j.out
 #SBATCH --error=/lustre/fsw/portfolios/coreai/users/shuangy/logs/env-refresh-mopd-%j.err
 
+# Export secrets on the submit host so they propagate into the container env.
+set -a; source ~/.env; set +a
+
 srun \
   --no-container-mount-home \
   --container-image=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/images/nemo-rl-fp4-fa4-venvs-sm90fix-2026-07-10.sqsh \

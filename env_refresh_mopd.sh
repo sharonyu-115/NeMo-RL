@@ -12,8 +12,9 @@ set -e
 REPO=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/src/NeMo-RL/nemo-rl-mopd
 cd "$REPO"
 
-# Secrets from ~/.env — never hardcode.
-set -a; source ~/.env; set +a
+# Secrets come from the submit host's environment (sbatch propagates them);
+# ~/.env only exists outside the container (--no-container-mount-home).
+if [ -f ~/.env ]; then set -a; source ~/.env; set +a; fi
 
 export NRL_FORCE_REBUILD_VENVS=true
 export WANDB_MODE=disabled

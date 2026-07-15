@@ -25,11 +25,7 @@ export PYTHONUNBUFFERED=1
 RUN_NAME=mopd-smoke-$(date +%m%d-%H%M)
 
 cd ${REPO}
-# Build a complete project venv on lustre instead of incrementally syncing the
-# container's baked env: the image is older than the checked-out main (pyproject/
-# uv.lock/Gym drift), and an in-place sync of the stale env leaves broken
-# packages (observed: transformers 'unknown location' ImportError).
-COMMAND="export UV_PROJECT_ENVIRONMENT=${REPO}/.venv && uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+COMMAND="uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml \
     logger.wandb_enabled=True \
     logger.wandb.project=mopd \
@@ -39,7 +35,9 @@ COMMAND="export UV_PROJECT_ENVIRONMENT=${REPO}/.venv && uv run examples/nemo_gym
     logger.monitor_gpus=True \
     checkpointing.enabled=False \
     $*" \
-CONTAINER=${USER_FS1}/images/nemo-rl-fp4-fa4-venvs-sm90fix-2026-07-10.sqsh \
+# Image baked from THIS checkout via submit_env_refresh_mopd.sbatch (matching
+# fingerprint — required; see env_refresh_mopd.sh header for why).
+CONTAINER=${USER_FS1}/images/nemo-rl-mopd-main-2026-07-15.sqsh \
 MOUNTS="${USER_FS1}:${USER_FS1},${USER_FSW}:${USER_FSW}" \
 UV_CACHE_DIR_OVERRIDE=${USER_FS1}/.uv-cache-main \
 sbatch \

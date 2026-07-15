@@ -25,7 +25,11 @@ export PYTHONUNBUFFERED=1
 RUN_NAME=mopd-smoke-$(date +%m%d-%H%M)
 
 cd ${REPO}
-COMMAND="uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+# Build a complete project venv on lustre instead of incrementally syncing the
+# container's baked env: the image is older than the checked-out main (pyproject/
+# uv.lock/Gym drift), and an in-place sync of the stale env leaves broken
+# packages (observed: transformers 'unknown location' ImportError).
+COMMAND="export UV_PROJECT_ENVIRONMENT=${REPO}/.venv && uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml \
     logger.wandb_enabled=True \
     logger.wandb.project=mopd \
@@ -43,6 +47,6 @@ sbatch \
     --partition=batch \
     --nodes=3 \
     --gres=gpu:8 \
-    --time=2:00:00 \
+    --time=4:00:00 \
     --job-name=mopd-smoke \
     ray.sub

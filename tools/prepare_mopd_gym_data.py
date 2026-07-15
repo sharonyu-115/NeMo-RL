@@ -32,6 +32,13 @@ SYSTEM_PROMPT = (
     "(and only the answer) inside \\boxed{}."
 )
 
+# Route every row to the math agent server from math_with_judge.yaml. Without
+# agent_ref, NeMo Gym rollout collection cannot route the row (older nemo_gym
+# builds hang with a swallowed KeyError instead of failing fast), and MOPD's
+# teacher routing also keys off this name (unmapped names fall back to
+# default_teacher_alias).
+AGENT_REF = {"name": "math_with_judge_simple_agent", "type": "responses_api_agents"}
+
 
 def write_train(out_path: Path) -> int:
     ds = load_dataset("YouJiacheng/DAPO-Math-17k-dedup", split="train")
@@ -39,6 +46,7 @@ def write_train(out_path: Path) -> int:
     with open(out_path, "w") as f:
         for example in ds:
             row = {
+                "agent_ref": AGENT_REF,
                 "responses_create_params": {"input": example["prompt"]},
                 "question": example["prompt"][0]["content"],
                 "expected_answer": example["reward_model"]["ground_truth"],
@@ -54,6 +62,7 @@ def write_val(out_path: Path) -> int:
     with open(out_path, "w") as f:
         for example in ds:
             row = {
+                "agent_ref": AGENT_REF,
                 "responses_create_params": {
                     "input": [
                         {"role": "system", "content": SYSTEM_PROMPT},

@@ -43,6 +43,7 @@ COMMAND="uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     logger.monitor_gpus=True \
     checkpointing.enabled=False \
     $*" \
+SETUP_COMMAND="rm -rf /opt/ray_venvs/nemo_rl.environments.nemo_gym.NemoGym" \
 CONTAINER=${USER_FS1}/images/nemo-rl-mopd-main-2026-07-15.sqsh \
 MOUNTS="${USER_FS1}:${USER_FS1},${USER_FSW}:${USER_FSW}" \
 sbatch \

@@ -29,7 +29,10 @@ cd ${REPO}
 # fingerprint — required; see env_refresh_mopd.sh header for why).
 # NOTE: the env-prefix block below must stay contiguous (no comment lines
 # between continuations) or sbatch won't receive the earlier variables.
-COMMAND="uv run examples/nemo_gym/run_grpo_nemo_gym.py \
+# The leading reinstall self-heals the base env: extras-flipping uv syncs
+# (conflict groups) can leave transformers as a broken namespace package
+# ('unknown location' ImportError); dist-info survives so a plain sync no-ops.
+COMMAND="uv sync --reinstall-package transformers && uv run examples/nemo_gym/run_grpo_nemo_gym.py \
     --config examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml \
     logger.wandb_enabled=True \
     logger.wandb.project=mopd \

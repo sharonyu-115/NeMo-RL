@@ -62,6 +62,19 @@ kill $TRAIN_PID 2>/dev/null || true
 pkill -f "ray::" 2>/dev/null || true
 pkill -f "run_grpo" 2>/dev/null || true
 sleep 5
+# Fully stop Ray so no raylet can spawn workers (whose uv-run py_executables
+# would race the final base-env sync below and corrupt it).
+ray stop --force 2>/dev/null || true
+pkill -9 -f raylet 2>/dev/null || true
+sleep 5
+
+# Leave the base env in the no-extras state the training drivers use, and
+# verify it imports cleanly BEFORE the container is saved. Extras-flipping
+# syncs (uv conflict groups) have left transformers as a broken namespace
+# package here before — that must never be baked in.
+echo "=== Final base-env sync + import verification ==="
+uv sync --reinstall-package transformers
+uv run python -c "from transformers import AutoProcessor; import transformers; print(f'base transformers OK: {transformers.__version__}')"
 
 echo "=== Verifying package versions ==="
 MEGATRON_VENV=/opt/ray_venvs/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker
@@ -82,7 +95,9 @@ done
 # Stamp the fingerprint so future runs of this checkout skip the in-place
 # drift sync (the root cause of the venv corruption).
 echo "=== Updating container fingerprint ==="
-uv run python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
+# Use the env python directly — another `uv run` here could resync the env
+# after the verification above.
+/opt/nemo_rl_venv/bin/python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 cat /opt/nemo_rl_container_fingerprint
 
 echo "=== Environment refresh complete: $(date) ==="

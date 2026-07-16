@@ -1,0 +1,37 @@
+defaults: mopd-qwen3-1.7b-3n8g-megatron-pack.yaml
+# Multi-teacher MOPD: math + instruction-following, Qwen3-1.7B student,
+# Qwen3-4B-2507 specialist teachers. Arm 3 (multi-teacher) is the yaml
+# default; Arms 1/2 override both agent mappings to a single checkpoint via
+# CLI (dedup collapses them onto one teacher worker group / one node).
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 4
+  max_num_steps: 150
+  val_period: 25
+  val_at_start: true
+  val_batch_size: 32
+checkpointing:
+  enabled: true
+  save_period: 25
+  keep_top_k: 2
+policy:
+  generation:
+    # 1.7B thinking-mode student on competition math overruns 2048 and
+    # overlong_filtering would silently starve the math half of each batch.
+    max_new_tokens: 4096
+data:
+  train:
+    data_path: "${oc.env:HF_HOME}/mopd_mt_data/train-split.jsonl"
+  validation:
+    data_path: "${oc.env:HF_HOME}/mopd_mt_data/val-split.jsonl"
+logger:
+  wandb:
+    project: mopd
+    name: mopd-mt-arm3
+cluster:
+  num_nodes: 4
+on_policy_distillation:
+  teacher_model_by_agent_name:
+    math_with_judge_simple_agent: Qwen/Qwen3-4B-Thinking-2507
+    instruction_following_simple_agent: Qwen/Qwen3-4B-Instruct-2507
+  default_teacher_alias: math_with_judge_simple_agent

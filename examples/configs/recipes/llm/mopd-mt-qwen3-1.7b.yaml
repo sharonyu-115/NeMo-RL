@@ -30,8 +30,12 @@ logger:
     name: mopd-mt-arm3
 cluster:
   num_nodes: 4
+# NOTE: OmegaConf deep-merges this dict with the parent recipe's, so adding a
+# math-specific alias would leave the parent's `default_teacher: Qwen3-1.7B`
+# entry alive as a THIRD teacher (3 reserved nodes -> no GPUs left to train).
+# Instead the parent's `default_teacher` key IS the math teacher: math rows are
+# unmapped and fall back to default_teacher_alias -> default_teacher.
 on_policy_distillation:
   teacher_model_by_agent_name:
-    math_with_judge_simple_agent: Qwen/Qwen3-4B-Thinking-2507
+    default_teacher: Qwen/Qwen3-4B-Thinking-2507
     instruction_following_simple_agent: Qwen/Qwen3-4B-Instruct-2507
-  default_teacher_alias: math_with_judge_simple_agent

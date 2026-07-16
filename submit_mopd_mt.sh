@@ -42,7 +42,7 @@ for i in $(seq 1 ${NUM_JOBS}); do
   JOB_ID=$(
   COMMAND="uv run examples/nemo_gym/run_grpo_nemo_gym.py \
       --config examples/configs/recipes/llm/mopd-mt-qwen3-1.7b.yaml \
-      on_policy_distillation.teacher_model_by_agent_name.math_with_judge_simple_agent=${MATH_T} \
+      on_policy_distillation.teacher_model_by_agent_name.default_teacher=${MATH_T} \
       on_policy_distillation.teacher_model_by_agent_name.instruction_following_simple_agent=${IF_T} \
       cluster.num_nodes=${NODES} \
       logger.wandb_enabled=True \

@@ -110,3 +110,37 @@ distillation is required to measure math gains at this scale.
 3. Mode-matched specialist pair (e.g., two thinking-mode teachers RL-tuned on
    different domains) for a clean H2 test.
 4. File upstream: findings 5-8 + the two design rules as MOPD docs additions.
+
+## Addendum — wandb step-level analysis (post-hoc, all 150 steps per arm)
+
+Per-arm training health (wandb runs y2iq91d4 / swkgsr07 / zrrubccl):
+
+| Metric (150 steps) | arm1 (Thinking) | arm2v2 (generalist) | arm3v2 (multi) |
+|---|---|---|---|
+| teacher−student logprob gap (mean) | −0.327 | −0.184 | −0.291 |
+| adv_std | 1.15 | 0.82 | 1.12 |
+| `token_mult_prob_error>1.1` steps | 1 (max 1.107) | 0 (max 1.056) | **42 (max 1.349)** |
+| masked seqs by logprob error (mean/max per step) | 0.19 / 2 | 0.01 / 1 | **1.47 / 25** |
+| grad_norm (typical) | 3.3–4.6 | 2.1–2.4 | 3.5–5.7 |
+| gen_kl_error plateau | ~0.005 | ~0.002-0.006 | ~0.011 |
+| NaN / grad spikes | none | none | none |
+
+- **The gap is negative everywhere** (teacher assigns lower likelihood to the
+  student's sampled tokens than the student itself — the advantage mostly
+  *suppresses* current behavior), with magnitude ordered by teacher–student
+  distribution distance: Thinking-2507 (−0.33) > multi (−0.29) > generalist 4B
+  (−0.18). It barely shrinks over 150 steps at lr 3e-6.
+- **The multi-teacher arm carries measurably more off-policy stress**: it is the
+  only arm violating the `token_mult_prob_error < 1.1` bar (42/150 steps) and
+  masks up to 25 seqs/step via `seq_logprob_error_threshold` — two teachers
+  pulling domain-disjoint directions between refits. Worth a lower LR or
+  tighter refit cadence in future multi-teacher runs.
+- **Correction to Finding 2 (training side)**: `train/truncation_rate` = 0.0 in
+  all arms even though median/p95 `gen_tokens_per_turn` sit at the 4096 cap —
+  the gym rollout path does not populate the hit-max-tokens flag, so
+  `overlong_filtering: true` was a **no-op** (upstream finding #9): nothing was
+  dropped from training; instead OPD trained on unfinished truncated reasoning.
+  The eval-side mechanism (answers cut before `\boxed{}`) stands.
+- Aggregate wandb `validation/accuracy` (val_at_start + 6 periodic): arm2v2
+  finishes best (0.153) vs arm1/arm3v2 (0.108 both) — consistent with the
+  per-domain table; the distribution-closest teacher also trained most stably.

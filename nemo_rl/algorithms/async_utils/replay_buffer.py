@@ -411,6 +411,28 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
             self._truncate_to_max_size(current_training_step)
 
+            # The persisted watermark can reference targets whose trajectories
+            # were still in flight at save time (never persisted) or were
+            # filtered out above. Trusting it makes the collector skip
+            # regenerating those targets while the trainer waits for them —
+            # a permanent stall. Clamp to what the buffer actually holds so
+            # the collector regenerates the missing targets.
+            if self.target_weight_versions:
+                watermark_cap = max(self.target_weight_versions)
+            elif current_training_step is not None:
+                # Empty buffer: the trainer's next consume needs
+                # current_training_step, which must still be generatable.
+                watermark_cap = current_training_step - 1
+            else:
+                watermark_cap = 0
+            if self.last_target_weight_already_generated > watermark_cap:
+                print(
+                    "   Clamping last_target_weight_already_generated "
+                    f"{self.last_target_weight_already_generated} -> {watermark_cap} "
+                    "(persisted watermark exceeds restored trajectories)"
+                )
+                self.last_target_weight_already_generated = watermark_cap
+
             print(
                 f"ReplayBuffer restored: {len(self.trajectories)} trajectories, "
                 "last_target_weight_already_generated="

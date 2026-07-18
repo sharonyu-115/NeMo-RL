@@ -59,6 +59,8 @@ for i in $(seq 1 ${NUM_JOBS}); do
       logger.log_dir=${REPO}/results/${RUN_NAME}/logs \
       logger.monitor_gpus=True \
       checkpointing.checkpoint_dir=${REPO}/results/${RUN_NAME}/ckpts \
+      checkpointing.metric_name=null \
+      checkpointing.keep_top_k=3 \
       $*" \
   SETUP_COMMAND="rm -rf /opt/ray_venvs/nemo_rl.environments.nemo_gym.NemoGym" \
   CONTAINER=${USER_FS1}/images/nemo-rl-mopd-main-2026-07-15.sqsh \

@@ -152,7 +152,14 @@ class AsyncTrajectoryCollector:
                 )
             ]
 
-        return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
+        # Include generation_weight_version itself: in steady state it is
+        # always <= the buffer's last-generated watermark and gets skipped by
+        # the callers' consumed-target guard, but after checkpoint resume the
+        # trainer can consume the restored buffer and bump the weight version
+        # BEFORE this collector's first reservation — the initial-window
+        # special case above never fires and target (initial_version + 1)
+        # would otherwise never be generated, deadlocking training.
+        return [generation_weight_version + i for i in range(0, max_trajectory_age + 1)]
 
     def _get_next_target_for_generation(
         self, generation_weight_version: int

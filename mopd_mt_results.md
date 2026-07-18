@@ -144,3 +144,93 @@ Per-arm training health (wandb runs y2iq91d4 / swkgsr07 / zrrubccl):
 - Aggregate wandb `validation/accuracy` (val_at_start + 6 periodic): arm2v2
   finishes best (0.153) vs arm1/arm3v2 (0.108 both) — consistent with the
   per-domain table; the distribution-closest teacher also trained most stably.
+
+# v3 — 16k budget, lr 1e-6, 300 steps, AIME24 avg@8 (2026-07-18)
+
+Reruns of the three arms with the v2 confounds removed: `max_new_tokens=16384`,
+lr 1e-6 (all arms), 300 steps as chained 4h jobs (both resume-deadlock fixes
+validated at scale: 2 handoffs × 3 arms, zero stalls), math val =
+`BytedTsinghua-SIA/AIME-2024` avg@8 (240 rows, train-identical formatting), IF val
+unchanged (64 rows). wandb `nv-welcome/mopd`, runs `mopd-mt16k-arm{1,2,3}`
+(note: each chain link opens a new run under the same name).
+
+## Per-domain val (math = AIME24 avg@8 over 240 rows; IF = 64 rows; noise ~±0.02-0.06)
+
+| step | arm1 math/IF (Thinking) | arm2 math/IF (generalist) | arm3 math/IF (multi) |
+|---|---|---|---|
+| 0 | 0.383 / 0.312 | 0.383 / 0.281 | 0.404 / 0.281 |
+| 50 | 0.283 / 0.453 | 0.342 / 0.297 | 0.271 / 0.250 |
+| 100 | 0.279 / 0.547 | 0.354 / 0.328 | 0.308 / 0.297 |
+| 150 | 0.258 / 0.484 | 0.350 / 0.312 | 0.279 / 0.266 |
+| 200 | 0.283 / 0.516 | 0.379 / 0.328 | 0.267 / 0.266 |
+| 250 | 0.254 / 0.547 | 0.371 / 0.312 | 0.279 / 0.297 |
+| 300 | 0.283 / 0.453 | 0.358 / 0.266 | 0.233 / 0.297 |
+
+## Finding 3 — v2's math story was measurement artifact; true baseline is 0.38-0.40
+
+At 16k the untrained student scores **0.38-0.40 avg@8 on AIME24** (vs 0.10-0.14
+"measured" at 4k in v2) and needs 10-12k tokens per solution. No cap pinning in v3
+(train gens ~8k mean, val ~12.3k < 16384); truncation no longer confounds anything.
+
+## Finding 4 — teacher labels do not predict per-domain transfer (headline)
+
+Under reverse-KL OPD on an already-post-trained student:
+- The **math-specialist** teacher (Thinking-2507) **degrades math** (arm1: 0.383→0.283,
+  −0.10 stable across steps 50-300) while **massively improving IF**
+  (0.312→0.453-0.547, up to **+0.24**, far beyond noise).
+- The **generalist** (Qwen3-4B) holds math nearly flat (−0.02, best math retention)
+  with flat IF.
+
+Interpretation: dense token-level distillation transfers a teacher's *behavioral
+style* (deliberate, constraint-following long reasoning → IF gains), while pulling an
+RL-polished student's token distribution toward even a stronger teacher's can degrade
+its calibrated task behavior (math loss). "Specialist" benchmark rankings do not
+translate into per-domain OPD gains.
+
+## Finding 5 — multi-teacher routing composes per-domain effects faithfully
+
+Arm3's math curve tracks arm1's math (Thinking-taught rows: 0.23-0.31 vs 0.25-0.28)
+and arm3's IF tracks arm2's IF (generalist-taught rows: 0.25-0.30 vs 0.27-0.33) at
+every checkpoint. **The multi-teacher mechanism does exactly what it promises —
+per-domain effects compose additively.** Arm3 underperformed only because the
+teacher→domain assignment was (per Finding 4) inverted relative to what the teachers
+actually transfer: the data implies the optimal routing here was Thinking→IF,
+generalist→math — the mirror of the "obvious" assignment.
+
+## H1/H2 verdict (final)
+
+- **H1 rejected**: specialists did not improve "their" domains; the math specialist
+  improved the *other* domain.
+- **H2 split verdict**: the *mechanism* (per-domain-best composition) is validated —
+  arm3 = arm1's math effect + arm2's IF effect, cleanly. The *premise* (you know which
+  teacher is best per domain a priori) is rejected. Multi-teacher MOPD is only as good
+  as the routing table, and the routing table needs empirical per-domain transfer
+  measurements (cheap single-teacher probes), not benchmark labels.
+
+## Training health (wandb, last-link histories)
+
+lr 1e-6 eliminated the v2 drift entirely: `token_mult_prob_error>1.1` on **0 steps**
+in all arms (max ≤ 1.018 vs 42 violations at 3e-6), masked-seqs ≈ 0, no grad
+anomalies; teacher-student gap ≈ −0.22…−0.27 and roughly flat (300 steps at 1e-6
+barely moves the distribution — capability changes above are style-level, consistent
+with Finding 4).
+
+## Additional upstream/infra findings (continuing the list)
+
+9. Gym rollouts never set the hit-max-tokens flag (from the v2 addendum; still true).
+10. Chained runs: metric-based `keep_top_k` prunes the newest checkpoint and
+    `checkpoint_must_save_by` saves are unretained without val metrics at that step —
+    resume chains must set `checkpointing.metric_name=null` (recency retention).
+11. Each chain link opens a new wandb run with the same name — per-name history is
+    last-link-only; use TB/val_data dumps for full curves.
+12. IF server checker crashes on some rows (`count_increment_word: 'list' object has
+    no attribute 'strip'`) — data-quality issue, zeroes those rewards uniformly.
+13. The two-part async-resume fix (buffer watermark clamp + collector target-window
+    including current version) survived 6 real mid-training handoffs — upstream-ready.
+
+## Suggested next iteration
+
+**Arm 4 (optimal routing)**: math→Qwen3-4B, IF→Thinking-2507 — Finding 4 predicts it
+beats all three existing arms on both domains simultaneously; one 4-node chain
+(~30 node-hours) turns Finding 5's compositionality into a constructive win and gives
+H2 a proper affirmative test with an empirically-derived routing table.

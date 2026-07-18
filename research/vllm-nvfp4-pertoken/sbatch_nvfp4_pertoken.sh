@@ -31,7 +31,7 @@ fi
 : "${MODEL_SMALL:?set MODEL_SMALL in .env}"
 
 RUN_CHECKS="${RUN_CHECKS:-check_a or check_b or check_c or check_d}"
-RESULTS_DIR="${SCRIPT_DIR}/results/${SLURM_JOB_ID}"
+RESULTS_DIR="${RESULTS_DIR_OVERRIDE:-${SCRIPT_DIR}/results/${SLURM_JOB_ID}}"
 mkdir -p "${RESULTS_DIR}" "${SCRIPT_DIR}/logs"
 
 # Repo root (for the pertoken overlay's import of nemo_rl sources when needed).

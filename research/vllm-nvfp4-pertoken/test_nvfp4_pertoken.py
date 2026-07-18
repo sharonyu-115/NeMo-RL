@@ -154,13 +154,14 @@ def _cb_count_static_input_scales(model) -> int:
 
 
 def _cb_perturb_first_moe_scale(model) -> bool:
-    # In-place mul on the kernel-format global weight scale: the FusedMoE
-    # quant config references the same tensor (g1_alphas), so no kernel
-    # rebuild is needed — and process_weights_after_loading is NOT
-    # idempotent on kernel-format params (it expects checkpoint layout).
+    # Corrupt the packed FP4 weight bytes of the first MoE layer's expert 0.
+    # Scale params are unsuitable probes: the TRT-LLM kernel fuses global
+    # scales into its own state at setup, so post-setup param mutation is
+    # invisible to compute. The packed weights are read at runtime.
     for module in model.modules():
-        if hasattr(module, "w13_weight_scale_2"):
-            module.w13_weight_scale_2.data.mul_(2.0)
+        w = getattr(module, "w13_weight", None)
+        if w is not None and w.dtype == torch.uint8:
+            w.data[0] ^= 0xFF
             return True
     return False
 

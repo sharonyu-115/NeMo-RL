@@ -49,9 +49,29 @@ calibration in the rollout path.
 
 Run: `sbatch sbatch_nvfp4_pertoken.sh` (or `RUN_CHECKS=A,B ./sbatch_...` to select).
 
-## Findings
+## Verdict (2026-07-18): **GO for Stage-2 wiring**
 
-(TODO — filled as checks complete)
+All four Stage-1 questions answered affirmatively on GB200 + vLLM nightly
+(0.23.1rc1.dev1261):
+
+1. **Kernel feasibility** — pre-quantized ModelOpt NVFP4 weights + per-token
+   dynamic activation scales run through the FlashInfer TRT-LLM fused MoE
+   (`pertoken_overlay.py`, ~90 lines, structured to graduate directly into
+   #2983's `vllm_modelopt.py` as the `w4a4_pertoken` registered config).
+2. **Fidelity** — per-token beats calibrated static scales by ~22%
+   avg_prob_mult_error on identical quantized weights (1.690 vs 2.180).
+3. **Reload/refit correctness** — identity reload is token-identical and
+   corrupt-then-reload restores baseline, provided kernel scale tensors are
+   contiguous (fix included in the overlay; #2983 already does this).
+4. **Parallelism** — TP=2 works (upstream's initial TP `NotImplementedError`
+   constraint is gone), unblocking multi-GPU rollout.
+
+Bonus finding: upstream's `_quantize_moe_weight_to_nvfp4` emits exactly the
+ModelOpt checkpoint tensor layout, bitwise-deterministically — the same
+export contract also serves the future no-ModelOpt (TE-training +
+quantize-at-refit) flow.
+
+## Findings
 
 | Check | Status | Notes |
 |---|---|---|
@@ -60,7 +80,8 @@ Run: `sbatch sbatch_nvfp4_pertoken.sh` (or `RUN_CHECKS=A,B ./sbatch_...` to sele
 | A TP=2 | PASS — **TP works now** (job 2404103) | Survey's "TP raises NotImplementedError" is outdated; nightly initializes TP=2 and generates sanely. Removes the biggest wiring blocker for multi-GPU rollout |
 | B.1 external-quant layout + determinism | PASS (job 2404103) | `_quantize_moe_weight_to_nvfp4` output = ModelOpt ckpt layout (uint8 packed / fp8-e4m3 block / fp32 global); bitwise deterministic |
 | B.2 hybrid per-token overlay (GO/NO-GO) | **PASS** (job 2404103) | Pre-quantized ModelOpt NVFP4 weights + per-token dynamic activations generate sanely through FlashInfer TRT-LLM; `ModelOptNvFp4PerTokenFusedMoE` active. The NeMo-RL to-be flow is kernel-feasible |
-| C reload determinism | FINDING (job 2404103, retest pending) | `reload_weights` fails on stride-0 expanded scale views: layerwise-reload finalize `param.data.copy_()` cannot write into them ("more than one element ... single memory location"). Affects upstream `nvfp4_per_token` (upstream bug, matches RFC #48312) AND the v1 overlay — overlay fixed with `.contiguous()` (same as #2983's approach); upstream path also blocked by `_already_called_process_weights_after_loading` guard skipping re-quantization on reload |
+| C reload determinism — hybrid overlay | **PASS** (job 2404172) | With the overlay's `.contiguous()` fix: identity `reload_weights` reproduces greedy outputs token-identically; corrupting packed FP4 weight bytes changes outputs; reload restores the baseline exactly. The RL refit contract holds for the to-be flow |
+| C reload determinism — upstream `nvfp4_per_token` | XFAIL, upstream bug (jobs 2404119/2404153) | `reload_weights` fails on stride-0 expanded scale views: layerwise-reload finalize `param.data.copy_()` cannot write into them. Upstream `Nvfp4OnlineMoEMethod` needs the same `.contiguous()` treatment (matches RFC #48312 risk list). Not a blocker for NeMo-RL, whose path uses the (fixed) overlay approach | |
 | D fidelity (per-token / static / hybrid vs BF16) | **PASS — thesis validated** (job 2404135) | See table below. On identical pre-quantized weights, per-token dynamic activation scales beat calibrated static scales by ~22% |
 
 ### Fidelity results (2026-07-18, job 2404135)

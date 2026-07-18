@@ -39,17 +39,46 @@ IF_AGENT = {
 
 SEED = 42
 N_TRAIN_PER_DOMAIN = 8000
-N_VAL_MATH_HELDOUT = 128
 N_VAL_IF_HELDOUT = 64
 
 # Required by InstructionFollowingRunRequest (gym IF server app.py).
 IF_REQUIRED_KEYS = {"id", "instruction_id_list", "prompt", "kwargs"}
 
+# v3: math val = DAPO's canonical AIME-2024 eval (960 rows = 30 problems x 32
+# repeats), formatted identically to DAPO-17k train rows, capped for avg@k.
+AIME_REPEATS_PER_PROBLEM = 8
+
+
+def aime24_dapo_rows(repeats_per_problem: int) -> list[dict]:
+    from datasets import load_dataset
+
+    ds = load_dataset("BytedTsinghua-SIA/AIME-2024", split="train")
+    seen: dict[str, int] = {}
+    rows = []
+    for example in ds:
+        q = example["prompt"][0]["content"]
+        if seen.get(q, 0) >= repeats_per_problem:
+            continue
+        seen[q] = seen.get(q, 0) + 1
+        rows.append(
+            {
+                "agent_ref": MATH_AGENT,
+                "responses_create_params": {"input": example["prompt"]},
+                "question": q,
+                "expected_answer": example["reward_model"]["ground_truth"],
+            }
+        )
+    print(
+        f"AIME24(DAPO): {len(seen)} problems x <={repeats_per_problem} repeats "
+        f"= {len(rows)} rows"
+    )
+    return rows
+
 
 def main() -> None:
     hf_home = os.environ["HF_HOME"]
     src = Path(hf_home) / "nanov3_data"
-    out = Path(hf_home) / "mopd_mt_data"
+    out = Path(hf_home) / "mopd_mt_data_v3"
     out.mkdir(parents=True, exist_ok=True)
     rng = random.Random(SEED)
 
@@ -58,10 +87,9 @@ def main() -> None:
     assert all(r["agent_ref"]["name"] == MATH_AGENT["name"] for r in math_rows[:5])
     rng.shuffle(math_rows)
     math_train = math_rows[:N_TRAIN_PER_DOMAIN]
-    math_val = math_rows[N_TRAIN_PER_DOMAIN : N_TRAIN_PER_DOMAIN + N_VAL_MATH_HELDOUT]
 
-    # AIME24 val rows (already staged with math agent_ref).
-    aime_val = [json.loads(l) for l in open(src / "val-split.jsonl")]
+    # v3 math val: DAPO-format AIME24 avg@k rows (train/eval format identical).
+    aime_val = aime24_dapo_rows(AIME_REPEATS_PER_PROBLEM)
 
     # IF: the exact artifact the gym IF agent config declares as its train set.
     if_path = hf_hub_download(
@@ -81,7 +109,10 @@ def main() -> None:
 
     train = math_train + if_train
     rng.shuffle(train)
-    val = aime_val + math_val + if_val
+    # Fixed val order matters for per-domain analysis: math (AIME avg@k) rows
+    # first, then IF. The DAPO held-out slice is dropped in v3 (AIME avg@8
+    # provides the sensitivity single-shot AIME lacked).
+    val = aime_val + if_val
 
     with open(out / "train-split.jsonl", "w") as f:
         for r in train:
@@ -92,7 +123,7 @@ def main() -> None:
 
     print(
         f"train: {len(train)} rows ({len(math_train)} math + {len(if_train)} IF); "
-        f"val: {len(val)} rows ({len(aime_val)} AIME24 + {len(math_val)} DAPO held-out "
+        f"val: {len(val)} rows ({len(aime_val)} AIME24-avg@{AIME_REPEATS_PER_PROBLEM} "
         f"+ {len(if_val)} IF held-out) -> {out}"
     )
 

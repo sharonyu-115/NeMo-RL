@@ -1,10 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=nvfp4-pertoken-probe
-#SBATCH --account=coreai_dlalgo_nemorl
-#SBATCH --partition=batch
+#SBATCH --job-name=general_sa-nemo_rl.nvfp4-pertoken-probe
+#SBATCH --account=general_sa
+#SBATCH --partition=batch,tcpo,36x2-a01r,a02grace
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=4
 #SBATCH --time=04:00:00
 #SBATCH --exclusive
 #SBATCH --output=logs/nvfp4-pertoken-%j.out
@@ -51,10 +50,33 @@ export RESULTS_DIR='${RESULTS_DIR}'
 export PYTHONPATH='${SCRIPT_DIR}:${REPO_ROOT}'
 export VLLM_LOGGING_LEVEL=\"\${VLLM_LOGGING_LEVEL:-INFO}\"
 
-python -c 'import vllm; print(\"vllm\", vllm.__version__, getattr(vllm, \"__commit__\", \"?\"))'
+python3 -c 'import vllm; print(\"vllm\", vllm.__version__, getattr(vllm, \"__commit__\", \"?\"))'
 
-pip install -q pytest 2>/dev/null || true
+python3 -m pip install -q pytest 2>/dev/null || true
 cd '${SCRIPT_DIR}'
-python -m pytest -v -s test_nvfp4_pertoken.py -k \"${RUN_CHECKS}\" \
-    --junitxml=\"${RESULTS_DIR}/junit.xml\" 2>&1
+
+# One pytest process per check: engines leak KV-cache GPU memory across
+# in-process engine rebuilds, so hard process isolation is the only reliable
+# teardown. Failures do not stop later checks.
+# Reload checks (check_c_*) run LAST: a reload crash can leave the GPU with
+# dying engine procs that poison the next engine init.
+CHECKS=\"\${RUN_CHECKS_LIST:-check_a_smoke_small check_a_smoke_qwen30b check_a_tp2 check_b1 check_b2 check_d1 check_d2 check_d3 check_d4 check_d5 check_c_reload_pertoken_small check_c_reload_hybrid}\"
+wait_gpu_free() {
+    for _ in \$(seq 1 60); do
+        free_mb=\$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0)
+        [ \"\${free_mb}\" -gt 150000 ] && return 0
+        sleep 5
+    done
+    echo \"WARN: GPU0 still busy after 5min (free=\${free_mb}MB)\"
+}
+overall=0
+for chk in \${CHECKS}; do
+    wait_gpu_free
+    echo \"================ RUNNING \${chk} ================\"
+    python3 -m pytest -v -s -o addopts= --durations=5 test_nvfp4_pertoken.py \
+        -k \"\${chk}\" --junitxml=\"${RESULTS_DIR}/junit-\${chk}.xml\" 2>&1 \
+        || { echo \"CHECK_FAILED \${chk}\"; overall=1; }
+done
+echo \"================ SUITE DONE (overall=\${overall}) ================\"
+exit \${overall}
 "

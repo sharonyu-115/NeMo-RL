@@ -20,11 +20,12 @@ calibration in the rollout path.
 
 | Item | Value |
 |---|---|
-| Container | `/lustre/fsw/general_sa/shuangy/images/vllm-nightly-2026-07-18.sqsh` |
-| Image source | `docker://vllm/vllm-openai:nightly` (digest: TODO after import) |
-| vLLM commit | TODO (must postdate 2026-07-16, PR #48538) |
-| Hardware | 1× GB200 node (feature is SM100-only, MoE-only, TP=1 only) |
-| Models | `Qwen/Qwen3-30B-A3B` (BF16), `nvidia/Qwen3-30B-A3B-NVFP4` (static-scale baseline) |
+| Container | `/lustre/fsw/general_sa/shuangy/images/vllm-nightly-2026-07-18.sqsh` (7.1G) |
+| Image source | `docker://vllm/vllm-openai:nightly` imported 2026-07-18 |
+| vLLM version | `0.23.1rc1.dev1261+gc71a583aa` (postdates #48538, merged 2026-07-16) |
+| Hardware | 1× GB200 node, 4× GB200 SM100 189GB (feature is SM100-only, MoE-only, TP=1 only) |
+| Models | `Qwen/Qwen3-30B-A3B` (BF16), `nvidia/Qwen3-30B-A3B-NVFP4` (static baseline), `ibm-granite/granite-3.0-1b-a400m-base` (fast-iteration MoE) |
+| Slurm | account `general_sa`, `--partition=batch,tcpo,36x2-a01r,a02grace`, whole-node exclusive (no GPU GRES), job names `general_sa-nemo_rl.<details>` |
 
 ## Checks
 
@@ -54,12 +55,13 @@ Run: `sbatch sbatch_nvfp4_pertoken.sh` (or `RUN_CHECKS=A,B ./sbatch_...` to sele
 
 | Check | Status | Notes |
 |---|---|---|
-| Stage-0 gates | | |
-| A smoke | | |
-| B.1 external-quant equivalence | | |
-| B.2 hybrid per-token overlay | | |
-| C reload determinism | | |
-| D fidelity (per-token / static vs BF16) | | |
+| Stage-0 gates | PASS (2026-07-18, job 2404072) | vLLM 0.23.1rc1.dev1261+gc71a583aa; `Nvfp4OnlineMoEMethod` importable; `make_nvfp4_moe_kernel(per_token_activation=...)` present; `has_flashinfer_trtllm_fused_moe()=True` on GB200 SM100 |
+| A smoke (granite + Qwen3-30B) | PASS (job 2404103) | `nvfp4_per_token` loads and generates sanely on both; `Nvfp4OnlineMoEMethod` active on every MoE layer; `FLASHINFER_TRTLLM` backend selected |
+| A TP=2 | PASS — **TP works now** (job 2404103) | Survey's "TP raises NotImplementedError" is outdated; nightly initializes TP=2 and generates sanely. Removes the biggest wiring blocker for multi-GPU rollout |
+| B.1 external-quant layout + determinism | PASS (job 2404103) | `_quantize_moe_weight_to_nvfp4` output = ModelOpt ckpt layout (uint8 packed / fp8-e4m3 block / fp32 global); bitwise deterministic |
+| B.2 hybrid per-token overlay (GO/NO-GO) | **PASS** (job 2404103) | Pre-quantized ModelOpt NVFP4 weights + per-token dynamic activations generate sanely through FlashInfer TRT-LLM; `ModelOptNvFp4PerTokenFusedMoE` active. The NeMo-RL to-be flow is kernel-feasible |
+| C reload determinism | FINDING (job 2404103, retest pending) | `reload_weights` fails on stride-0 expanded scale views: layerwise-reload finalize `param.data.copy_()` cannot write into them ("more than one element ... single memory location"). Affects upstream `nvfp4_per_token` (upstream bug, matches RFC #48312) AND the v1 overlay — overlay fixed with `.contiguous()` (same as #2983's approach); upstream path also blocked by `_already_called_process_weights_after_loading` guard skipping re-quantization on reload |
+| D fidelity (per-token / static / hybrid vs BF16) | pending (job 2404119) | |
 
 ### Log markers for Stage-2 assert_grep
 

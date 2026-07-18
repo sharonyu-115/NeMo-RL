@@ -112,6 +112,12 @@ def _make_llm(model: str, quantization: str | None = None, tp: int = 1, **kw):
 
 
 def _free(llm) -> None:
+    # del alone leaks the EngineCore child procs and their ~155GiB KV cache,
+    # killing every subsequent engine init in this process.
+    try:
+        llm.llm_engine.shutdown()
+    except AttributeError:
+        pass
     del llm
     gc.collect()
     torch.cuda.empty_cache()
@@ -122,34 +128,54 @@ def _skip_if_missing(path: str) -> None:
         pytest.skip(f"model not downloaded yet: {path}")
 
 
-def _moe_quant_method_names(llm) -> list[str]:
-    """Type names of every FusedMoE/RoutedExperts quant method in the model."""
+# apply_model / collective_rpc callbacks must be module-level: they are sent
+# to worker processes via plain pickle (shm broadcast), which cannot serialize
+# closures even with VLLM_ALLOW_INSECURE_SERIALIZATION=1.
 
-    def collect(model):
-        names = []
-        for module in model.modules():
+
+def _cb_collect_moe_method_names(model) -> list[str]:
+    names = []
+    for module in model.modules():
+        method = getattr(module, "_quant_method", None) or getattr(
+            module, "quant_method", None
+        )
+        if method is not None and "MoE" in type(method).__name__:
+            names.append(type(method).__name__)
+    return names
+
+
+def _cb_count_static_input_scales(model) -> int:
+    total = 0
+    for name, param in model.named_parameters():
+        if name.endswith(("w13_input_scale", "w2_input_scale")):
+            if param.dim() >= 2:  # checkpoint layout, not neutral/converted
+                total += 1
+    return total
+
+
+def _cb_perturb_first_moe_scale(model) -> bool:
+    for module in model.modules():
+        if hasattr(module, "w13_weight_scale_2"):
+            module.w13_weight_scale_2.data.mul_(2.0)
             method = getattr(module, "_quant_method", None) or getattr(
                 module, "quant_method", None
             )
-            if method is not None and "MoE" in type(method).__name__:
-                names.append(type(method).__name__)
-        return names
+            if hasattr(method, "moe_quant_config"):
+                method.process_weights_after_loading(module)
+            return True
+    return False
 
-    return [n for worker in llm.apply_model(collect) for n in worker]
+
+def _moe_quant_method_names(llm) -> list[str]:
+    """Type names of every FusedMoE/RoutedExperts quant method in the model."""
+    return [
+        n for worker in llm.apply_model(_cb_collect_moe_method_names) for n in worker
+    ]
 
 
 def _static_input_scale_param_count(llm) -> int:
     """Count leftover checkpoint-shaped (E, 2) input-scale params on MoE layers."""
-
-    def count(model):
-        total = 0
-        for name, param in model.named_parameters():
-            if name.endswith(("w13_input_scale", "w2_input_scale")):
-                if param.dim() >= 2:  # checkpoint layout, not neutral/converted
-                    total += 1
-        return total
-
-    return sum(llm.apply_model(count))
+    return sum(llm.apply_model(_cb_count_static_input_scales))
 
 
 def _greedy(llm, prompts: list[str], max_tokens: int = 32):
@@ -277,18 +303,26 @@ def test_check_a_smoke_qwen30b():
     _free(llm)
 
 
-def test_check_a_tp2_raises():
-    """TP>1 is documented-unsupported; must fail loudly, not silently degrade."""
+def test_check_a_tp2_support():
+    """Record whether TP>1 works (upstream #48538 initially raised
+    NotImplementedError; nightly 0.23.1rc1 no longer does — verify it
+    generates sanely rather than silently degrading)."""
     _skip_if_missing(MODEL_SMALL)
     if torch.cuda.device_count() < 2:
         pytest.skip("needs 2 GPUs")
-    with pytest.raises(Exception) as excinfo:
+    try:
         llm = _make_llm(MODEL_SMALL, quantization="nvfp4_per_token", tp=2)
-        _free(llm)
-    msg = str(excinfo.value) + str(getattr(excinfo.value, "__cause__", ""))
-    assert "NotImplemented" in msg or "not implemented" in msg.lower() or "TP" in msg, (
-        f"TP=2 failed for an unexpected reason: {msg[:500]}"
-    )
+    except Exception as e:  # noqa: BLE001 - the old documented behavior
+        _save("check_a_tp2", {"tp2_works": False, "error": repr(e)[:500]})
+        return
+    names = _moe_quant_method_names(llm)
+    assert names and all(n == "Nvfp4OnlineMoEMethod" for n in names), names
+    results = _greedy(llm, SMOKE_PROMPTS)
+    for r in results:
+        assert r["token_ids"], "empty generation under TP=2"
+        assert all(lp == lp for lp in r["logprobs"]), "NaN logprob under TP=2"
+    _save("check_a_tp2", {"tp2_works": True})
+    _free(llm)
 
 
 # ---------------------------------------------------------------- check B
@@ -351,20 +385,9 @@ def _reload_weights(llm) -> None:
 
 
 def _perturb_layer0_scale(llm) -> None:
-    def perturb(model):
-        for module in model.modules():
-            if hasattr(module, "w13_weight_scale_2"):
-                module.w13_weight_scale_2.data.mul_(2.0)
-                method = getattr(module, "_quant_method", None) or getattr(
-                    module, "quant_method", None
-                )
-                if hasattr(method, "moe_quant_config"):
-                    # rebuild kernel view of the scales
-                    method.process_weights_after_loading(module)
-                return True
-        return False
-
-    assert any(llm.apply_model(perturb)), "no MoE layer found to perturb"
+    assert any(llm.apply_model(_cb_perturb_first_moe_scale)), (
+        "no MoE layer found to perturb"
+    )
 
 
 def _run_reload_check(model: str, quantization: str) -> dict:

@@ -1852,7 +1852,50 @@ class MegatronPolicyWorkerImpl(
             )
         return param_info
 
+    def _nvfp4_pertoken_rollout_cfg(self):
+        """Validated per-token NVFP4 rollout config, or None when disabled."""
+        generation_cfg = self.cfg.get("generation")
+        if (
+            not generation_cfg
+            or generation_cfg.get("backend") != "vllm"
+            or not (generation_cfg.get("nvfp4_pertoken_rollout") or {}).get("enabled")
+        ):
+            return None
+        from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
+            NvFp4PerTokenRolloutConfig,
+        )
+
+        return NvFp4PerTokenRolloutConfig.model_validate(
+            generation_cfg["nvfp4_pertoken_rollout"]
+        )
+
     def _iter_params_with_optional_kv_scales(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield exported HF parameters (quantized when a quantized-rollout
+        mode is active) and optionally append FP8 KV/Q scale tensors.
+
+        All refit surfaces (prepare_refit_info metadata, ZMQ IPC streaming,
+        collective broadcast) consume this iterator, so wrapping it keeps the
+        advertised state-dict info and the streamed payloads consistent.
+        """
+        base_iter = self._iter_params_with_optional_kv_scales_impl(kv_scales)
+        rollout_cfg = self._nvfp4_pertoken_rollout_cfg()
+        if rollout_cfg is None:
+            yield from base_iter
+            return
+        from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
+            iter_nvfp4_pertoken_weights,
+        )
+
+        yield from iter_nvfp4_pertoken_weights(
+            base_iter,
+            quant_patterns=rollout_cfg.quant_patterns,
+            ignore_patterns=rollout_cfg.resolved_ignore(),
+        )
+
+    def _iter_params_with_optional_kv_scales_impl(
         self,
         kv_scales: Optional[dict[str, float]] = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:

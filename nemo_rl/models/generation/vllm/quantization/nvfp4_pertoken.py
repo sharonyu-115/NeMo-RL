@@ -30,9 +30,10 @@ The producer matches vLLM's online-quant kernel
 
 import fnmatch
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Optional
 
 import torch
+from pydantic import BaseModel
 
 # Layers kept in native precision during rollout (mirrors the ModelOpt path's
 # default; that path re-exports this constant so the dependency points from
@@ -47,6 +48,28 @@ DEFAULT_NVFP4_IGNORE: list[str] = [
     "*post_attention_layernorm*",
     "*norm*",
 ]
+
+class NvFp4PerTokenRolloutConfig(BaseModel, extra="allow"):
+    """User config for the per-token NVFP4 W4A4 rollout.
+
+    ``policy.generation.nvfp4_pertoken_rollout`` in YAML. Mutually exclusive
+    with the ModelOpt QAT rollout keys (``quant_cfg`` / ``real_quant``).
+
+    - ``enabled``: turn the mode on (quantized refit + per-token vLLM kernel).
+    - ``ignore``: HF-name patterns kept in native precision during rollout;
+      ``None`` uses :data:`DEFAULT_NVFP4_IGNORE`. Everything NOT ignored and
+      matching ``quant_patterns`` is quantized at refit.
+    - ``quant_patterns``: HF-name allowlist quantized at refit (MoE experts
+      only — the per-token kernel is MoE-only).
+    """
+
+    enabled: bool = False
+    ignore: Optional[list[str]] = None
+    quant_patterns: list[str] = ["*.experts.*"]
+
+    def resolved_ignore(self) -> list[str]:
+        return list(DEFAULT_NVFP4_IGNORE) if self.ignore is None else self.ignore
+
 
 _FP4_MAX = 6.0
 _FP8_E4M3_MAX = 448.0
@@ -146,6 +169,7 @@ def _matches_any(name: str, patterns: list[str]) -> bool:
 def iter_nvfp4_pertoken_weights(
     base_iter: Iterator[tuple[str, torch.Tensor]],
     quant_patterns: list[str],
+    ignore_patterns: Optional[list[str]] = None,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Refit filter: quantize matching ``*.weight`` tensors in an export stream.
 
@@ -159,8 +183,13 @@ def iter_nvfp4_pertoken_weights(
     Everything else (non-matching weights, biases, kv scales, draft weights)
     passes through untouched.
     """
+    ignore = ignore_patterns or []
     for name, tensor in base_iter:
-        if not (name.endswith(".weight") and _matches_any(name, quant_patterns)):
+        if (
+            not name.endswith(".weight")
+            or not _matches_any(name, quant_patterns)
+            or _matches_any(name, ignore)
+        ):
             yield name, tensor
             continue
         packed, block_scale, weight_scale_2 = quantize_nvfp4_weight(tensor)
@@ -177,12 +206,16 @@ def build_nvfp4_pertoken_hf_quant_config(ignore: list[str]) -> dict[str, Any]:
     block-16 e4m3 scales; activations dynamic (per-token global scales are
     derived inside the kernel, no ``input_scale`` tensors exist).
     """
+    # Mirrors the quantization_config of ModelOpt NVFP4 HF checkpoints
+    # (e.g. nvidia/Qwen3-30B-A3B-NVFP4 config.json) key-for-key — vLLM's
+    # ModelOpt config parser is shape-sensitive (`ignore`, not
+    # `exclude_modules`; `targets` inside the group). Only delta:
+    # input_activations.dynamic=True since no input_scale tensors exist.
     return {
         "quant_method": "modelopt",
         "quant_algo": "NVFP4",
-        "group_size": 16,
-        "kv_cache_quant_algo": None,
-        "exclude_modules": list(ignore),
+        "producer": {"name": "modelopt"},
+        "ignore": list(ignore),
         "config_groups": {
             "group_0": {
                 "weights": {
@@ -197,6 +230,7 @@ def build_nvfp4_pertoken_hf_quant_config(ignore: list[str]) -> dict[str, Any]:
                     "type": "float",
                     "group_size": 16,
                 },
+                "targets": ["Linear"],
             }
         },
     }

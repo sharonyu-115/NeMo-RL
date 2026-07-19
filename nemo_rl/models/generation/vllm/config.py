@@ -56,6 +56,12 @@ class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
 
+    # Per-token NVFP4 W4A4 rollout (TE-training flow; no ModelOpt). Mutually
+    # exclusive with quant_cfg/real_quant below. Validated against
+    # nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken
+    # .NvFp4PerTokenRolloutConfig, where the defaults live.
+    nvfp4_pertoken_rollout: NotRequired[dict[str, Any]]
+
     # quantization config
     quant_cfg: NotRequired[str | None]
     # When set with ``quant_cfg``, initialize rollout vLLM with real ModelOpt

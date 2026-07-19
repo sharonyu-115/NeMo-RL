@@ -436,13 +436,36 @@ GENERATION_WORKER_OVERRIDES = {
 }
 
 
-def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
-    """Return the quantized vLLM generation worker FQN if ``quant_cfg`` is set, else ``default_cls``.
+NVFP4_PERTOKEN_WORKER_OVERRIDES = {
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_worker.NvFp4PerTokenGenerationWorker",
+    "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_worker.NvFp4PerTokenAsyncGenerationWorker",
+}
 
+
+def _nvfp4_pertoken_enabled(config: dict) -> bool:
+    rollout_cfg = config.get("nvfp4_pertoken_rollout")
+    return bool(rollout_cfg and rollout_cfg.get("enabled"))
+
+
+def resolve_generation_worker_cls(default_cls: str, config: dict) -> str:
+    """Return the quantized vLLM generation worker FQN for the active quant mode.
+
+    Dispatches to the ModelOpt QAT workers when ``quant_cfg`` is set, or to the
+    per-token NVFP4 workers when ``nvfp4_pertoken_rollout.enabled`` is set.
+    The two modes are mutually exclusive — configuring both is an error.
     Safe to call even when ModelOpt is not installed — returns ``default_cls``
-    unchanged whenever ``quant_cfg`` is ``None``, so the core generation path
-    stays import-free of ModelOpt.
+    unchanged whenever no quant mode is configured, so the core generation
+    path stays import-free of ModelOpt.
     """
-    if config.get("quant_cfg") is None:
-        return default_cls
-    return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)
+    pertoken = _nvfp4_pertoken_enabled(config)
+    if config.get("quant_cfg") is not None:
+        if pertoken:
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout.enabled cannot be combined "
+                "with the ModelOpt rollout keys (generation.quant_cfg / "
+                "real_quant); pick one quantized-rollout mode."
+            )
+        return GENERATION_WORKER_OVERRIDES.get(default_cls, default_cls)
+    if pertoken:
+        return NVFP4_PERTOKEN_WORKER_OVERRIDES.get(default_cls, default_cls)
+    return default_cls

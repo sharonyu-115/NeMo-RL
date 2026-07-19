@@ -176,6 +176,66 @@ def test_filter_keeps_device():
 def test_hf_quant_config_shape():
     cfg = M.build_nvfp4_pertoken_hf_quant_config(["*lm_head*"])
     assert cfg["quant_algo"] == "NVFP4"
-    assert cfg["exclude_modules"] == ["*lm_head*"]
-    acts = cfg["config_groups"]["group_0"]["input_activations"]
-    assert acts["dynamic"] is True
+    assert cfg["ignore"] == ["*lm_head*"]
+    group = cfg["config_groups"]["group_0"]
+    assert group["targets"] == ["Linear"]
+    assert group["input_activations"]["dynamic"] is True
+
+
+def test_filter_respects_ignore_patterns():
+    stream = [
+        ("m.experts.0.gate_proj.weight", torch.randn(16, 32)),
+        ("m.shared_expert.gate_proj.weight", torch.randn(16, 32)),
+    ]
+    out = list(
+        M.iter_nvfp4_pertoken_weights(
+            iter(stream),
+            quant_patterns=["*expert*"],
+            ignore_patterns=["*shared_expert*"],
+        )
+    )
+    names = [n for n, _ in out]
+    assert "m.experts.0.gate_proj.weight_scale" in names
+    assert "m.shared_expert.gate_proj.weight_scale" not in names
+    assert dict(out)["m.shared_expert.gate_proj.weight"].dtype != torch.uint8
+
+
+def test_rollout_config_defaults():
+    cfg = M.NvFp4PerTokenRolloutConfig()
+    assert cfg.enabled is False
+    assert cfg.quant_patterns == ["*.experts.*"]
+    assert cfg.resolved_ignore() == M.DEFAULT_NVFP4_IGNORE
+
+    cfg2 = M.NvFp4PerTokenRolloutConfig.model_validate(
+        {"enabled": True, "ignore": ["*foo*"], "unknown_key": 1}
+    )
+    assert cfg2.enabled and cfg2.resolved_ignore() == ["*foo*"]
+
+
+# --------------------------------------------------------- worker resolution
+
+
+def test_resolver_dispatch_and_mutual_exclusion():
+    try:
+        from nemo_rl.models.generation.vllm.utils import (  # noqa: PLC0415
+            resolve_generation_worker_cls,
+        )
+    except ImportError:
+        pytest.skip("nemo_rl full deps unavailable")
+
+    base = "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker"
+    assert resolve_generation_worker_cls(base, {}) == base
+    assert (
+        "nvfp4_pertoken_worker.NvFp4PerTokenGenerationWorker"
+        in resolve_generation_worker_cls(
+            base, {"nvfp4_pertoken_rollout": {"enabled": True}}
+        )
+    )
+    assert "VllmQuantGenerationWorker" in resolve_generation_worker_cls(
+        base, {"quant_cfg": "some.yaml"}
+    )
+    with pytest.raises(ValueError, match="mutually exclusive|pick one"):
+        resolve_generation_worker_cls(
+            base,
+            {"quant_cfg": "some.yaml", "nvfp4_pertoken_rollout": {"enabled": True}},
+        )

@@ -34,11 +34,19 @@ calibration in the rollout path.
   `Nvfp4OnlineMoEMethod` is live and no static input-scale params exist;
   TP=2 negative test.
 - **B — pre-quantized weights + per-token activations (go/no-go)**:
-  (1) quantize BF16 expert weights outside vLLM with `flashinfer.nvfp4_quantize`
-  and assert numerics identical to vLLM's own online quant — validates the
-  refit export contract; (2) hybrid overlay: pre-quantized ModelOpt ckpt with
-  checkpoint `input_scale` ignored + per-token dynamic activation config
+  (1) exercise `_quantize_moe_weight_to_nvfp4` (vLLM's online-quant helper,
+  which wraps vLLM's in-tree `scaled_fp4_quant` CUDA kernel — NOT
+  `flashinfer.nvfp4_quantize`, FlashInfer's independent implementation of the
+  same transform) and assert its output matches the ModelOpt checkpoint
+  layout bitwise-deterministically — validates the refit export contract;
+  (2) hybrid overlay: pre-quantized ModelOpt ckpt with checkpoint
+  `input_scale` ignored + per-token dynamic activation config
   (vLLM analog of `SGLANG_FLASHINFER_PER_TOKEN_NVFP4_MOE=1`).
+  Note: runtime per-token activation quant happens inside FlashInfer's fused
+  `trtllm_fp4_block_scale_moe` kernel, not through either weight-quant path.
+  Cross-provider bitwise agreement (vLLM kernel vs `flashinfer.nvfp4_quantize`
+  vs ModelOpt export) is untested — add a micro-test before a no-ModelOpt
+  quantize-at-refit flow picks a producer.
 - **C — weight-reload determinism (RL-critical)**: identity reload reproduces
   greedy outputs; corrupt-then-reload proves real re-quantization; layerwise
   reload leg mirrors `_weight_update_lifecycle` in

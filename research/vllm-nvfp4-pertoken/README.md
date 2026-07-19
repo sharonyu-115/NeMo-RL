@@ -132,6 +132,37 @@ Reading:
    `flashinfer/fused_moe/core.py:1227` with `cudaErrorIllegalAddress` on
    vLLM 0.23.1rc1.dev1261. Workaround: `moe_backend="triton"`.
 
+### Training-side QAT: ModelOpt does NOT support per-token W4A4 (resolved 2026-07-18)
+
+Answers the open question "can QAT mirror per-token global scaling?" — verified
+against TensorRT-Model-Optimizer main @ `bd955fd`:
+
+- ModelOpt NVFP4 fake-quant (`NVFP4_DEFAULT_CFG` shape, as in
+  `nvfp4_experts.yaml`) uses dynamic block-16 E4M3 micro-scales but a **single
+  scalar global scale**: the calibrated `_amax` buffer when present (this is
+  what gets exported as `input_scale`), else a per-invocation amax that the
+  kernel hard-collapses to a scalar (`_dynamic_block_quantize_impl`:
+  `if amax.numel() != 1: amax = amax.amax()`, `tensor_quant.py:180-192`,
+  before `fp4_fake_quant_block(inputs, amax)`). No path keeps a per-row amax.
+- The `block_sizes={-1: None, "type": "dynamic"}` per-token notation
+  (`config.py:768`) applies to single-level formats (FP8/INT8-style) and
+  cannot combine with NVFP4's block-16 double quantization.
+
+Stage-2 options, in increasing fidelity:
+1. **Accept the mismatch** (recommended first): calibrated-static QAT in
+   training, per-token dynamic in rollout. The residual train/gen gap is
+   confined to global-scale granularity, and check D shows the rollout side
+   moves *closer* to the unquantized reference — the mismatch shrinks vs
+   today's static-static setup.
+2. **Calibration-free QAT**: input quantizer without calibrated amax → global
+   scale recomputed per forward (per-tensor dynamic, never stale). Synergy:
+   no calibrated amax ⇒ no `input_scale` to export, which is exactly the
+   `w4a4_pertoken` mode's signature — `resolve_nvfp4_real_quant_mode` can key
+   off it.
+3. **True per-token QAT**: needs a ModelOpt extension (row-wise amax + triton
+   `fp4_fake_quant_block` kernel change, or slow Python emulation) — an
+   upstream-ModelOpt contribution, out of NeMo-RL scope.
+
 ### Log markers for Stage-2 assert_grep
 
 - `Using 'FLASHINFER_TRTLLM' NvFp4 MoE backend` — kernel backend proof

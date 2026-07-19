@@ -4,31 +4,46 @@ Executes `DESIGN-te-nvfp4-pertoken.md`. Steps are ordered so every step is
 independently testable and lands green; each PR follows conventional-commit
 titles + sign-off (`-s`) and triggers CI with `/ok to test <full-sha>`.
 
-## PR breakdown
+## PR breakdown (rev. 2026-07-19: nemo-rl-embedded first, Bridge later/optional)
+
+**Revision:** the original plan routed refit quantization through a new
+Megatron-Bridge exporter (PR-A). That is deferred: the base worker already
+receives TP-gathered, HF-named, on-GPU tensors from
+`megatron_bridge.export_hf_weights`, so quantization is a pure **iterator
+filter inside nemo-rl** — same compute point (post-gather, pre-IPC, on GPU;
+4x transfer saving preserved), no cross-repo PR, no submodule bump. Bonus:
+quantizing the per-expert HF names the base export emits produces exactly the
+ModelOpt NVFP4 HF checkpoint layout vLLM's loaders already consume — no
+fused-family batching in the transport at all. The Bridge exporter becomes an
+optional later streamlining, justified only if refit profiling shows
+per-expert kernel-launch overhead (then: batch into stacked (E,N,K) calls
+bridge-side) or a non-nemo-rl consumer appears.
 
 | PR | Repo | Title | Depends on |
 |---|---|---|---|
-| PR-A | Megatron-Bridge | `feat(conversion): NVFP4 quantized weight export with pluggable producer` | — |
-| PR-B | NeMo-RL | `feat(vllm): nvfp4_pertoken quantized rollout (producer, registered config, transport)` | PR-A (submodule bump), vLLM repin, #2983 merged (transport refactor) |
-| PR-C | NeMo-RL | `feat(megatron): fp4_cfg TE NVFP4 training config` | TE pin decision |
-| PR-D | NeMo-RL | `test: nvfp4_pertoken functional + nightly recipe` | PR-B, PR-C, GB200 env |
-
-If #2983 stalls, PR-B ships the transport helpers standalone in the neutral
-module (duplicating ~150 lines) and a follow-up `refactor:` deduplicates once
-#2983 merges. Do not block on it.
+| PR-1 | NeMo-RL | `feat(vllm): nvfp4_pertoken quantized rollout (producer, refit filter, registered config)` | vLLM repin; #2983 only if transport-factoring included (see Step 4) |
+| PR-2 | NeMo-RL | `feat(megatron): fp4_cfg TE NVFP4 training config` | TE pin decision |
+| PR-3 | NeMo-RL | `test: nvfp4_pertoken functional + nightly recipe` | PR-1, PR-2, GB200 env |
+| PR-4 (optional) | Megatron-Bridge + NeMo-RL | `refactor(conversion): move NVFP4 refit quantization into bridge exporter` | e2e validated; profiling shows need |
 
 ---
 
-## Phase P0 — producer + Bridge exporter (no vLLM, no TE deps)
+## Phase P0 — producer + refit filter (no vLLM, no TE, no Bridge deps)
 
 ### Step 1: vendored NVFP4 producer (nemo-rl)
 **File:** `nemo_rl/models/generation/vllm/quantization/nvfp4_pertoken.py` (new)
 
 ```python
-def quantize_nvfp4_moe_weight(weight: torch.Tensor)  # (E,N,K) bf16, CUDA
+def quantize_nvfp4_weight(weight: torch.Tensor)  # (N,K) or (E,N,K) bf16, CUDA
     -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    # packed uint8 (E,N,K/2), block-16 e4m3 (E,N,K/16), fp32 global (E,)
+    # packed uint8 (...,K/2), block-16 e4m3 (...,K/16), fp32 global scalar/(E,)
 ```
+
+The 2D per-tensor variant is the primary interface: the base export stream
+yields per-expert HF names (`...experts.{e}.gate_proj.weight`), each a 2D
+tensor, and per-expert amax ≡ per-tensor amax. The 3D stacked variant is kept
+for the bitwise test against vLLM's `_quantize_moe_weight_to_nvfp4` and for
+the optional future Bridge batching (PR-4).
 
 - **Pure torch** (amax → global scale fold → block-16 e4m3 scales → E2M1
   round + nibble-pack). CRITICAL: no vLLM import — this runs on **training
@@ -47,32 +62,36 @@ def quantize_nvfp4_moe_weight(weight: torch.Tensor)  # (E,N,K) bf16, CUDA
 **Verify:** run in the probe's vLLM-nightly sqsh on a GB200 node (same srun
 pattern as `stage0_gates.sh`).
 
-### Step 2: Bridge exporter (Megatron-Bridge PR-A)
-**Files:** `src/megatron/bridge/models/conversion/nvfp4_export_utils.py` (new),
-method on `AutoBridge` (auto_bridge.py)
+### Step 2: refit filter (nemo-rl, replaces the Bridge exporter for now)
+**File:** `nvfp4_pertoken.py` (same module)
 
-- `AutoBridge.export_hf_weights_nvfp4(model, *, quantize_fn, quant_patterns,
-  cpu=False, show_progress=True, conversion_tasks=None,
-  merge_adapter_weights=True) -> Iterable[HFWeightTuple]`
-- Clone `export_hf_weights_modelopt`'s streaming skeleton; reuse (import,
-  don't copy) the already-ModelOpt-free helpers from `modelopt_utils.py`:
-  `matches_quant_ignore_pattern`, `_nvfp4_export_names` naming, expert
-  grouping/stacking, TP reduce. Drop: quantizer metadata collection, input
-  scales, qformat checks. `quant_patterns` selects names to quantize
-  (inverse of ignore — explicit allowlist `["*.experts.*"]` is safer here).
-- `quantize_fn` contract: `(hf_name, weight) -> Iterator[(name, tensor)]`
-  yielding `.weight` / `.weight_scale` / `.weight_scale_2`.
+```python
+def iter_nvfp4_pertoken_weights(
+    base_iter: Iterator[tuple[str, torch.Tensor]],
+    quant_patterns: list[str],          # explicit allowlist, e.g. ["*.experts.*"]
+) -> Iterator[tuple[str, torch.Tensor]]:
+    # matching *.weight → yield .weight/.weight_scale/.weight_scale_2
+    # (quantized on-GPU before IPC — 4x transfer saving); rest pass through
+```
 
-**Test (Bridge repo):** unit with a stub quantize_fn + tiny fake conversion
-tasks: name mapping, pattern selection, 3-tensor yield order, non-matching
-weights pass through unchanged.
-**Verify:** `pytest` in Bridge; then from nemo-rl, a smoke that streams a
-2-layer toy model end-to-end (reuse `tests/functional/_bridge_to_mlm_helper.py`
-patterns).
+- Pure filter over the stream the base worker already produces
+  (`megatron_bridge.export_hf_weights` output: TP-gathered, HF-named,
+  on-GPU). No Bridge changes, no submodule bump.
+- Output names = per-expert ModelOpt NVFP4 HF checkpoint layout — exactly
+  what vLLM's NVFP4 loaders consume from disk; no fused-family batching in
+  the transport.
+- (Deferred PR-4: move this loop bridge-side with stacked-(E,N,K) batching if
+  refit profiling shows per-expert launch overhead matters.)
+
+**Test:** pure-python unit with a fake iterator: pattern selection, 3-tensor
+yield order + naming, pass-through of non-matching weights, GPU tensors stay
+on device.
+**Verify:** covered by the producer's GPU test (Step 1) + Step 10's
+injected-weights probe leg.
 
 ---
 
-## Phase P1 — vLLM rollout path + worker hook + config (nemo-rl PR-B)
+## Phase P1 — vLLM rollout path + worker hook + config (nemo-rl PR-1)
 
 ### Step 3: graduate the probe overlay (neutral module)
 **File:** `nvfp4_pertoken.py` (same module as Step 1)
@@ -127,11 +146,11 @@ plus a small `configure_nvfp4_pertoken_engine_kwargs()` in the neutral module
 ### Step 6: training-side refit hook
 **File:** `nemo_rl/models/policy/workers/megatron_policy_worker.py`
 
-- `_iter_nvfp4_pertoken_refit_params()`: calls
-  `megatron_bridge.export_hf_weights_nvfp4(..., quantize_fn=
-  quantize_nvfp4_moe_weight-adapter, quant_patterns=[...])`, then appends
-  draft + kv scales exactly like `_iter_params_with_optional_kv_scales`
-  (factor the kv-scale tail into a shared helper rather than copying).
+- `_iter_nvfp4_pertoken_refit_params()`: wraps
+  `_iter_params_with_optional_kv_scales()` (or the base export iterator plus
+  the shared kv-scale tail) with `iter_nvfp4_pertoken_weights(...,
+  quant_patterns)` from Step 2 — kv scales and draft weights pass through the
+  filter untouched.
 - Selection: where refit iterators are chosen, gate on
   `generation.nvfp4_pertoken_rollout.enabled`.
 - `prepare_refit_info`: state_dict_info must advertise the **quantized**
@@ -139,7 +158,6 @@ plus a small `configure_nvfp4_pertoken_engine_kwargs()` in the neutral module
   manifest validates — add `build_nvfp4_refit_state_dict_info()` next to the
   producer (single source of truth for shapes); mirror how #2983's
   `prepare_refit_info` handles fused-MoE families, minus input scales.
-- Submodule bump to the Bridge commit from PR-A.
 
 ### Step 7: P1 unit tests (CPU-mocked, run in today's CI)
 `tests/unit/models/generation/test_nvfp4_pertoken_rollout.py` +
@@ -152,15 +170,15 @@ plus a small `configure_nvfp4_pertoken_engine_kwargs()` in the neutral module
 
 ---
 
-## Phase P2 — environment + integration + e2e (PR-C, PR-D)
+## Phase P2 — environment + integration + e2e (PR-2, PR-3)
 
 ### Step 8: environment
 - vLLM repin ≥ #48538 via `/env-profile` → `/env-build` sqsh (shared
   prerequisite with the ModelOpt per-token mode; coordinate once).
 - TE pin with per-token NVFP4: decide upstream-TE vs study-fork pin;
-  `/env-refresh` the worker venvs. Gates PR-C only.
+  `/env-refresh` the worker venvs. Gates PR-2 only.
 
-### Step 9: `fp4_cfg` upstreaming (PR-C)
+### Step 9: `fp4_cfg` upstreaming (PR-2)
 - Port the rl-fp4 study's TE NVFP4 wiring next to `fp8_cfg`
   (`megatron_policy_worker.py:373` pattern): `Fp4Config` BaseModel
   (`enabled=False`, `recipe="nvfp4_pertoken"`, f2l4 knobs), exemplar YAML doc,
@@ -173,7 +191,7 @@ plus a small `configure_nvfp4_pertoken_engine_kwargs()` in the neutral module
   reload → outputs identical to checkpoint-loaded weights (closes the loop
   refit-payload → kernel without Megatron).
 
-### Step 11: functional + recipe + nightly (PR-D)
+### Step 11: functional + recipe + nightly (PR-3)
 - `tests/functional/grpo_vllm_nvfp4_pertoken_rollout_gb200.sh` modeled on
   `grpo_vllm_mxfp8_rollout_gb200.sh`; assert_grep markers from the probe
   README (`Using 'FLASHINFER_TRTLLM' NvFp4 MoE backend`,
@@ -195,7 +213,7 @@ plus a small `configure_nvfp4_pertoken_engine_kwargs()` in the neutral module
 
 ```
 P0  Step 1 producer+test        ~250 loc   ─┐ parallelizable
-    Step 2 bridge exporter      ~300 loc   ─┘ (different repos)
+    Step 2 refit filter         ~80 loc    ─┘ (same module)
 P1  Step 3 graduate overlay     ~200 loc (mostly moves)
     Step 4 transport factor     ~400 loc moved + ~100 new   ← riskiest (refactor gate)
     Step 5 config+engine        ~150 loc
@@ -207,5 +225,7 @@ P2  Step 8 env (ops)            sqsh bakes
     Step 11 functional+nightly  ~200 loc scripts/yaml
 ```
 
-Critical path: Step 1 → 2 → 6 (payload correctness), with Step 4 the merge
-risk (coordinate with #2983's fate before starting it).
+Critical path: Step 1 → 2 → 6 (payload correctness, all in one nemo-rl
+module), with Step 4 the merge risk (coordinate with #2983's fate before
+starting it). The optional Bridge move (PR-4) happens only after e2e is
+validated and profiled.

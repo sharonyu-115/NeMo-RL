@@ -236,6 +236,50 @@ def test_filter_raises_when_nothing_quantized():
         list(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
 
 
+def test_expand_fused_roundtrips_to_per_expert_checkpoint_names():
+    """Fused transport tensors must expand back to exactly the per-expert
+    ModelOpt names RoutedExperts' expert mapping matches (defect #8: the raw
+    w13_/w2_ names are silently dropped by vLLM's loader)."""
+    stream = _expert_stream(num_experts=2, n=16, k=32)
+    stream.insert(0, ("m.self_attn.q_proj.weight", torch.randn(8, 8)))
+    fused = list(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
+    expanded = dict(M.expand_fused_expert_weights(iter(fused)))
+    fused = dict(fused)
+
+    # Passthrough tensor is untouched.
+    assert torch.equal(expanded["m.self_attn.q_proj.weight"], stream[0][1])
+    # No fused transport names survive expansion.
+    assert not any(".experts.w13_" in n or ".experts.w2_" in n for n in expanded)
+
+    p = "model.layers.0.mlp.experts"
+    # 1 passthrough + 2 experts x 3 projections x 3 tensors
+    assert len(expanded) == 1 + 2 * 3 * 3
+    for e in range(2):
+        assert torch.equal(
+            expanded[f"{p}.{e}.gate_proj.weight"], fused[f"{p}.w13_weight"][e, :16]
+        )
+        assert torch.equal(
+            expanded[f"{p}.{e}.up_proj.weight"], fused[f"{p}.w13_weight"][e, 16:]
+        )
+        assert torch.equal(
+            expanded[f"{p}.{e}.down_proj.weight"], fused[f"{p}.w2_weight"][e]
+        )
+        assert torch.equal(
+            expanded[f"{p}.{e}.gate_proj.weight_scale"].contiguous().view(torch.uint8),
+            fused[f"{p}.w13_weight_scale"][e, :16].contiguous().view(torch.uint8),
+        )
+        assert torch.equal(
+            expanded[f"{p}.{e}.down_proj.weight_scale_2"],
+            fused[f"{p}.w2_weight_scale_2"][e],
+        )
+        # Shared gate/up global scale lands on both per-expert names as scalars.
+        assert expanded[f"{p}.{e}.gate_proj.weight_scale_2"].dim() == 0
+        assert torch.equal(
+            expanded[f"{p}.{e}.gate_proj.weight_scale_2"],
+            expanded[f"{p}.{e}.up_proj.weight_scale_2"],
+        )
+
+
 def test_rollout_config_defaults():
     cfg = M.NvFp4PerTokenRolloutConfig()
     assert cfg.enabled is False

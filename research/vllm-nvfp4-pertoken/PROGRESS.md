@@ -126,4 +126,32 @@ confirmed in .so strings, not just python source.
    `_quantize_moe_weight_to_nvfp4` online behavior) and emits (E, 2)
    scale_2 with identical columns. Lesson: the warning was in retry-5/6 logs
    all along — grep for `Accuracy may be affected` class warnings, not just
-   crashes.
+   crashes. CORRECTION (defect #8 triage): that warning also fires once per
+   engine process at dummy-load startup (random scales are never allclose),
+   so it is NOT a usable driver gate — the unit test asserting identical
+   scale_2 columns is the guard. Defect #7 was real but masked by #8.
+
+8. **Fused expert tensors never loaded — RoutedExperts name-contract
+   mismatch** (job 2411044, run dir also cleaned + launcher now wipes stale
+   run dirs after job 2411027 auto-resumed past max_num_steps and no-opped):
+   generations were byte-identical to the pre-#7-fix runs (val accuracy 0,
+   avg_length 3977.6 to the decimal) and the log showed
+   `[layerwise.py:268] RoutedExperts: Failed to load weights` ×720
+   (48 layers × workers). Root cause: dev1283's
+   `RoutedExperts.load_weights` matches per-expert checkpoint names
+   (`experts.{e}.gate_proj.weight` ...) or BF16 HF fused names
+   (`experts.gate_up_proj`, with transpose heuristics that break on packed
+   uint8), but NOT the `w13_weight`/`w2_weight` parameter names our filter
+   emitted — every fused tensor passed through unmatched (load_numel=0) and
+   finalize restored the previous DUMMY kernel tensors, with only a warning.
+   So since retry-5 every "successful" refit refit nothing; step times looked
+   great because loading was skipped. Fix: keep the fused format for
+   transport, expand vLLM-side in the worker extension
+   (`expand_fused_expert_weights`: local slicing into per-expert ModelOpt
+   names, no per-tensor IPC) before `model.load_weights`. Drivers now forbid
+   `RoutedExperts: Failed to load weights` (fires per refit on real failures;
+   quiet on dummy load). Lessons: (a) refit liveness must be proven on the
+   CONSUMER side, not the producer side — the Megatron-side marker counted
+   tensors sent, not loaded; (b) vLLM swallows unmatched refit names by
+   design — always check `Failed to load weights` warnings when output
+   quality is impossible.

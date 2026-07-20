@@ -49,9 +49,12 @@ grep -Eq "\[nvfp4_pertoken\] refit: quantized [1-9][0-9]* expert layers" "$RUN_L
 ! grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
 ! grep -q "FakeQuantWorker" "$RUN_LOG"
 ! grep -q "Using NvFp4LinearBackend.MARLIN" "$RUN_LOG"
-# Refit numerics: the loader collapses w13_weight_scale_2 to column 0; a
-# gate/up scale mismatch silently corrupts every MoE layer (defect #7).
-! grep -q "w1_weight_scale_2 must match w3_weight_scale_2" "$RUN_LOG"
+# Refit must actually reach the experts: unmatched expert names are silently
+# dropped by RoutedExperts.load_weights and the layerwise-reload finalize
+# restores the previous (dummy) weights with only this warning (defect #8).
+# (The w1/w3 scale_2 mismatch warning is NOT greppable: dummy-load startup
+# always fires it once on random scales — defect #7's guard is the unit test.)
+! grep -q "RoutedExperts: Failed to load weights" "$RUN_LOG"
 
 MAX_RECORDED_STEP=$(jq -r 'if has("train/loss") then (."train/loss" | keys | map(tonumber) | max // 0) else 0 end' "$JSON_METRICS")
 if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then

@@ -45,6 +45,7 @@ from vllm.model_executor.utils import replace_parameter
 
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
     build_nvfp4_pertoken_hf_quant_config,
+    expand_fused_expert_weights,
 )
 from nemo_rl.models.generation.vllm.vllm_backend import (
     VllmInternalWorkerExtension,
@@ -192,14 +193,21 @@ NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS = 600_000
 class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
     """Refit transport for per-token NVFP4 rollouts.
 
-    The refit stream carries pre-quantized per-expert tensors in the ModelOpt
-    NVFP4 HF checkpoint layout (produced by ``iter_nvfp4_pertoken_weights``),
-    which vLLM's NVFP4 loaders consume natively — no fused-family batching.
+    The refit stream carries pre-quantized expert tensors FUSED per layer
+    (``iter_nvfp4_pertoken_weights``'s transport format) plus BF16 passthrough
+    tensors. Fused tensors are expanded back to per-expert ModelOpt checkpoint
+    names locally (``expand_fused_expert_weights``) before ``load_weights`` —
+    RoutedExperts' expert mapping only matches per-expert (or BF16 HF fused)
+    names; the raw ``w13_weight``/``w2_weight`` names pass through unmatched
+    and the reload finalize silently keeps the previous weights.
     Weight updates run inside vLLM's layerwise reload lifecycle so quantized
     params are restored to load format before loading and re-processed
     (per-token kernel rebuilt) afterwards, preserving CUDA-graph-stable
     kernel storage.
     """
+
+    def _load_weights(self, weights):
+        super()._load_weights(list(expand_fused_expert_weights(iter(weights))))
 
     def maybe_init_zmq(self) -> None:
         """Longer ZMQ timeout: the first refit re-processes every layer

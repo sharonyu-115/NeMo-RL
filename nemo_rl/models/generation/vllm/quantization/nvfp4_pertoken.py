@@ -43,6 +43,10 @@ _EXPERT_WEIGHT_RE = re.compile(
     r"^(?P<prefix>.*\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
 )
 
+_FUSED_EXPERT_RE = re.compile(
+    r"^(?P<prefix>.*\.experts)\.(?P<kind>w13|w2)_(?P<part>weight|weight_scale|weight_scale_2)$"
+)
+
 # Layers kept in native precision during rollout (mirrors the ModelOpt path's
 # default; that path re-exports this constant so the dependency points from
 # nemo_rl.modelopt -> here, never the reverse).
@@ -207,11 +211,13 @@ def iter_nvfp4_pertoken_weights(
     passthrough = 0
 
     # Per-(layer-prefix) buffers of expert projections. Experts are stacked
-    # and emitted as FUSED tensors (`<prefix>.w13_weight` etc., the ModelOpt
-    # fused MoE checkpoint convention vLLM's RoutedExperts loader consumes
-    # natively). Streaming per-expert names instead (~55k tensors on a
-    # 128-expert 48-layer model) crawls through per-tensor IPC handshakes and
-    # reload buffering and cannot finish a refit in tolerable time.
+    # and emitted as FUSED tensors (`<prefix>.w13_weight` etc.) purely for
+    # transport: streaming per-expert names (~55k tensors on a 128-expert
+    # 48-layer model) crawls through per-tensor IPC handshakes and reload
+    # buffering and cannot finish a refit in tolerable time. vLLM-side, the
+    # worker extension expands them back to per-expert checkpoint names via
+    # expand_fused_expert_weights before model.load_weights (the fused names
+    # match no entry in RoutedExperts' expert mapping and would be dropped).
     pending: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
 
     def _flush(prefix: str) -> Iterator[tuple[str, torch.Tensor]]:
@@ -295,6 +301,45 @@ def iter_nvfp4_pertoken_weights(
             f"{quant_patterns} is configured — export naming and patterns are "
             "out of sync."
         )
+
+
+def expand_fused_expert_weights(
+    weights: Iterator[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Expand fused expert tensors back to per-expert ModelOpt checkpoint names.
+
+    Inverse of :func:`iter_nvfp4_pertoken_weights`'s fused emission, applied
+    vLLM-side just before ``model.load_weights``. The fused tensors exist for
+    TRANSPORT only (per-expert streaming crawls through per-tensor IPC): vLLM's
+    ``RoutedExperts.load_weights`` expert mapping matches per-expert checkpoint
+    names (``experts.{e}.gate_proj.weight`` ...) or BF16 HF fused names
+    (``experts.gate_up_proj``), but NOT the ``w13_weight``/``w2_weight``
+    parameter names — those pass through unmatched and the layerwise-reload
+    finalize silently restores the previous kernel tensors
+    ("RoutedExperts: Failed to load weights"). Expansion is local slicing
+    (views, no copies), so it adds none of the per-tensor transport overhead
+    the fusing removed.
+    """
+    for name, tensor in weights:
+        m = _FUSED_EXPERT_RE.match(name)
+        if m is None:
+            yield name, tensor
+            continue
+        prefix, kind, part = m.group("prefix"), m.group("kind"), m.group("part")
+        num_experts = tensor.shape[0]
+        if kind == "w2":
+            for e in range(num_experts):
+                yield f"{prefix}.{e}.down_proj.{part}", tensor[e]
+        elif part == "weight_scale_2":
+            # (E, 2) with identical columns (one shared gate+up global scale).
+            for e in range(num_experts):
+                yield f"{prefix}.{e}.gate_proj.weight_scale_2", tensor[e, 0]
+                yield f"{prefix}.{e}.up_proj.weight_scale_2", tensor[e, 1]
+        else:
+            n = tensor.shape[1] // 2
+            for e in range(num_experts):
+                yield f"{prefix}.{e}.gate_proj.{part}", tensor[e, :n]
+                yield f"{prefix}.{e}.up_proj.{part}", tensor[e, n:]
 
 
 def build_nvfp4_pertoken_hf_quant_config(ignore: list[str]) -> dict[str, Any]:

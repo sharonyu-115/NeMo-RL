@@ -252,8 +252,14 @@ def test_expand_fused_roundtrips_to_per_expert_checkpoint_names():
     assert not any(".experts.w13_" in n or ".experts.w2_" in n for n in expanded)
 
     p = "model.layers.0.mlp.experts"
-    # 1 passthrough + 2 experts x 3 projections x 3 tensors
-    assert len(expanded) == 1 + 2 * 3 * 3
+    # 1 passthrough + 2 experts x 3 projections x (3 tensors + input_scale)
+    assert len(expanded) == 1 + 2 * 3 * 4
+    # Neutral input scales complete each RoutedExperts layer during reload
+    # (otherwise vLLM buffers the whole model and defers to finalize).
+    for e in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            s = expanded[f"{p}.{e}.{proj}.input_scale"]
+            assert s.dim() == 0 and s.item() == 1.0
     for e in range(2):
         assert torch.equal(
             expanded[f"{p}.{e}.gate_proj.weight"], fused[f"{p}.w13_weight"][e, :16]

@@ -327,7 +327,21 @@ def expand_fused_expert_weights(
             continue
         prefix, kind, part = m.group("prefix"), m.group("kind"), m.group("part")
         num_experts = tensor.shape[0]
-        if kind == "w2":
+        if kind == "w2" and part == "weight_scale_2":
+            # Last tensor of a layer's fused group (filter emission order is
+            # fixed). Also emit neutral input scales: the quant method
+            # registers w13/w2_input_scale params, so the layerwise reloader
+            # counts them in load_numel_total — without them every
+            # RoutedExperts layer stays "incomplete", vLLM buffers the whole
+            # model (~5.4GB/worker) and defers all processing to finalize.
+            # The per-token method overwrites input scales with 1.0 in
+            # process_weights_after_loading, so streamed 1.0s are consistent.
+            one = torch.ones((), device=tensor.device, dtype=torch.float32)
+            for e in range(num_experts):
+                yield f"{prefix}.{e}.down_proj.weight_scale_2", tensor[e]
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    yield f"{prefix}.{e}.{proj}.input_scale", one
+        elif kind == "w2":
             for e in range(num_experts):
                 yield f"{prefix}.{e}.down_proj.{part}", tensor[e]
         elif part == "weight_scale_2":

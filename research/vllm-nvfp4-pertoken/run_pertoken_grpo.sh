@@ -52,6 +52,8 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 DRIVER_ENV=""
 [[ -n "${MAX_STEPS}" ]] && DRIVER_ENV="export MAX_STEPS=${MAX_STEPS} && "
+WANDB_MODE_EXPORT=""
+[[ -z "${WANDB_API_KEY}" ]] && WANDB_MODE_EXPORT="export WANDB_MODE=offline && "
 
 echo "=============================================="
 echo "  Driver:     ${DRIVER}"
@@ -79,6 +81,7 @@ export COMMAND="\
     export TORCH_CUDA_ARCH_LIST='${TORCH_CUDA_ARCH_LIST}' && \
     ${HF_TOKEN:+export HF_TOKEN=${HF_TOKEN} && }\
     ${WANDB_API_KEY:+export WANDB_API_KEY=${WANDB_API_KEY} && }\
+    ${WANDB_MODE_EXPORT}\
     export CUDA_DEVICE_MAX_CONNECTIONS=1 && \
     export NRL_INSTALL_FA3=0 && \
     cd /opt/nemo-rl && \

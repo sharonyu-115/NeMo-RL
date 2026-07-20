@@ -73,3 +73,37 @@ problems recorded inline as encountered.
 | A4 gates | pending (after bake) | |
 | B5 run ladder | pending (after A4) | |
 | D nightly | pending (after B5/C4 runs) | |
+
+### B5.1 refit-smoke debugging log (2026-07-20, jobs 2410468→2410625)
+
+Six iterations, five real defects found and fixed — exactly what the 1-node
+rung exists for:
+1. `cluster.segment_size=4` from the performance parent doesn't divide 1 node
+   → smoke overrides segment_size=1 (config-only).
+2. **Actor registry**: new Ray worker classes need
+   ACTOR_ENVIRONMENT_REGISTRY entries → per-token workers registered with the
+   vLLM executable (1f0e329a4).
+3. **Router ignore pattern**: `*mlp.gate.*` doesn't fnmatch the bare router
+   prefix `...mlp.gate` → vLLM NVFP4-quantized the router while refit streamed
+   it BF16 (shape mismatch [128,2048]→[128,1024]). Added bare-suffix pattern.
+4. **ZMQ timeouts**: first refit re-processes every layer vLLM-side
+   (per-token kernel rebuild + FlashInfer autotune) → 600s timeouts on both
+   sides, mirroring the ModelOpt path.
+5. **Per-expert streaming too slow** (THE big one): ~55k tensors through
+   per-tensor IPC + reload buffering couldn't finish a refit in 600s
+   (vLLM side showed ~6GB of reload buffers accumulating ~1MB/tensor). Filter
+   rewritten to emit FUSED stacked tensors in the ModelOpt fused-MoE
+   convention (~6/layer, per-(expert,projection) scales preserving on-disk
+   semantics; flush on layer-prefix change). 14/14 unit tests incl.
+   fused≡per-projection equality. The plan's "optional Bridge batching"
+   risk materialized at the transport layer instead.
+6. Retry-5 then ran the ENTIRE M1 loop (dummy load → fused quantized refit →
+   per-token generation → train step) and died only in save_checkpoint —
+   1-node host OOM staging the 30B optimizer state (862/890GB), a smoke-config
+   artifact. Liveness marker switched to print() (Ray workers hide INFO), and
+   the smoke disables checkpointing.
+
+Also: bake4 (TE 937c4de) GREEN — TE 2.17.0.dev0+937c4de0, ROW_SCALED knob
+present, training step passed → v4 sqsh is the M2 image
+(nemo-rl-nvfp4-pertoken-venvs-gb200-2026-07-20-v4.sqsh). TE 2.15 knob absence
+confirmed in .so strings, not just python source.

@@ -193,9 +193,10 @@ config, 4over6 parity) is a follow-up study using the m-inf harness.
 
 1. **Producer micro-test** (GPU unit): vendored quantize_fn ≡ vLLM's
    `_quantize_moe_weight_to_nvfp4` bitwise; determinism. (Extends probe B1.)
-2. **CPU-mocked units**: exporter name/shape contract; config guards
-   (mutual exclusion, ignore-list consistency); worker extension manifest
-   without input scales. Mirror `test_vllm_modelopt_real_quant_config.py` fakes.
+2. **CPU-mocked units** (implemented in the producer test file): filter
+   naming/pattern contract, rollout-config defaults, resolver dispatch +
+   mutual exclusion. No manifest tests needed (per-expert names use vLLM's
+   native loaders).
 3. **Probe reuse** (GB200): checks B2/C/D run unchanged against the renamed
    registered config — same engine behavior, same thresholds
    (hybrid ≤ static×1.05; measured 1.690 vs 2.180).
@@ -204,23 +205,26 @@ config, 4over6 parity) is a follow-up study using the m-inf harness.
    gates copied from the w4a4-static recipe, tightened after green runs.
 5. **Nightly GB200**: `grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken.{yaml,sh}`.
 
-## Phasing
+## Phasing (as executed — see PROGRESS.md for the ledger)
 
-- **P0** Bridge exporter + producer + micro-test (no vLLM dependency; testable
-  against safetensors on any Blackwell node).
-- **P1** vLLM neutral module (graduate overlay) + transport factoring + worker
-  hook + config classes. Requires the vLLM repin (≥ #48538) — shared
-  prerequisite with the ModelOpt per-token mode.
-- **P2** e2e recipe + functional test + nightly. Requires TE pin with
-  per-token NVFP4 (env-build sqsh).
-- **P3** alignment study (TE↔FlashInfer recipe parity) on the m-inf harness.
+- **P0 DONE** — producer + refit filter + bitwise micro-test (green on GB200,
+  first run; no Bridge dependency after the revision).
+- **P1 DONE** — vLLM modules (graduated overlay, worker extension, workers) +
+  refit hook + config classes; GB200-validated via unit tests +
+  SMOKE_GRADUATED_OK. Code merged pre-repin; the CI-run of the full unit set
+  and the e2e refit exercise need the vLLM repin (≥ #48538).
+- **P2** e2e recipe + functional test + nightly. Requires the vLLM repin and
+  TE pin with per-token NVFP4 (env-build sqsh) + fp4_cfg port (PR-2).
+- **P3** alignment study (TE↔FlashInfer recipe parity) on the m-inf harness;
+  optional Bridge exporter move if refit profiling warrants batching.
 
 ## Risks
 
 | Risk | Mitigation |
 |---|---|
 | TE pin on main lacks per-token NVFP4 (study uses a TE fork) | env story = same sqsh-bake as vLLM repin; P0/P1 don't need TE |
-| Fused-MoE refit requires all experts local (no EP), inherited from transport | same constraint as #2983 today; TP is fine (probe: TP=2 works) |
+| Expert-parallel refit interaction unvalidated (per-expert names may relax #2983's no-EP constraint — untested) | validate in P2 e2e; TP is fine (probe: TP=2 works) |
 | Refit-time quantization cost on training GPUs | producer is one batched kernel per layer (vLLM does the same at load); measure in P2, flashinfer backend if needed |
-| vLLM `ModelOptNvFp4FusedMoE` base-class drift across repins | thin subclass + probe checks in CI catch it; the factored transport is ours |
+| vLLM `ModelOptNvFp4FusedMoE` base-class drift across repins | thin subclass + probe checks in CI catch it |
+| vLLM duck-types on the "ModelOpt" class-name substring (found in P1) | class keeps the prefix; constraint documented in its docstring |
 | Cross-producer bit drift (vendored vs vLLM kernel) | P0 micro-test is a hard gate |

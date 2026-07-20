@@ -138,15 +138,19 @@ vllm = [
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@29d31c095796f3c8ece47ee9cdcc167051bbeed9 ; platform_machine == 'x86_64'",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@a48493600c4886c1b297aaa78db0e1ebc2d8dd6c ; platform_machine == 'aarch64'",
-  # Default wheels on GitHub are cu130. See v0.20.0 release assets:
-  # https://github.com/vllm-project/vllm/releases/tag/v0.20.0
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
-  "vllm @ https://github.com/vllm-project/vllm/releases/download/v0.20.0/vllm-0.20.0-cp38-abi3-manylinux_2_35_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "vllm==0.20.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
+  # Nightly pin: nvfp4_pertoken rollout needs vllm-project/vllm#48538 (merged
+  # 2026-07-16, first release TBD). Exact dev-wheel URLs keep uv.lock
+  # reproducible (nightly index churns daily); wheels are mirrored under
+  # /lustre/fsw/general_sa/shuangy/images/wheels/ as a GC guard.
+  "vllm @ https://wheels.vllm.ai/9459fc647105f10f754697b3bf136d194564d603/vllm-0.23.1rc1.dev1283%2Bg9459fc647-cp38-abi3-manylinux_2_28_aarch64.whl ; sys_platform == 'linux' and platform_machine == 'aarch64'",
+  "vllm @ https://wheels.vllm.ai/9459fc647105f10f754697b3bf136d194564d603/vllm-0.23.1rc1.dev1283%2Bg9459fc647-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "vllm==0.23.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.8.post1",
-  "flashinfer-cubin==0.6.8.post1",
-  "flashinfer-jit-cache==0.6.8.post1",
+  # 0.6.14 matches the vllm nightly's flashinfer expectations (validated in the
+  # probe container, which ran flashinfer 0.6.14 with vllm 0.23.1rc1 nightly).
+  "flashinfer-python==0.6.14",
+  "flashinfer-cubin==0.6.14",
+  "flashinfer-jit-cache==0.6.14",
   "nvidia-cutlass-dsl>=4.5.2",
 ]
 sglang = [

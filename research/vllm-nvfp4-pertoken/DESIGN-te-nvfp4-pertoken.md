@@ -1,7 +1,10 @@
 # Design: TE NVFP4 per-token W4A4 — train → refit → vLLM rollout (no ModelOpt)
 
-Status: draft (2026-07-19). Companion to this directory's probe (`README.md`),
-which validated the vLLM-side kernel path, fidelity win, and reload contract.
+Status: **as-built** (rev. 2026-07-19; original draft same date). Companion to
+this directory's probe (`README.md`) and the execution ledger (`PROGRESS.md`).
+P0+P1 are implemented and GB200-validated (commits aab14dd7f, fe56561bb);
+sections below describe the implemented architecture, with "superseded" notes
+where implementation diverged from the original draft and why.
 
 ## Goal
 
@@ -46,12 +49,13 @@ rollout weights are exactly what the producer kernel emits).
                                       │ input scales                         │
 ════════ EVERY STEP ════════          └──────────────────────────────────────┘
  1. TRAIN  TE NVFP4 GEMMs (real quant compute); BF16 master weights updated
- 2. REFIT  bridge.export_hf_weights_nvfp4(models, quantize_fn=<producer>)
-             ├ .weight          packed FP4 (E,N,K/2) uint8
+ 2. REFIT  iter_nvfp4_pertoken_weights(<existing HF export stream>)
+             per-expert HF names, quantized on-GPU pre-IPC:
+             ├ .weight          packed FP4 uint8
              ├ .weight_scale    block-16 E4M3
-             └ .weight_scale_2  per-expert FP32 (amax/(448·6), from master wt)
-           — no input scales, no draft changes, kv scales as today —
-           → ZMQ IPC / collective, layerwise reload lifecycle (as #2983)
+             └ .weight_scale_2  FP32 (amax/(448·6), from master weight)
+           — no input scales; draft weights + kv scales pass through —
+           → ZMQ IPC / collective, layerwise reload lifecycle
  3. ROLLOUT FlashInfer TRT-LLM fused MoE, per_token_activation=True
 ```
 
@@ -77,91 +81,95 @@ Reuse: the whole m-inf study implementation (pinned TE fork knobs,
 per-token NVFP4 — the study runs on a pinned TE fork; upstreaming that pin is
 part of this workstream's env story (same sqsh-bake flow as the vLLM repin).
 
-### 2. Refit — quantize-at-export in Megatron-Bridge (new, small)
+### 2. Refit — quantize in-flight in nemo-rl (as built)
 
-New Bridge method `AutoBridge.export_hf_weights_nvfp4`, a sibling of
-`export_hf_weights_modelopt` (auto_bridge.py) that reuses its skeleton but
-computes quant metadata **from the weights themselves**:
+**Superseded: the original draft added a Megatron-Bridge exporter
+(`AutoBridge.export_hf_weights_nvfp4`).** Not needed: the base worker already
+receives TP-gathered, HF-named, on-GPU tensors from
+`megatron_bridge.export_hf_weights`, so quantization is an **iterator filter
+inside nemo-rl** — same compute point (post-gather, pre-IPC ⇒ 4x transfer
+saving preserved), no cross-repo PR, no submodule bump. The Bridge exporter
+remains an optional later streamlining if refit profiling shows per-expert
+kernel-launch overhead (batch into stacked (E,N,K) calls bridge-side).
 
-```python
-def export_hf_weights_nvfp4(
-    self, model, *,
-    quantize_fn,                # (hf_name, weight) -> iter[(name, tensor)] : 3-tensor NVFP4 contract
-    quant_patterns,             # HF-name patterns to quantize (e.g. *.experts.*)
-    cpu=False, conversion_tasks=None, ...
-) -> Iterable[HFWeightTuple]:
-```
+As built, both pieces live in the vLLM-free module
+`nemo_rl/models/generation/vllm/quantization/nvfp4_pertoken.py`:
 
-Reused unchanged from the modelopt exporter (all ModelOpt-free already):
-conversion tasks + `build_hf_to_megatron_name_map`, TP/PP/EP gather and expert
-stacking, streaming loop, ignore/pattern matching, `_nvfp4_export_names`
-naming. Dropped: `collect_modelopt_quant_metadata` (quantizer buffers),
-`compute_nvfp4_input_scale` and all input-scale export, qformat checks.
+- **Producer** `quantize_nvfp4_weight(weight)` — pure torch (no vLLM import:
+  it runs on training workers whose mcore venv has no vLLM), 2D per-tensor or
+  3D stacked-expert; per-expert amax → fp32 `weight_scale_2`; dynamic block-16
+  e4m3 scales; RNE-on-grid E2M1 rounding; nibble packing. Verified
+  **bit-identical** to vLLM's `_quantize_moe_weight_to_nvfp4` on GB200.
+- **Refit filter** `iter_nvfp4_pertoken_weights(base_iter, quant_patterns,
+  ignore_patterns)` — quantizes matching `*.weight` entries of the export
+  stream into `.weight/.weight_scale/.weight_scale_2` (the ModelOpt NVFP4 HF
+  checkpoint layout, per-expert names); everything else passes through.
 
-(Why not `export_hf_weights_quant`? Its `quant_fn` contract is a 2-tuple
-`(qweight, scale)` shaped for FP8; NVFP4 needs three tensors. Extending that
-contract is the fallback; a dedicated exporter is clearer.)
+**Worker hook (as built):** rather than a parallel iterator, the existing
+`MegatronPolicyWorker._iter_params_with_optional_kv_scales` was renamed to
+`..._impl` and re-exposed as a wrapper that applies the filter when
+`generation.nvfp4_pertoken_rollout.enabled`. Because prepare_refit_info
+metadata, ZMQ streaming, and collective broadcast all consume this single
+iterator, the advertised state-dict info and streamed payloads stay consistent
+by construction (no separate `build_nvfp4_refit_state_dict_info` needed, as
+the draft had assumed). No changes to `MegatronQuantPolicyWorker`.
 
-**The producer (`quantize_fn`)** is one pluggable function living in nemo-rl
-(`nemo_rl/models/generation/vllm/quantization/nvfp4_pertoken.py`, see §3):
-per-expert amax → `weight_scale_2`; block-16 E4M3 scales; packed uint8 — the
-same layout the probe's check B1 validated. Implementation choice, in order of
-preference: vendor the ~30-line math (no fragile private import), matching
-vLLM's `_quantize_moe_weight_to_nvfp4` bit-for-bit (guarded by the
-cross-producer micro-test the probe README calls for). It runs on the training
-GPU at export; `flashinfer.nvfp4_quantize` is an optional fast backend later.
+### 3. vLLM — per-token W4A4 modules (as built)
 
-**NeMo-RL worker hook:** `MegatronPolicyWorker` gains
-`_iter_nvfp4_pertoken_refit_params()`, selected next to the existing
-`_iter_params_with_optional_kv_scales` when the rollout mode is enabled.
-It calls the new bridge exporter and appends kv scales exactly like today
-(reuse `get_vllm_qkv_scale_names`). No changes to `MegatronQuantPolicyWorker`.
+**Superseded: "one neutral module" split into three** — module-scope vLLM
+subclasses (required so the pickled quantization config can be re-imported by
+vLLM's EngineCore subprocess) contradict training-venv importability, so:
 
-### 3. vLLM — neutral per-token W4A4 module (graduate the probe overlay)
+- `quantization/nvfp4_pertoken.py` — vLLM-free: producer, refit filter,
+  `DEFAULT_NVFP4_IGNORE`, `NvFp4PerTokenRolloutConfig`,
+  `build_nvfp4_pertoken_hf_quant_config`. Importable on training workers.
+- `quantization/nvfp4_pertoken_vllm.py` — vLLM-side:
+  `ModelOptNvFp4PerTokenFusedMoE`, `NvFp4PerTokenConfig`,
+  `register_nvfp4_pertoken()`, `NvFp4PerTokenWorkerExtension`,
+  `configure_nvfp4_pertoken_engine_kwargs()`.
+- `quantization/nvfp4_pertoken_worker.py` — Ray generation workers
+  (sync/async) that inject the engine kwargs at `_create_engine`; selected by
+  `resolve_generation_worker_cls`.
 
-New module `nemo_rl/models/generation/vllm/quantization/nvfp4_pertoken.py`
-(sibling of `quantization/fp8.py`; deliberately **not** under `nemo_rl/modelopt/`):
+**Superseded: "renamed neutrally".** The FusedMoE method class MUST keep the
+"ModelOpt" substring: vLLM's `RoutedExperts.weight_loader` duck-types NVFP4
+expert-scale loading on `"ModelOpt" in quant_method.__class__.__name__`
+(routed_experts.py) — a neutral rename silently breaks initial load. The
+registered method name is still `nvfp4_pertoken`.
 
-- The probe's `pertoken_overlay.py` classes, renamed neutrally:
-  `NvFp4PerTokenConfig` / `NvFp4PerTokenFusedMoE`, registered as
-  `"nvfp4_pertoken"` via `register_quantization_config`. (They still subclass
-  vLLM's `ModelOptNvFp4FusedMoE` — that's vLLM's class name for the NVFP4
-  checkpoint-format method, not a ModelOpt dependency.) Includes the probe's
-  `.contiguous()` reload fix and the FLASHINFER_TRTLLM backend assert.
-- The HF `quantization_config` override as a **literal dict** (quant_algo
-  NVFP4, group_size 16, dynamic input activations, exclude_modules from the
-  ignore list) — no ModelOpt `convert_hf_quant_config_format`.
-- The `quantize_fn` producer from §2 (co-located so vLLM-format knowledge
-  stays in one file).
-- `DEFAULT_NVFP4_IGNORE` moves (or is re-exported) here; `nemo_rl/modelopt/`
-  imports from the neutral module — dependency points one way only.
+The HF `quantization_config` override is a literal dict that mirrors the real
+ModelOpt NVFP4 checkpoint schema **key-for-key** (`ignore`, `targets`,
+`producer`; the parser is shape-sensitive), with the single per-token delta
+`input_activations.dynamic=true`. Engine init uses `load_format="dummy"`: the
+BF16 training checkpoint cannot fill NVFP4-shaped params, and the first refit
+(which always precedes the first generation) supplies every weight.
 
-**Weight transport:** the fused-MoE refit machinery in #2983's
-`vllm_quant_backend.py` is format-generic (suffix mapping, manifest
-completeness, layerwise reload lifecycle with CUDA-graph-stable finalize,
-600s ZMQ timeout, EP rejection). Factor the reusable pieces into a neutral
-helper module and add a thin `NvFp4PerTokenWorkerExtension
-(VllmInternalWorkerExtension)` that uses them with `require_input_scales=False`
-and no `VLLM_MODELOPT_REAL_QUANT` env. The ModelOpt backend keeps working by
-importing the factored helpers (mechanical refactor, no behavior change).
+**Superseded: transport factoring from #2983 — not needed at all.** Because
+the refit stream uses per-expert checkpoint-layout names, vLLM's native
+loaders handle everything; no fused-family suffix mapping or manifest
+completeness code exists in this path. `NvFp4PerTokenWorkerExtension` is ~40
+lines over the base lifecycle hooks: initialize/finalize layerwise reload
+around each update (per-token kernel rebuilt into CUDA-graph-stable storage),
+fatal refit errors, accelerator fence before IPC ack.
 
 ### 4. Config surface (v2, per config-conventions)
 
 ```python
 class NvFp4PerTokenRolloutConfig(BaseModel, extra="allow"):
     enabled: bool = False
-    ignore: list[str] | None = None   # None → DEFAULT_NVFP4_IGNORE
+    ignore: list[str] | None = None          # None → DEFAULT_NVFP4_IGNORE
+    quant_patterns: list[str] = ["*.experts.*"]  # refit-quantized allowlist (MoE-only kernel)
 ```
 
-- Lives at `policy.generation.nvfp4_pertoken_rollout`. Defaults on the
-  BaseModel; exemplar YAML documents it; recipes override minimally with
-  `defaults:` inheritance.
-- **Mutual exclusion, fail loudly:** startup assert that
-  `nvfp4_pertoken_rollout.enabled` is not combined with the ModelOpt path's
+- Lives at `policy.generation.nvfp4_pertoken_rollout` (NotRequired key on the
+  `VllmConfig` TypedDict; defaults on the BaseModel). Exemplar-YAML
+  documentation deferred to the recipe PR to avoid reference_configs churn.
+- **Mutual exclusion (implemented):** `resolve_generation_worker_cls` raises
+  `ValueError` when combined with the ModelOpt path's
   `generation.quant_cfg`/`real_quant`.
-- **Train/rollout consistency guard** (pattern from #2983's
-  `_get_real_quant_mode` cross-check): if `fp4_cfg.enabled`, warn/error when
-  the layers TE keeps in BF16 (f2l4) diverge from the rollout `ignore` list.
+- **Train/rollout consistency guard (deferred to PR-2):** when `fp4_cfg`
+  lands, warn/error when the layers TE keeps in BF16 (f2l4) diverge from the
+  rollout `ignore` list.
 
 ### 5. Explicitly NOT reused (the independence claim)
 

@@ -6,6 +6,30 @@ defaults: grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken.yaml
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken-fp4train
 policy:
+  generation:
+    nvfp4_pertoken_rollout:
+      enabled: true
+      # DEFAULT_NVFP4_IGNORE + the f2l4 layers (first 2 / last 4 of 48 stay
+      # BF16 in training below, so the rollout must not quantize their experts
+      # either — the worker warns on this train/gen precision divergence).
+      # An explicit ignore list REPLACES the default, so the default entries
+      # are repeated here.
+      ignore:
+        - "*lm_head*"
+        - "*mlp.gate"
+        - "*mlp.gate.*"
+        - "*mlp.shared_expert*"
+        - "*self_attn*"
+        - "*embed_tokens*"
+        - "*input_layernorm*"
+        - "*post_attention_layernorm*"
+        - "*norm*"
+        - "*.layers.0.mlp.experts*"
+        - "*.layers.1.mlp.experts*"
+        - "*.layers.44.mlp.experts*"
+        - "*.layers.45.mlp.experts*"
+        - "*.layers.46.mlp.experts*"
+        - "*.layers.47.mlp.experts*"
   megatron_cfg:
     # The performance parent pins fp64 router probs; with fp4_cfg enabled the
     # MoE experts route permuted_probs through TE's quantization padding

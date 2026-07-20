@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 # nemo_rl.modelopt -> here, never the reverse).
 DEFAULT_NVFP4_IGNORE: list[str] = [
     "*lm_head*",
+    # NOTE: the MoE router module prefix is exactly "...mlp.gate" — a trailing
+    # ".*" would NOT fnmatch it and vLLM would NVFP4-quantize the router while
+    # the refit streams it in BF16 (shape-mismatch at first refit).
+    "*mlp.gate",
     "*mlp.gate.*",
     "*mlp.shared_expert*",
     "*self_attn*",

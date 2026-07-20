@@ -223,7 +223,23 @@ now 42 quantized layers / passthrough 2739 (f2l4 experts stream BF16); no
 f2l4 warning; ~41s steps (2739-tensor BF16 passthrough adds no overhead).
 Metrics: val acc 0.5625→**0.625** (rose over training), reward 0.625/0.625,
 gen_kl 0.035/0.037, js 0.0098/0.0105, entropy 0.23/0.24 — all gates green.
-Watch item: token_mult_prob_error elevated (15.8→9.9 vs M1's ~1.1) — the
-fp4-training-vs-rollout-kernel quant gap; ungated, run healthy (reward/acc
-rising), monitor at longer horizons. **M1 (BF16 train) AND M2 (fp4 train)
-per-token W4A4 rollout both validated e2e on Qwen3-30B-A3B/GB200.**
+Watch item: token_mult_prob_error elevated (15.8→9.9 vs M1's ~1.1),
+gen_kl 0.035 vs M1 0.018. NOT a bug and NOT "fp4 training shrinks the
+train/gen gap" (that earlier framing was WRONG). gen_kl/tmpe compare the
+TRAINING-forward logprobs (prev_logprobs) vs the vLLM ROLLOUT logprobs
+(generation_logprobs, grpo.py:2199) — minimized when the two forwards are
+the IDENTICAL function, not when both are merely quantized. M2 is larger
+for two reasons: (1) MODULE-COVERAGE asymmetry (dominant): the rollout
+quantizes only MoE experts (DEFAULT_NVFP4_IGNORE keeps self_attn/router/
+shared/norms BF16), but TE fp4 training sets model_cfg.fp4 globally →
+quantizes attention + all linears in non-f2l4 layers. So M1's BF16 train
+attention EXACTLY matches the rollout's BF16 attention (zero gap
+contribution) while M2's W4A4 train attention diverges from BF16-rollout
+attention. (2) Even for experts, TE row/per-token-scaled NVFP4 (RHT/2D/SR
+off) ≠ flashinfer block-16 rollout kernel → uncorrelated errors add in
+quadrature, |ε_train−ε_rollout|≈√(ε_train²+ε_rollout²)>|ε_rollout|.
+Rules out "fp4 not applied to logprob forward" bug: that would give M2≈M1
+(0.018); it's 2x. Lever to actually shrink the gap: align the quantized
+module set (rollout quantizes attention too, OR fp4 training experts-only).
+Ungated, run healthy (reward/acc rising). **M1 (BF16 train) AND M2 (fp4
+train) per-token W4A4 rollout both validated e2e on Qwen3-30B-A3B/GB200.**

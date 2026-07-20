@@ -69,7 +69,11 @@ policy:
       # weight refit — blocked by this container's ptrace policy
       # ("pidfd_getfd: Bad file descriptor", jobs 2411700/2411701). The legacy
       # allocator uses cudaIpcMemHandle (no pidfd) — the M1/M2-proven setting.
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      # garbage_collection_threshold:0.8 forces it to release cached blocks
+      # (the legacy allocator otherwise hoards freed memory, fragmenting the
+      # GPU over colocated wake/sleep cycles until vLLM CuMemAllocator OOMs on
+      # wake_up — job 2412970 died at step ~11).
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False,garbage_collection_threshold:0.8
     optimizer:
       lr: 1.0e-6
       min_lr: 1.0e-7
@@ -94,7 +98,12 @@ policy:
       # 20k-KV headroom (policy is offloaded during colocated generation).
       # (The pidfd refit failure was the allocator, not tp — see env_vars.)
       tensor_parallel_size: 1
-      gpu_memory_utilization: 0.7
+      # 0.5 (down from 0.7): with expandable_segments:False the policy's legacy
+      # allocator can't fully release GPU memory back for vLLM's wake_up KV
+      # realloc, so a smaller vLLM pool leaves headroom for the policy residual
+      # (job 2412970 OOM'd at step ~11 at 0.7). Safe on KV — generations avg
+      # ~1k tokens, far below the 20k cap.
+      gpu_memory_utilization: 0.5
       enforce_eager: true
       max_model_len: ${policy.max_total_sequence_length}
     colocated:

@@ -48,8 +48,10 @@ policy:
     env_vars:
       NRL_MEGATRON_CHECKPOINT_DIR: /lustre/fsw/general_sa/shuangy/hf/megatron_ckpt
       # See the BF16 recipe: :False avoids the pidfd-based cuMem IPC that the
-      # container ptrace policy blocks during weight refit.
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      # container ptrace policy blocks during weight refit;
+      # garbage_collection_threshold:0.8 releases cached blocks so colocated
+      # wake/sleep cycles don't fragment the GPU into a vLLM wake_up OOM.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False,garbage_collection_threshold:0.8
       NVTE_NVFP4_ROW_SCALED_ACTIVATION: "1"
       NVTE_NVFP4_DISABLE_RHT: "1"
       NVTE_NVFP4_DISABLE_2D_QUANTIZATION: "1"

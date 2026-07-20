@@ -38,6 +38,10 @@ ENV_FILE="${SCRIPT_DIR}/research/vllm-nvfp4-pertoken/.env"
 if [[ -f "${ENV_FILE}" ]]; then
     set -a; source "${ENV_FILE}"; set +a
 fi
+# .env overwrites exported vars; CONTAINER_IMAGE_OVERRIDE (sbatch --export)
+# wins over it — the M2 fp4train leg runs on the TE-937c4de (v4) image while
+# .env keeps the M1 default.
+CONTAINER_IMAGE="${CONTAINER_IMAGE_OVERRIDE:-${CONTAINER_IMAGE:-}}"
 
 export TORCH_CUDA_ARCH_LIST='10.0'
 : "${RL_DIR:?Set RL_DIR in .env}"

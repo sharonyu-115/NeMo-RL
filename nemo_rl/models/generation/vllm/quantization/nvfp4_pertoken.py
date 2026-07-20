@@ -29,11 +29,14 @@ The producer matches vLLM's online-quant kernel
 """
 
 import fnmatch
+import logging
 from collections.abc import Iterator
 from typing import Any, Optional
 
 import torch
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 # Layers kept in native precision during rollout (mirrors the ModelOpt path's
 # default; that path re-exports this constant so the dependency points from
@@ -184,19 +187,39 @@ def iter_nvfp4_pertoken_weights(
     passes through untouched.
     """
     ignore = ignore_patterns or []
+    quantized = 0
+    passthrough = 0
     for name, tensor in base_iter:
         if (
             not name.endswith(".weight")
             or not _matches_any(name, quant_patterns)
             or _matches_any(name, ignore)
         ):
+            passthrough += 1
             yield name, tensor
             continue
         packed, block_scale, weight_scale_2 = quantize_nvfp4_weight(tensor)
         base = name[: -len(".weight")]
+        quantized += 1
         yield name, packed
         yield f"{base}.weight_scale", block_scale
         yield f"{base}.weight_scale_2", weight_scale_2
+
+    # Per-refit liveness proof: a config/name mismatch (e.g. quant_patterns
+    # not matching the export's expert naming) would otherwise silently
+    # degrade to an all-BF16 refit that vLLM then fails to load — or worse.
+    logger.info(
+        "[nvfp4_pertoken] refit: quantized %d params -> %d tensors, passthrough %d",
+        quantized,
+        3 * quantized,
+        passthrough,
+    )
+    if quant_patterns and quantized == 0:
+        raise RuntimeError(
+            "[nvfp4_pertoken] refit quantized 0 params although quant_patterns="
+            f"{quant_patterns} is configured — export naming and patterns are "
+            "out of sync."
+        )
 
 
 def build_nvfp4_pertoken_hf_quant_config(ignore: list[str]) -> dict[str, Any]:

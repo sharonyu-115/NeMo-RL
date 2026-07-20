@@ -200,6 +200,12 @@ def test_filter_respects_ignore_patterns():
     assert dict(out)["m.shared_expert.gate_proj.weight"].dtype != torch.uint8
 
 
+def test_filter_raises_when_nothing_quantized():
+    stream = [("m.self_attn.q_proj.weight", torch.randn(8, 16))]
+    with pytest.raises(RuntimeError, match="quantized 0 params"):
+        list(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
+
+
 def test_rollout_config_defaults():
     cfg = M.NvFp4PerTokenRolloutConfig()
     assert cfg.enabled is False

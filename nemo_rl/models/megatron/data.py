@@ -1121,7 +1121,14 @@ def _get_pack_sequence_parameters_for_megatron(
     pp_size = megatron_cfg["pipeline_model_parallel_size"]
     cp_size = megatron_cfg["context_parallel_size"]
     fp8_cfg = megatron_cfg.get("fp8_cfg", None) or {}
+    fp4_cfg = megatron_cfg.get("fp4_cfg", None) or {}
     use_fp8 = fp8_cfg.get("enabled", False)
+    use_fp4 = fp4_cfg.get("enabled", False)
+    if use_fp8 and use_fp4:
+        raise ValueError(
+            "megatron_cfg.fp8_cfg and fp4_cfg cannot both have enabled: true "
+            "(Megatron does not allow fp8 and fp4 together)."
+        )
 
     # individual sequence needs to be splitted to CP domain, and to TP domain when SP is enabled.
     minimum_pad_factor = 1
@@ -1160,6 +1167,14 @@ def _get_pack_sequence_parameters_for_megatron(
         divisor = max(divisor, 128)
     if divisor > 1:
         pad_packed_seq_to_multiple_of = divisor
+        if cp_size > 1:
+            pad_packed_seq_to_multiple_of *= cp_size * 2
+        if tp_size > 1 and sp:
+            pad_packed_seq_to_multiple_of *= tp_size
+    elif use_fp4:
+        # NVFP4 packed sequences follow the same conservative 128 divisor as
+        # blockwise FP8 (TE block-scaled GEMM alignment).
+        pad_packed_seq_to_multiple_of = 128
         if cp_size > 1:
             pad_packed_seq_to_multiple_of *= cp_size * 2
         if tp_size > 1 and sp:

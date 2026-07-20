@@ -1,0 +1,30 @@
+defaults: performance/grpo-qwen3-30ba3b-4n4g.yaml
+# Per-token NVFP4 W4A4 rollout (no ModelOpt): BF16 Megatron training; weights
+# quantized to NVFP4 in-flight at refit; vLLM derives per-token activation
+# global scales inside the FlashInfer TRT-LLM fused-MoE kernel. QA-sized run.
+grpo:
+  max_num_steps: 2
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 2
+  val_period: 30
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken
+  save_period: 30
+  keep_top_k: 1
+policy:
+  train_global_batch_size: 16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  generation:
+    nvfp4_pertoken_rollout:
+      enabled: true
+    vllm_kwargs:
+      # The performance parent pins triton (a vLLM-0.20 refit workaround).
+      # Per-token requires the FlashInfer TRT-LLM MoE backend; `auto` selects
+      # it on SM100 and the quant method asserts the selection.
+      moe_backend: auto
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken
+  wandb:
+    name: grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken

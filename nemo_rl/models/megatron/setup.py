@@ -868,15 +868,79 @@ def _apply_performance_config(model_cfg: Any, config: PolicyConfig) -> None:
         ):
             model_cfg.use_te_rng_tracker = True
 
-    # FP8 configuration
+    apply_te_precision_config(model_cfg, config)
+
+
+
+def apply_te_precision_config(model_cfg, config: PolicyConfig) -> None:
+    """Apply FP8/FP4 + layer-skip + per-module TE precision settings.
+
+    Extracted from _override_model_cfg for unit-testability. Mutates
+    ``model_cfg`` (a Megatron TransformerConfig or equivalent namespace).
+    """
+    # FP8 / FP4 via Transformer Engine (mutually exclusive on Megatron
+    # TransformerConfig).
     fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
-    if fp8_cfg is not None and fp8_cfg.get("enabled", False):
+    fp4_cfg = config["megatron_cfg"].get("fp4_cfg", None)
+    fp8_on = fp8_cfg is not None and fp8_cfg.get("enabled", False)
+    fp4_on = fp4_cfg is not None and fp4_cfg.get("enabled", False)
+    if fp8_on and fp4_on:
+        raise ValueError(
+            "policy.megatron_cfg.fp8_cfg and fp4_cfg cannot both have enabled: "
+            "true (Megatron does not allow fp8 and fp4 together)."
+        )
+    
+    if fp8_on:
         try:
             model_cfg.fp8 = fp8_cfg["fp8"]
             model_cfg.fp8_recipe = fp8_cfg["fp8_recipe"]
             model_cfg.fp8_param = fp8_cfg["fp8_param"]
         except KeyError as e:
             raise KeyError(f"Missing key in fp8_cfg: {e}")
+    
+    if fp4_on:
+        try:
+            model_cfg.fp4 = fp4_cfg["fp4"]
+            model_cfg.fp4_recipe = fp4_cfg["fp4_recipe"]
+            model_cfg.fp4_param = fp4_cfg["fp4_param"]
+        except KeyError as e:
+            raise KeyError(f"Missing key in fp4_cfg: {e}")
+        model_cfg.fp8 = None
+        if fp4_cfg.get("fp4_recipe") == "custom":
+            factory = fp4_cfg.get("fp4_quantizer_factory")
+            if not factory:
+                raise ValueError(
+                    "fp4_quantizer_factory is required in fp4_cfg when "
+                    "fp4_recipe is 'custom'"
+                )
+            model_cfg.fp4_quantizer_factory = factory
+        print(
+            f"[fp4_cfg] Megatron FP4 training enabled: fp4={fp4_cfg['fp4']} "
+            f"recipe={fp4_cfg['fp4_recipe']} fp4_param={fp4_cfg['fp4_param']}",
+            flush=True,
+        )
+    
+    # Keep first/last N TransformerBlocks in BF16 while using FP8/FP4
+    # (Megatron fp8_utils / fp4_utils). Layer counts are per pipeline stage.
+    mc = config["megatron_cfg"]
+    if "first_last_layers_bf16" in mc:
+        model_cfg.first_last_layers_bf16 = mc["first_last_layers_bf16"]
+    if "num_layers_at_start_in_bf16" in mc:
+        model_cfg.num_layers_at_start_in_bf16 = mc["num_layers_at_start_in_bf16"]
+    if "num_layers_at_end_in_bf16" in mc:
+        model_cfg.num_layers_at_end_in_bf16 = mc["num_layers_at_end_in_bf16"]
+    
+    # TE-native per-module precision recipe -> TransformerConfig.quant_recipe
+    # (mirrors Megatron's --te-precision-config-file argparse path).
+    te_precision_path = mc.get("te_precision_config_file")
+    if te_precision_path:
+        from megatron.core.quantization.utils import load_quantization_recipe
+    
+        model_cfg.quant_recipe = load_quantization_recipe(te_precision_path)
+        print(
+            f"[fp4_cfg] TE per-module precision recipe loaded from {te_precision_path}",
+            flush=True,
+        )
 
 
 def _validate_optimizer_config(config: PolicyConfig) -> None:

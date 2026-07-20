@@ -1,0 +1,30 @@
+defaults: grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken.yaml
+# M1 recipe + TE NVFP4 per-token TRAINING: real quantized compute in the
+# Megatron GEMMs (per-token activation scaling via NVTE knobs), matching the
+# per-token rollout. First 2 / last 4 layers stay BF16 (f2l4, mirroring the
+# m-inf precision study's nvfp4_pertoken leg).
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken-fp4train
+policy:
+  megatron_cfg:
+    optimizer:
+      use_precision_aware_optimizer: false
+    fp4_cfg:
+      enabled: true
+      fp4: e2m1
+      fp4_recipe: nvfp4
+      fp4_param: false
+    first_last_layers_bf16: true
+    num_layers_at_start_in_bf16: 2
+    num_layers_at_end_in_bf16: 4
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NVTE_NVFP4_ROW_SCALED_ACTIVATION: '1'
+      NVTE_NVFP4_DISABLE_RHT: '1'
+      NVTE_NVFP4_DISABLE_2D_QUANTIZATION: '1'
+      NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: '1'
+      NVTE_BACKWARD_OVERRIDE: dequantized
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken-fp4train
+  wandb:
+    name: grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken-fp4train

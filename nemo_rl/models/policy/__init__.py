@@ -303,6 +303,23 @@ class Fp8Config(TypedDict):
 
 
 # Type exists to be lax if not specified
+class Fp4Config(TypedDict):
+    # Master switch for TE NVFP4 training (real quantized compute in the
+    # Megatron GEMMs; BF16 master weights). Mutually exclusive with fp8_cfg.
+    # Requires Blackwell+ and TE >= 2.7. Per-token activation scaling and the
+    # other NVTE_NVFP4_* knobs ride megatron_cfg.env_vars.
+    enabled: bool
+    # FP4 format for the GEMMs. Only "e2m1" is supported.
+    fp4: NotRequired[str]
+    # FP4 scaling recipe: "nvfp4" (NVFP4BlockScaling) or "custom".
+    fp4_recipe: NotRequired[str]
+    # When True, keep parameters in FP4 (not recommended; the RL flows keep
+    # BF16 master weights and quantize at GEMM/refit time).
+    fp4_param: NotRequired[bool]
+    # Dotted path to a quantizer factory; required when fp4_recipe == "custom".
+    fp4_quantizer_factory: NotRequired[str]
+
+
 class MegatronConfigDisabled(TypedDict):
     enabled: Literal[False]
 
@@ -441,6 +458,16 @@ class MegatronConfig(TypedDict):
     clear_memory_caches_before_refit: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
+    # TE NVFP4 training settings (mutually exclusive with fp8_cfg).
+    fp4_cfg: NotRequired[Fp4Config]
+    # Keep the first/last N transformer blocks in BF16 under FP8/FP4 training
+    # (Megatron fp8_utils/fp4_utils; layer counts are per pipeline stage).
+    first_last_layers_bf16: NotRequired[bool]
+    num_layers_at_start_in_bf16: NotRequired[int]
+    num_layers_at_end_in_bf16: NotRequired[int]
+    # Path to a TE per-module precision recipe YAML (glob matchers over module
+    # names), loaded via megatron.core.quantization.utils.load_quantization_recipe.
+    te_precision_config_file: NotRequired[str]
 
 
 class DraftConfigDisabled(TypedDict):

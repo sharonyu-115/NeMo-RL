@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import fnmatch
 import gc
 import logging
 import os
@@ -369,8 +370,22 @@ class MegatronPolicyWorkerImpl(
             "defer_fp32_logits", None
         ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
 
-        # Store FP8 config for later use
+        # Store FP8 / FP4 config for later use
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+        self.fp4_cfg = config["megatron_cfg"].get("fp4_cfg", None)
+
+        # NVTE_BACKWARD_OVERRIDE (MXFP8/NVFP4 high-precision backward) must
+        # apply only during train() forward+backward — it is incompatible with
+        # the inference/logprob forward paths. Capture it, strip it from the
+        # global env, and re-apply it inside the training context manager.
+        self._nvte_backward_override = (
+            (config["megatron_cfg"].get("env_vars") or {}).get(
+                "NVTE_BACKWARD_OVERRIDE"
+            )
+            or os.environ.get("NVTE_BACKWARD_OVERRIDE")
+        )
+        if self._nvte_backward_override is not None:
+            os.environ.pop("NVTE_BACKWARD_OVERRIDE", None)
 
         # Full-iteration CUDA graphs cannot be interrupted, so disable the
         # NaN-in-loss check that would otherwise require breaking out of the graph.
@@ -540,6 +555,22 @@ class MegatronPolicyWorkerImpl(
             return
         self.model.load_state_dict(extra_state, strict=False)
 
+    @contextmanager
+    def _nvte_backward_override_training_ctx(self):
+        """Apply NVTE_BACKWARD_OVERRIDE only for train() forward+backward.
+
+        The override (e.g. ``dequantized`` for MXFP8/NVFP4 high-precision
+        backward) must not leak into inference/logprob forwards, so it is
+        stripped from the environment at init and re-applied only here.
+        """
+        if self._nvte_backward_override is not None:
+            os.environ["NVTE_BACKWARD_OVERRIDE"] = self._nvte_backward_override
+        try:
+            yield
+        finally:
+            if self._nvte_backward_override is not None:
+                os.environ.pop("NVTE_BACKWARD_OVERRIDE", None)
+
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -694,7 +725,10 @@ class MegatronPolicyWorkerImpl(
                         stage="train",
                         require=True,
                     )
-                    with maybe_r3_trace_stage("train", enabled=use_router_replay):
+                    with (
+                        self._nvte_backward_override_training_ctx(),
+                        maybe_r3_trace_stage("train", enabled=use_router_replay),
+                    ):
                         losses_reduced = megatron_forward_backward(
                             model=self.model,
                             data_iterator=data_iterator,
@@ -1170,6 +1204,7 @@ class MegatronPolicyWorkerImpl(
         # The critical wrap: hooks fire (accumulate main_grad) but the
         # per-call reduce dispatch is gated off.
         with (
+            self._nvte_backward_override_training_ctx(),
             maybe_r3_trace_stage("train", enabled=use_router_replay),
             self.model.no_sync(),
         ):
@@ -1734,6 +1769,7 @@ class MegatronPolicyWorkerImpl(
     @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
     def prepare_refit_info(self) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        self._warn_fp4_f2l4_rollout_ignore_mismatch()
         self.refit_param_info_mcore = self._calculate_refit_param_info()
 
         # Collect tensor metadata for refit / hf side info
@@ -1868,6 +1904,42 @@ class MegatronPolicyWorkerImpl(
         return NvFp4PerTokenRolloutConfig.model_validate(
             generation_cfg["nvfp4_pertoken_rollout"]
         )
+
+    def _warn_fp4_f2l4_rollout_ignore_mismatch(self) -> None:
+        """Warn when TE keeps first/last layers BF16 but the per-token rollout
+        would still quantize them (train/rollout precision divergence)."""
+        rollout_cfg = self._nvfp4_pertoken_rollout_cfg()
+        mc = self.cfg.get("megatron_cfg") or {}
+        fp4_cfg = mc.get("fp4_cfg") or {}
+        if (
+            rollout_cfg is None
+            or not fp4_cfg.get("enabled")
+            or not mc.get("first_last_layers_bf16")
+        ):
+            return
+        num_layers = self.megatron_bridge.transformer_config.num_layers
+        n_start = mc.get("num_layers_at_start_in_bf16", 0)
+        n_end = mc.get("num_layers_at_end_in_bf16", 0)
+        bf16_layers = list(range(n_start)) + list(
+            range(num_layers - n_end, num_layers)
+        )
+        ignore = rollout_cfg.resolved_ignore()
+        uncovered = [
+            i
+            for i in bf16_layers
+            if not any(
+                fnmatch.fnmatch(f"model.layers.{i}.mlp.experts.0.gate_proj", pat)
+                for pat in ignore
+            )
+        ]
+        if uncovered:
+            warnings.warn(
+                "[nvfp4_pertoken] TE keeps layers "
+                f"{uncovered} in BF16 during training (f2l4) but the rollout "
+                "ignore patterns do not exclude their experts — those layers "
+                "will be quantized at refit while training in BF16. Extend "
+                "generation.nvfp4_pertoken_rollout.ignore to cover them."
+            )
 
     def _iter_params_with_optional_kv_scales(
         self,

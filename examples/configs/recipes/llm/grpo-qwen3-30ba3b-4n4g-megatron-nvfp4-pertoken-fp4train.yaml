@@ -7,6 +7,11 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-nvfp4-pertoken-fp4train
 policy:
   megatron_cfg:
+    # The performance parent pins fp64 router probs; with fp4_cfg enabled the
+    # MoE experts route permuted_probs through TE's quantization padding
+    # (fused_multi_row_padding), which has no fp64 kernel — the first logprob
+    # forward dies with "GetTransformerEngineDType: Invalid type (7)".
+    moe_router_dtype: fp32
     optimizer:
       use_precision_aware_optimizer: false
     fp4_cfg:

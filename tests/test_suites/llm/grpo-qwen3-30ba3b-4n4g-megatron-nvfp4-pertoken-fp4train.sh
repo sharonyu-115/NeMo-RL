@@ -64,16 +64,16 @@ if [[ $MAX_RECORDED_STEP -lt $MAX_STEPS ]]; then
     exit 1
 fi
 
-# gen_kl/js gates are wider than the BF16-training variant's (0.03/0.007):
-# fp4 training logprobs quantize differently than the rollout kernel (TE
-# row-scaled vs flashinfer block-16), so the train/gen gap is inherently
-# larger. Evidence: job 2411268 measured 0.042/0.012 (before the f2l4-aligned
-# rollout ignore); tighten from 50-step evidence once available.
+# Same gen_kl/js gates as the BF16-training variant (0.03/0.007). With the
+# attention-BF16 TE recipe (experts-only NVFP4, matching the rollout), the
+# fp4 train/gen gap is actually SMALLER than BF16 training: job 2411458
+# measured gen_kl 0.0113, js 0.0029 (vs the earlier all-layers-NVFP4 run's
+# 0.037/0.0105). Kept at 0.03/0.007 for ~2.5x headroom over run-to-run noise.
 uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     "data[\"train/reward\"][\"$MAX_STEPS\"] >= 0.25" \
     "data[\"validation/accuracy\"][\"$MAX_STEPS\"] >= 0.4" \
-    "data[\"train/gen_kl_error\"][\"$MAX_STEPS\"] < 0.05" \
-    "data[\"train/js_divergence_error\"][\"$MAX_STEPS\"] < 0.015" \
+    "data[\"train/gen_kl_error\"][\"$MAX_STEPS\"] < 0.03" \
+    "data[\"train/js_divergence_error\"][\"$MAX_STEPS\"] < 0.007" \
     "data[\"train/approx_entropy\"][\"$MAX_STEPS\"] < 0.35"
 
 mapfile -t TRAIN_DATA_FILES < <(

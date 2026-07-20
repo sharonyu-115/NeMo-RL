@@ -243,3 +243,19 @@ Rules out "fp4 not applied to logprob forward" bug: that would give M2≈M1
 module set (rollout quantizes attention too, OR fp4 training experts-only).
 Ungated, run healthy (reward/acc rising). **M1 (BF16 train) AND M2 (fp4
 train) per-token W4A4 rollout both validated e2e on Qwen3-30B-A3B/GB200.**
+
+### M2 attn-BF16 refinement (job 2411458, GREEN) — closed the gen_kl gap
+Wired the rl-fp4 study's TE per-module recipe
+(examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml, via
+te_precision_config_file): demotes attention (linear_qkv/linear_proj) to
+BF16, keeps only MoE experts (linear_fc1/fc2) in NVFP4 — the "align the
+quantized module set" lever from the gen_kl analysis. RESULT: gen_kl
+0.037→**0.0113**, js 0.0105→**0.0029**, token_mult_prob(step2) 9.86→**2.97**
+— now BELOW BF16-train M1 (0.018/0.005/1.25) because training matches the
+rollout on BOTH axes (attn BF16 both sides, experts NVFP4 both sides; M1
+trained experts BF16 vs the NVFP4 rollout). fp4train gates tightened back to
+0.03/0.007 (was 0.05/0.015). Confirms the coverage-asymmetry diagnosis
+empirically. Config knobs documented in CONFIG-fp4train.md. Watch: step-1
+token_mult_prob spiked to 180 (one outlier seq; exp-based, fragile) then
+2.97 at step 2 — trust mean-based gen_kl/js. **attn-BF16 is now the
+committed fp4train config.**

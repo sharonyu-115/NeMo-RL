@@ -55,15 +55,21 @@ The per-token rollout quantizes ONLY MoE experts (`DEFAULT_NVFP4_IGNORE`
 keeps `self_attn`, router, shared experts, norms in BF16). So:
 
 - Global `fp4_cfg` alone quantizes training attention -> diverges from the
-  BF16-rollout attention -> inflated gen_kl (M2 job 2411336: gen_kl 0.035,
+  BF16-rollout attention -> inflated gen_kl (M2 job 2411336: gen_kl 0.037,
   token_mult_prob 15.8->9.9 vs BF16-train M1's 0.018 / ~1.1).
 - Adding `attn_bf16_mlp_nvfp4.yaml` keeps training attention BF16, matching
-  the rollout, so only the experts (quantized on both sides) contribute to
-  the gap. Expected to reduce gen_kl toward the M1 band.
+  the rollout. MEASURED (job 2411458): gen_kl 0.0113, js 0.0029,
+  token_mult_prob 2.97 — BELOW both the all-NVFP4 run AND BF16-train M1,
+  because this config matches the rollout on both axes (attention BF16 both
+  sides, experts NVFP4 both sides; M1 trained experts BF16 vs NVFP4 rollout).
+  Driver gates tightened back to 0.03/0.007 (this config clears with ~2.5x
+  margin). NOTE token_mult_prob_error spiked to 180 at STEP 1 (one outlier
+  sequence; exp-of-logprob-diff is fragile) then settled to 2.97 at step 2 —
+  gen_kl/js (mean-based) are the reliable signals; step-1 tmpe is noisy.
 
 Even matched coverage won't drive the gap to zero: TE row/per-token-scaled
 NVFP4 (training) and flashinfer block-16 NVFP4 (rollout) are different
-kernels, so the expert-GEMM errors don't fully cancel.
+kernels, so the expert-GEMM errors don't fully cancel (residual gen_kl 0.011).
 
 ## NVTE activation-quantization knobs (env_vars)
 

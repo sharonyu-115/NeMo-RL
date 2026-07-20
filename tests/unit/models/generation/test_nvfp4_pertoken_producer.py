@@ -170,16 +170,30 @@ def test_filter_emits_fused_tensors_and_passes_rest():
     assert "model.layers.0.mlp.experts.0.gate_proj.weight" not in out
 
 
-def test_filter_fused_matches_per_projection_quantization():
+def test_filter_w13_shares_one_global_scale_per_expert():
+    """Gate+up must be quantized under ONE per-expert global scale.
+
+    vLLM's ModelOptNvFp4FusedMoE.process_weights_after_loading keeps only
+    w13_weight_scale_2[:, 0] for the whole fused tensor — per-projection
+    scales silently decode the up half with the gate scale.
+    """
     stream = _expert_stream(num_experts=2, n=16, k=32)
     tensors = {n: t for n, t in stream}
     out = dict(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
     p = "model.layers.0.mlp.experts"
+    s2 = out[f"{p}.w13_weight_scale_2"]
+    assert torch.equal(s2[:, 0], s2[:, 1])
     for e in range(2):
-        gq, _, gs2 = M.quantize_nvfp4_weight(tensors[f"{p}.{e}.gate_proj.weight"])
-        uq, _, us2 = M.quantize_nvfp4_weight(tensors[f"{p}.{e}.up_proj.weight"])
-        assert torch.equal(out[f"{p}.w13_weight"][e], torch.cat([gq, uq], dim=0))
-        assert torch.equal(out[f"{p}.w13_weight_scale_2"][e], torch.stack([gs2, us2]))
+        fused = torch.cat(
+            [
+                tensors[f"{p}.{e}.gate_proj.weight"],
+                tensors[f"{p}.{e}.up_proj.weight"],
+            ],
+            dim=0,
+        )
+        fq, _, fs2 = M.quantize_nvfp4_weight(fused)
+        assert torch.equal(out[f"{p}.w13_weight"][e], fq)
+        assert torch.equal(s2[e, 0], fs2)
 
 
 def test_filter_flushes_multiple_layers_in_order():

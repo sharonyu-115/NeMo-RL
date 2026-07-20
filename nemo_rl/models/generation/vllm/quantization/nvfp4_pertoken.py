@@ -188,8 +188,9 @@ def iter_nvfp4_pertoken_weights(
     Wraps the ``(hf_name, tensor)`` iterator the Megatron policy worker already
     produces (TP-gathered, HF-named). Per-expert projections matching
     ``quant_patterns`` (minus ``ignore_patterns``) are collected per layer,
-    quantized per (expert, projection), and emitted as FUSED stacked tensors
-    in the ModelOpt fused-MoE convention::
+    quantized per expert (gate+up share one global scale — vLLM's fused-MoE
+    loader keeps only ``w13_weight_scale_2[:, 0]``), and emitted as FUSED
+    stacked tensors in the ModelOpt fused-MoE convention::
 
         <...>.experts.w13_weight          uint8   (E, 2N, K/2)
         <...>.experts.w13_weight_scale    e4m3    (E, 2N, K/16)
@@ -234,18 +235,23 @@ def iter_nvfp4_pertoken_weights(
         def _stack(proj: str) -> torch.Tensor:
             return torch.stack([group[proj][e] for e in range(num_experts)], dim=0)
 
-        # Per-(expert, projection) global scales — exactly the on-disk
-        # ModelOpt NVFP4 layout the probe validated (w13_weight_scale_2 is
-        # (E, 2): one scale per gate/up shard).
-        g_q, g_bs, g_s2 = quantize_nvfp4_weight(_stack("gate_proj"))
-        u_q, u_bs, u_s2 = quantize_nvfp4_weight(_stack("up_proj"))
+        # ONE global scale per expert across the fused gate+up tensor.
+        # vLLM's ModelOptNvFp4FusedMoE.process_weights_after_loading collapses
+        # w13_weight_scale_2 to column 0 (`[:, 0]`) — per-projection scales
+        # would decode the up half with the gate scale, corrupting every MoE
+        # output (observed as reward=0 / no-EOS generations). Quantizing the
+        # stacked (E, 2N, K) tensor matches upstream's online-quant behavior;
+        # the (E, 2) checkpoint-convention shape carries the shared scale in
+        # both columns.
+        w13 = torch.cat([_stack("gate_proj"), _stack("up_proj")], dim=1)
+        w13_q, w13_bs, w13_s2 = quantize_nvfp4_weight(w13)
         d_q, d_bs, d_s2 = quantize_nvfp4_weight(_stack("down_proj"))
 
         quantized_layers += 1
         quantized_experts += num_experts
-        yield f"{prefix}.w13_weight", torch.cat([g_q, u_q], dim=1)
-        yield f"{prefix}.w13_weight_scale", torch.cat([g_bs, u_bs], dim=1)
-        yield f"{prefix}.w13_weight_scale_2", torch.stack([g_s2, u_s2], dim=1)
+        yield f"{prefix}.w13_weight", w13_q
+        yield f"{prefix}.w13_weight_scale", w13_bs
+        yield f"{prefix}.w13_weight_scale_2", w13_s2.unsqueeze(1).expand(-1, 2).contiguous()
         yield f"{prefix}.w2_weight", d_q
         yield f"{prefix}.w2_weight_scale", d_bs
         yield f"{prefix}.w2_weight_scale_2", d_s2

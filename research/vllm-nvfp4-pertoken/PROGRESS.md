@@ -107,3 +107,23 @@ Also: bake4 (TE 937c4de) GREEN — TE 2.17.0.dev0+937c4de0, ROW_SCALED knob
 present, training step passed → v4 sqsh is the M2 image
 (nemo-rl-nvfp4-pertoken-venvs-gb200-2026-07-20-v4.sqsh). TE 2.15 knob absence
 confirmed in .so strings, not just python source.
+
+7. **Fused w13 needs ONE global scale per expert** (numerics, jobs
+   2410625/2410626): both runs completed mechanically (refit markers on all
+   ranks, 40-70s step times) but generations were garbage — reward=0,
+   val accuracy=0, every sequence at the 4096 cap, NaN entropy/gen_kl (train
+   side healthy: finite kl_penalty). Root cause in vLLM's
+   `ModelOptNvFp4FusedMoE.process_weights_after_loading`:
+   `w13_weight_scale_2 = layer.w13_weight_scale_2[:, 0]` — the loader keeps
+   only the GATE global scale for the whole fused w13 (warning_once
+   "w1_weight_scale_2 must match w3_weight_scale_2", present in the logs on
+   every worker). Our filter quantized gate/up per-projection, so the up half
+   decoded off by scale2_gate/scale2_up per expert → corrupted every MoE
+   layer. Real ModelOpt ckpts don't hit this (fused-aware export = equal
+   scales), which is why the Stage-1 hybrid probe was coherent. Fix: filter
+   now quantizes the stacked (E, 2N, K) gate+up tensor in one producer call
+   (per-expert amax over both projections — exactly upstream's
+   `_quantize_moe_weight_to_nvfp4` online behavior) and emits (E, 2)
+   scale_2 with identical columns. Lesson: the warning was in retry-5/6 logs
+   all along — grep for `Accuracy may be affected` class warnings, not just
+   crashes.

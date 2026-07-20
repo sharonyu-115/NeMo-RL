@@ -149,12 +149,11 @@ vllm = [
   # vllm nightly imports openai.types.responses.NamespaceTool (present from
   # openai 2.30) but only declares openai>=2.0.0 — pin the real floor.
   "openai>=2.30.0",
-  # 0.6.14 matches the vllm nightly's flashinfer expectations (validated in the
-  # probe container, which ran flashinfer 0.6.14 with vllm 0.23.1rc1 nightly).
-  # flashinfer-cubin skipped 0.6.14 on PyPI (max 0.6.13); flashinfer-python
-  # declares no cross-pin, so the mixed set is coherent.
+  # vllm dev1283 hard-requires flashinfer-python==0.6.14. flashinfer-cubin has
+  # no 0.6.14 release and flashinfer runtime-enforces version equality with it
+  # when installed — so ship WITHOUT cubin (kernels come from jit-cache /
+  # runtime JIT), matching the upstream vllm-openai nightly image.
   "flashinfer-python==0.6.14",
-  "flashinfer-cubin==0.6.13",
   "flashinfer-jit-cache==0.6.14",
   "nvidia-cutlass-dsl>=4.5.2",
 ]

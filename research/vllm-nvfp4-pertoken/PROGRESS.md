@@ -59,3 +59,17 @@ problems recorded inline as encountered.
 | 6 | `megatron_policy_worker.py`: `_nvfp4_pertoken_rollout_cfg`, wrapped `_iter_params_with_optional_kv_scales` (original renamed `_impl`) | Training-side refit hook: when the mode is enabled, the shared export iterator is wrapped with the Step-2 filter. Because prepare_refit_info metadata, ZMQ streaming, and collective broadcast all consume this one iterator, the advertised state-dict info and streamed payloads stay consistent by construction |
 | 7 | test file additions (P1) | CPU-mocked coverage: filter ignore-patterns, rollout-config defaults/extra-keys, resolver dispatch + mutual exclusion (env-skips where full deps absent; complete in CI post-repin) |
 | 10 | `research/.../smoke_graduated_module.py` + `shim/` (P1) | GB200 validation harness: probe check B2 against the production classes; the shim is a stub `nemo_rl` package tree on PYTHONPATH so vLLM's EngineCore subprocess can re-import the pickled config in containers lacking ray |
+
+## P2 execution (2026-07-20)
+
+| Step | Status | Problems / notes |
+|---|---|---|
+| A1 repin + gitlink + mirror | **DONE** (0300826d9) | Nightly index paths aren't the real S3 objects — actual wheels live at wheels.vllm.ai/<full-sha>/; first mirror grabbed 300-byte error XML. Pinned dev1283 (dev1261's full sha unavailable due to GH API rate limit); A4 producer test is the drift gate. Index moved dev1282→dev1283 overnight — validates mirror-first strategy |
+| A2 uv lock | **DONE** (7f51094fb) | Risk-1 fired: flashinfer-cubin has no 0.6.14 on PyPI (skipped: max 0.6.13). flashinfer-python declares no cross-pin → coherent set python==0.6.14 / cubin==0.6.13 / jit-cache==0.6.14+cu130. Lock green, no 0.20 residue |
+| A3 venv bake | RUNNING (sbatch 2410178) | First srun attempt would have died at the 10-min background cap — resubmitted as sbatch. Bake run = tiny megatron GRPO (grpo_math_1B_megatron, cached Qwen2.5-1.5B, HF offline) building mcore+vllm venvs; NvFp4PerTokenGenerationWorker venv builds on first M1 run (uv cache warm) |
+| B1-B4 M1 artifacts | **DONE** (e1356a920) | Recipe inherits performance parent directly (skips ModelOpt QA parent); moe_backend auto (parent pins triton for vllm-0.20 refit reasons); driver greps swapped to per-token markers incl. per-refit "refit: quantized N" liveness line (RuntimeError on zero-quantized); ptyche launcher + .env |
+| C1-C3 fp4 port + tests | **DONE** (e1356a920) | fp4 block extracted to apply_te_precision_config for testability; 7/7 logic tests pass via shim runner on login node (no pytest there); NVTE_BACKWARD_OVERRIDE gated train-only at both forward_backward sites; f2l4↔ignore warning at prepare_refit_info; data.py fp4 padding branch |
+| C4 fp4train recipe | **DONE** (e1356a920) | fp4_cfg + f2l4 + NVTE per-token env vars (ROW_SCALED_ACTIVATION etc.), NVTE_BACKWARD_OVERRIDE=dequantized; driver adds [fp4_cfg] grep |
+| A4 gates | pending (after bake) | |
+| B5 run ladder | pending (after A4) | |
+| D nightly | pending (after B5/C4 runs) | |

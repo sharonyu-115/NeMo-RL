@@ -1,0 +1,112 @@
+defaults: ../../grpo_math_1B.yaml
+# Qwen3-30B-A3B-Base DAPO-512, vLLM colocated generation — BF16 long-run BASELINE
+# on GB200 (8 nodes x 4 GPU = 32 GPUs; tp2/ep8 training, vllm tp4 generation).
+# Ported from the rl-fp4 m-inf study recipe
+# grpo-qwen3-30ba3b-base-4n8g-dapo512-vllm-baseline.yaml (validated to match the
+# reference wandb config), with:
+#   - max response length 8192 -> 20480 (20k); seq/mb-token budgets scaled to match
+#   - 4n x 8 GPU -> 8n x 4 GPU (same tp2/ep8, dp16 — topology-agnostic)
+#   - paths -> general_sa; 800-step run; 5h wall (checkpoint_must_save_by 4:15)
+# The NVFP4 per-token variant inherits this file and adds only the quant deltas.
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_steps: 800
+  val_at_start: true
+  use_dynamic_sampling: true
+  batch_multiplier: 3
+  dynamic_sampling_max_gen_batches: 20
+  overlong_filtering: true
+  use_leave_one_out_baseline: false
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    max_response_length: 20480
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-bf16
+  enabled: true
+  save_period: 10
+  keep_top_k: 3
+  save_optimizer: true
+  checkpoint_must_save_by: "00:04:15:00"  # force save + clean exit before the 5h wall
+policy:
+  model_name: /lustre/fsw/general_sa/shuangy/models/Qwen/Qwen3-30B-A3B-Base
+  tokenizer:
+    name: /lustre/fsw/general_sa/shuangy/models/Qwen/Qwen3-30B-A3B-Base
+  train_global_batch_size: 512
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 22528  # 2048 prompt + 20480 response
+  logprob_chunk_size: 2048
+  offload_optimizer_for_logprob: true
+  make_sequence_length_divisible_by: 8
+  dtensor_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    activation_checkpointing: true
+    defer_fp32_logits: true
+    batch_invariant_mode: false
+    moe_router_dtype: fp32
+    env_vars:
+      NRL_MEGATRON_CHECKPOINT_DIR: /lustre/fsw/general_sa/shuangy/hf/megatron_ckpt
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-7
+      weight_decay: 0.1
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-8
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+    train_mb_tokens: 22528
+    logprob_mb_tokens: 22528
+  generation:
+    backend: vllm
+    max_new_tokens: 20480
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.5
+      enforce_eager: true
+      max_model_len: ${policy.max_total_sequence_length}
+    colocated:
+      enabled: true
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  num_val_samples_to_print: 8
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: qwen3-30b-nvfp4
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-bf16
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

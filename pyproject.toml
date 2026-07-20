@@ -146,6 +146,9 @@ vllm = [
   "vllm @ https://wheels.vllm.ai/9459fc647105f10f754697b3bf136d194564d603/vllm-0.23.1rc1.dev1283%2Bg9459fc647-cp38-abi3-manylinux_2_28_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "vllm==0.23.0 ; sys_platform != 'linux' or (platform_machine != 'aarch64' and platform_machine != 'x86_64')",
   "num2words>=0.5.14",
+  # vllm nightly imports openai.types.responses.NamespaceTool (present from
+  # openai 2.30) but only declares openai>=2.0.0 — pin the real floor.
+  "openai>=2.30.0",
   # 0.6.14 matches the vllm nightly's flashinfer expectations (validated in the
   # probe container, which ran flashinfer 0.6.14 with vllm 0.23.1rc1 nightly).
   # flashinfer-cubin skipped 0.6.14 on PyPI (max 0.6.13); flashinfer-python
@@ -346,6 +349,10 @@ link-mode = "copy"
 # (all in opencv_python_headless.libs/libav*.so shipped by 4.x wheels, which bundle FFmpeg 5.1.6).
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
+  # vllm nightly needs openai>=2.30 (NamespaceTool import) but Gym caps
+  # openai<=2.7.2 (conservative license-review pin) — override globally.
+  # Watch item: exercise gym flows once on the bumped openai.
+  "openai>=2.30.0",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",

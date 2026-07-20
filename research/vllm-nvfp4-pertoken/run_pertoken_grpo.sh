@@ -66,6 +66,17 @@ echo "=============================================="
 cd "${RL_DIR}"
 mkdir -p logs
 
+# The repo is mounted as /opt/nemo-rl (unlike CI's fresh checkout), so a prior
+# run's checkpoints under the driver's run dir survive and the next run
+# auto-resumes past max_num_steps — "Target step N reached, skipping run"
+# validates nothing. Start every submission from a clean run dir; keep it
+# (KEEP_RUN_DIR=1) only when a resume is actually wanted.
+RUN_DIR="tests/test_suites/llm/${DRIVER%.sh}"
+if [[ -d "${RUN_DIR}" && -z "${KEEP_RUN_DIR:-}" ]]; then
+    echo "Removing stale run dir ${RUN_DIR} (set KEEP_RUN_DIR=1 to resume)"
+    rm -rf "${RUN_DIR}"
+fi
+
 export CONTAINER="${CONTAINER_IMAGE}"
 export MOUNTS="/lustre:/lustre,${RL_DIR}:/opt/nemo-rl"
 export GPUS_PER_NODE

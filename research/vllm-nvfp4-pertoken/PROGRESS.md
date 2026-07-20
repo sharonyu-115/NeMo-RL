@@ -155,3 +155,36 @@ confirmed in .so strings, not just python source.
    tensors sent, not loaded; (b) vLLM swallows unmatched refit names by
    design — always check `Failed to load weights` warnings when output
    quality is impossible.
+
+9. **Layer-completion stall** (job 2411197, killed preemptively): with #8
+   fixed the first REAL weight load buffered the entire model
+   (`Allocating ~5.4GB of device memory to buffers` per bucket, still going
+   ~8min into the 600s ZMQ window). The quant method registers
+   w13/w2_input_scale params, counted in load_numel_total, but the refit
+   never streamed them → every RoutedExperts layer stayed "incomplete" →
+   all processing deferred to finalize. Fix: expansion also emits neutral
+   input_scale=1.0 per (expert, projection) — the names real W4A4 ckpts
+   carry, values our method overwrites anyway — restoring online per-layer
+   processing. (This was also defect #5's true mechanism.)
+
+### B5.2 4n4g 2-step: metrics GREEN (2026-07-20)
+
+Attempt ladder: 2410626 (defects #7/#8 latent) → 2411027 (no-op, stale-ckpt
+auto-resume; launcher now wipes run dirs) → 2411044 (#7 fixed, exposed #8) →
+2411117 (#8 fixed, exposed #9, killed at ZMQ-window risk) → **2411197**
+(#7+#8+#9 in).
+
+**RUN VERDICT (job 2411197, 4n4g, 2 steps + val, all fixes in):**
+- validation/accuracy 0.5625 @ step0 AND step2 (gate ≥0.4 ✓)
+- train/reward 0.5625 / 0.5 (gate ≥0.25 ✓)
+- gen_kl_error 0.017/0.018 (<0.03 ✓), js_divergence 0.0046/0.0050
+  (<0.007 ✓), approx_entropy 0.21/0.23 (<0.35 ✓),
+  token_mult_prob_error 1.12/1.51
+- refit ~40s total step time incl. quantize+transport+online reload;
+  no buffering warnings, no failed-load warnings
+- Job state FAILED on ONE driver grep only: the "per-token NVFP4 activation
+  scaling active" marker was logger.info_once on a nemo_rl.* logger inside
+  the engine proc (only the "vllm" tree is configured there — INFO dropped).
+  Defect #10, instrumentation-only: switched to print-once. All quality
+  gates evaluated green from metrics.json by hand. Needs one rerun for a
+  formally green driver.

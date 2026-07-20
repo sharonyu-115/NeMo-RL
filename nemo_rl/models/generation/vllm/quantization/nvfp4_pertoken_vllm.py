@@ -58,6 +58,7 @@ logger = init_logger(__name__)
 NVFP4_PER_TOKEN_METHOD = "nvfp4_pertoken"
 
 _registered = False
+_pertoken_marker_printed = False
 
 
 class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
@@ -95,9 +96,17 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
         ones = torch.ones(num_experts, device=device, dtype=torch.float32)
         replace_parameter(layer, "w13_input_scale", ones)
         replace_parameter(layer, "w2_input_scale", ones.clone())
-        logger.info_once(
-            "%s: per-token NVFP4 activation scaling active", NVFP4_PER_TOKEN_METHOD
-        )
+        # print, not logger.info_once: inside the engine process only the
+        # "vllm" logger tree is configured; INFO on nemo_rl.* loggers is
+        # dropped and the e2e drivers grep this exact liveness marker.
+        global _pertoken_marker_printed
+        if not _pertoken_marker_printed:
+            _pertoken_marker_printed = True
+            print(
+                f"[{NVFP4_PER_TOKEN_METHOD}] per-token NVFP4 activation "
+                "scaling active",
+                flush=True,
+            )
 
         if self.moe.is_act_and_mul and not torch.allclose(
             layer.w13_weight_scale_2[:, 0], layer.w13_weight_scale_2[:, 1]

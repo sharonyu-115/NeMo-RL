@@ -30,6 +30,10 @@ MCORE_EXECUTABLE = (
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
     "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker": VLLM_EXECUTABLE,
+    # Per-token NVFP4 W4A4 rollout workers: same vLLM environment, engine
+    # kwargs differ (quantization=nvfp4_pertoken).
+    "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_worker.NvFp4PerTokenGenerationWorker": VLLM_EXECUTABLE,
+    "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_worker.NvFp4PerTokenAsyncGenerationWorker": VLLM_EXECUTABLE,
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": SGLANG_EXECUTABLE,
     "nemo_rl.models.policy.workers.dtensor_policy_worker.DTensorPolicyWorker": PY_EXECUTABLES.FSDP,
     "nemo_rl.models.policy.workers.dtensor_policy_worker_v2.DTensorPolicyWorkerV2": PY_EXECUTABLES.AUTOMODEL,

@@ -82,12 +82,17 @@ policy:
     backend: vllm
     max_new_tokens: 20480
     vllm_cfg:
-      # tp2, not the coreai baseline's tp4: this model's moe_intermediate_size
-      # 768 / tp4 = 192 is not a multiple of 128, which the GB200 vLLM MoE
-      # kernel requires ("intermediate_size % 128 == 0"). 768/tp2 = 384 is ok,
-      # kv_heads=4 divides 2, and tp2 is the probe-validated per-token TP.
-      tensor_parallel_size: 2
-      gpu_memory_utilization: 0.5
+      # tp1 (NOT the coreai baseline's tp4): (1) tp>1 spawns vLLM's
+      # multiproc_executor, whose CUDA-IPC weight refit uses pidfd_getfd —
+      # blocked by the container ptrace policy across that process boundary
+      # ("pidfd_getfd: Bad file descriptor" at first refit, tp2 jobs
+      # 2411621/2411622). tp1 runs the worker in-process (no pidfd), the M1/M2
+      # proven path. (2) moe_intermediate 768 is fine at tp1 (%128 ok).
+      # (3) 8n x 4 GPU -> 32 data-parallel gen engines. GB200 192GB holds the
+      # full 30B/engine; gpu_mem_util 0.7 gives 20k-KV headroom (policy is
+      # offloaded during colocated generation).
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.7
       enforce_eager: true
       max_model_len: ${policy.max_total_sequence_length}
     colocated:

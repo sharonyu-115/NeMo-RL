@@ -1941,6 +1941,21 @@ class MegatronPolicyWorkerImpl(
                 "generation.nvfp4_pertoken_rollout.ignore to cover them."
             )
 
+    def maybe_init_zmq(self) -> None:
+        """Use a longer ZMQ timeout for quantized-rollout refits.
+
+        The first per-token NVFP4 refit re-runs process_weights_after_loading
+        per layer on the vLLM side (incl. FlashInfer autotune), which can
+        exceed the default 120s while the consumer appears unresponsive.
+        Mirrors the ModelOpt real-quant path's 600s timeout.
+        """
+        super().maybe_init_zmq()
+        if self._nvfp4_pertoken_rollout_cfg() is not None:
+            import zmq
+
+            self.zmq_socket.setsockopt(zmq.SNDTIMEO, 600_000)
+            self.zmq_socket.setsockopt(zmq.RCVTIMEO, 600_000)
+
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,

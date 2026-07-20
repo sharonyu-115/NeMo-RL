@@ -186,6 +186,9 @@ def register_nvfp4_pertoken() -> None:
     logger.info("Registered vLLM quantization method %r", NVFP4_PER_TOKEN_METHOD)
 
 
+NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS = 600_000
+
+
 class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
     """Refit transport for per-token NVFP4 rollouts.
 
@@ -197,6 +200,15 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
     (per-token kernel rebuilt) afterwards, preserving CUDA-graph-stable
     kernel storage.
     """
+
+    def maybe_init_zmq(self) -> None:
+        """Longer ZMQ timeout: the first refit re-processes every layer
+        (per-token kernel rebuild + FlashInfer autotune) before ACKing."""
+        import zmq
+
+        super().maybe_init_zmq()
+        self.zmq_socket.setsockopt(zmq.SNDTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
+        self.zmq_socket.setsockopt(zmq.RCVTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
 
     @contextmanager
     def _weight_update_lifecycle(

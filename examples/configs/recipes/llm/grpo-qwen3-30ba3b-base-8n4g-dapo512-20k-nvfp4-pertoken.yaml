@@ -47,7 +47,9 @@ policy:
       use_precision_aware_optimizer: false
     env_vars:
       NRL_MEGATRON_CHECKPOINT_DIR: /lustre/fsw/general_sa/shuangy/hf/megatron_ckpt
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # See the BF16 recipe: :False avoids the pidfd-based cuMem IPC that the
+      # container ptrace policy blocks during weight refit.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
       NVTE_NVFP4_ROW_SCALED_ACTIVATION: "1"
       NVTE_NVFP4_DISABLE_RHT: "1"
       NVTE_NVFP4_DISABLE_2D_QUANTIZATION: "1"

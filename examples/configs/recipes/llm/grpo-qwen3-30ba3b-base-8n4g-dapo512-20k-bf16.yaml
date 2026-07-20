@@ -64,7 +64,12 @@ policy:
     moe_router_dtype: fp32
     env_vars:
       NRL_MEGATRON_CHECKPOINT_DIR: /lustre/fsw/general_sa/shuangy/hf/megatron_ckpt
-      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+      # expandable_segments:False (NOT the coreai baseline's True): expandable
+      # segments use cuMem VMM, whose CUDA-IPC export needs pidfd_getfd for the
+      # weight refit — blocked by this container's ptrace policy
+      # ("pidfd_getfd: Bad file descriptor", jobs 2411700/2411701). The legacy
+      # allocator uses cudaIpcMemHandle (no pidfd) — the M1/M2-proven setting.
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
     optimizer:
       lr: 1.0e-6
       min_lr: 1.0e-7
@@ -82,15 +87,12 @@ policy:
     backend: vllm
     max_new_tokens: 20480
     vllm_cfg:
-      # tp1 (NOT the coreai baseline's tp4): (1) tp>1 spawns vLLM's
-      # multiproc_executor, whose CUDA-IPC weight refit uses pidfd_getfd —
-      # blocked by the container ptrace policy across that process boundary
-      # ("pidfd_getfd: Bad file descriptor" at first refit, tp2 jobs
-      # 2411621/2411622). tp1 runs the worker in-process (no pidfd), the M1/M2
-      # proven path. (2) moe_intermediate 768 is fine at tp1 (%128 ok).
-      # (3) 8n x 4 GPU -> 32 data-parallel gen engines. GB200 192GB holds the
-      # full 30B/engine; gpu_mem_util 0.7 gives 20k-KV headroom (policy is
-      # offloaded during colocated generation).
+      # tp1 (NOT the coreai baseline's tp4): tp4 gives moe_intermediate
+      # 768/4=192, not %128 — the GB200 vLLM MoE kernel rejects it. tp1 is
+      # valid, is the M1/M2-proven path, and 8n x 4 GPU -> 32 data-parallel gen
+      # engines. GB200 192GB holds the full 30B/engine; gpu_mem_util 0.7 gives
+      # 20k-KV headroom (policy is offloaded during colocated generation).
+      # (The pidfd refit failure was the allocator, not tp — see env_vars.)
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.7
       enforce_eager: true

@@ -1,0 +1,48 @@
+# TE per-module precision recipe (Megatron TransformerConfig.quant_recipe).
+# Loaded via policy.megatron_cfg.te_precision_config_file ->
+# megatron.core.quantization.utils.load_quantization_recipe.
+#
+# Effect (assuming the model's global default is already NVFP4 via fp4_cfg):
+# - Attention input/output projections (linear_qkv, linear_proj) -> BF16.
+# - MLP / MoE-expert linears (linear_fc1, linear_fc2)             -> NVFP4.
+#
+# Why: attention projections contribute the bulk of FP4 logit noise, and the
+# per-token W4A4 vLLM rollout only quantizes the MoE experts (attention stays
+# BF16 there). Keeping training attention in BF16 too aligns the training
+# forward with the rollout forward, shrinking train/gen logprob divergence
+# (token_mult_prob_error / gen_kl_error). Pairs with first_last_layers_bf16.
+#
+# Caveats (from the m-inf precision study):
+# - Matchers run post-init, so fp4_param / fp8_param (init-time weight cast)
+#   cannot be set here -- set them in the yaml's fp4_cfg / fp8_cfg.
+# - Confirm the per-module match log with Megatron --logging-level=20.
+configs:
+  bf16:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe: {}
+  nvfp4:
+    transformer_engine_config_type: "TEQuantizationParams"
+    training_recipe:
+      fp4_quantization_recipe: "nvfp4"
+
+matchers:
+  attn_qkv_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.linear_qkv"
+    enabled: true
+  attn_proj_bf16:
+    config: "bf16"
+    type: "glob"
+    pattern: "*.linear_proj"
+    enabled: true
+  mlp_fc1_nvfp4:
+    config: "nvfp4"
+    type: "glob"
+    pattern: "*.linear_fc1"
+    enabled: true
+  mlp_fc2_nvfp4:
+    config: "nvfp4"
+    type: "glob"
+    pattern: "*.linear_fc2"
+    enabled: true

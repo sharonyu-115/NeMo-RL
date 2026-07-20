@@ -46,6 +46,12 @@ policy:
     first_last_layers_bf16: true
     num_layers_at_start_in_bf16: 2
     num_layers_at_end_in_bf16: 4
+    # fp4_cfg above makes the interior layers NVFP4 globally (attention too).
+    # This TE per-module recipe demotes attention (linear_qkv/linear_proj) back
+    # to BF16, leaving only the MoE-expert linears (linear_fc1/linear_fc2) in
+    # NVFP4 — matching the experts-only per-token rollout so the training
+    # forward and the rollout forward agree (lower gen_kl/token_mult_prob).
+    te_precision_config_file: examples/configs/te_precision/attn_bf16_mlp_nvfp4.yaml
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
       NVTE_NVFP4_ROW_SCALED_ACTIVATION: '1'

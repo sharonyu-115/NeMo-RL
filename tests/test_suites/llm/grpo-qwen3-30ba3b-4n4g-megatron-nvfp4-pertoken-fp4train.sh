@@ -43,6 +43,8 @@ uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METR
 # active, per-token workers dispatched, and every refit actually quantized.
 grep -q "quantization=nvfp4_pertoken" "$RUN_LOG"
 grep -q "\[fp4_cfg\] Megatron FP4 training enabled" "$RUN_LOG"
+# Attention demoted to BF16 via the TE per-module recipe (experts-only NVFP4).
+grep -q "\[fp4_cfg\] TE per-module precision recipe loaded" "$RUN_LOG"
 grep -q "per-token NVFP4 activation scaling active" "$RUN_LOG"
 grep -Eq "\[nvfp4_pertoken\] refit: quantized [1-9][0-9]* expert layers" "$RUN_LOG"
 # The ModelOpt QAT path must NOT be active.

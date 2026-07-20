@@ -188,3 +188,24 @@ auto-resume; launcher now wipes run dirs) → 2411044 (#7 fixed, exposed #8) →
   Defect #10, instrumentation-only: switched to print-once. All quality
   gates evaluated green from metrics.json by hand. Needs one rerun for a
   formally green driver.
+
+### B5.2 formal rerun: JOB 2411254 COMPLETED — driver fully green
+(2026-07-20). All greps (incl. the print-once activation marker) + all
+check_metrics gates passed end-to-end. val acc 0.5625@0 / 0.50@2 (gen-order
+nondeterminism at temp 1.0; both ≥0.4), step times ~40s. **M1 is done at the
+2-step rung.** 50-step confirm launched as job 2411276 (MAX_STEPS=50).
+
+### M2 fp4train first e2e attempts (2026-07-20)
+- Job 2411255 (v4 image via new CONTAINER_IMAGE_OVERRIDE launcher knob):
+  `[fp4_cfg] Megatron FP4 training enabled: fp4=e2m1 recipe=nvfp4
+  fp4_param=False` on all 16 ranks; engine/refit/val@0 green (acc 0.5625,
+  identical to M1 as expected — step-0 val precedes any fp4 training).
+  **Defect #11**: first logprob forward died in TE
+  `fused_multi_row_padding` with `GetTransformerEngineDType: Invalid type
+  (7)` — type 7 = float64. The perf parent pins `moe_router_dtype: fp64`;
+  with fp4_cfg on, Megatron MoE experts route fp64 permuted_probs through
+  TE's quantization padding, which has no double kernel. BF16 (M1) never
+  touches that module. Fix: `moe_router_dtype: fp32` in the fp4train
+  variant (2c28be595) — the rl-fp4 study never set fp64, so it never hit
+  this.
+- Retry job 2411268 in flight.

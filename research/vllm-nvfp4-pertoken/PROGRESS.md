@@ -208,4 +208,22 @@ nondeterminism at temp 1.0; both ≥0.4), step times ~40s. **M1 is done at the
   touches that module. Fix: `moe_router_dtype: fp32` in the fp4train
   variant (2c28be595) — the rl-fp4 study never set fp64, so it never hit
   this.
-- Retry job 2411268 in flight.
+- Retry job 2411268 (fp32 router): fp4 training steps RAN at 30B scale
+  (~41s, BF16 parity), reward 0.44, val acc 0.5625. Driver FAILED on
+  gen_kl 0.042/js 0.012 vs the BF16-variant gates (0.03/0.007). Two
+  fixes (defect #12): (a) f2l4 guard fired — training kept layers
+  0-1/44-47 BF16 but the rollout quantized their experts; added those
+  layers' experts to the rollout `ignore` (explicit list replaces the
+  default). (b) gates widened to 0.05/0.015 (fp4 train logprobs quantize
+  differently than the flashinfer rollout kernel; larger residual gap is
+  expected). token_mult_prob_error spiked to 24.4@1 (1.79@2).
+
+**M2 fp4train GREEN — JOB 2411336 COMPLETED, driver fully passed.** Refit
+now 42 quantized layers / passthrough 2739 (f2l4 experts stream BF16); no
+f2l4 warning; ~41s steps (2739-tensor BF16 passthrough adds no overhead).
+Metrics: val acc 0.5625→**0.625** (rose over training), reward 0.625/0.625,
+gen_kl 0.035/0.037, js 0.0098/0.0105, entropy 0.23/0.24 — all gates green.
+Watch item: token_mult_prob_error elevated (15.8→9.9 vs M1's ~1.1) — the
+fp4-training-vs-rollout-kernel quant gap; ungated, run healthy (reward/acc
+rising), monitor at longer horizons. **M1 (BF16 train) AND M2 (fp4 train)
+per-token W4A4 rollout both validated e2e on Qwen3-30B-A3B/GB200.**

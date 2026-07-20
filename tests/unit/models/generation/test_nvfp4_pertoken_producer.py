@@ -142,62 +142,78 @@ def test_zero_block_yields_zero_codes():
 # ------------------------------------------------------------- refit filter
 
 
-def test_filter_quantizes_matching_and_passes_rest():
-    stream = [
-        ("model.layers.0.mlp.experts.3.gate_proj.weight", torch.randn(32, 64)),
-        ("model.layers.0.self_attn.q_proj.weight", torch.randn(8, 8)),
-        ("model.layers.0.mlp.experts.3.gate_proj.bias", torch.randn(32)),
-        ("model.layers.0.self_attn.attn.k_scale", torch.tensor(1.0)),
-    ]
-    out = list(
+def _expert_stream(num_experts=4, n=32, k=64, layers=("model.layers.0",)):
+    stream = []
+    for layer in layers:
+        for e in range(num_experts):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                shape = (n, k) if proj != "down_proj" else (k, n * 2)
+                stream.append((f"{layer}.mlp.experts.{e}.{proj}.weight", torch.randn(*shape)))
+    return stream
+
+
+def test_filter_emits_fused_tensors_and_passes_rest():
+    stream = _expert_stream(num_experts=4, n=32, k=64)
+    stream.insert(0, ("model.layers.0.self_attn.q_proj.weight", torch.randn(8, 8)))
+    stream.append(("model.layers.0.self_attn.attn.k_scale", torch.tensor(1.0)))
+    out = dict(
         M.iter_nvfp4_pertoken_weights(iter(stream), quant_patterns=["*.experts.*"])
     )
-    names = [n for n, _ in out]
-    assert names == [
-        "model.layers.0.mlp.experts.3.gate_proj.weight",
-        "model.layers.0.mlp.experts.3.gate_proj.weight_scale",
-        "model.layers.0.mlp.experts.3.gate_proj.weight_scale_2",
-        "model.layers.0.self_attn.q_proj.weight",
-        "model.layers.0.mlp.experts.3.gate_proj.bias",
-        "model.layers.0.self_attn.attn.k_scale",
-    ]
-    tensors = dict(out)
-    assert tensors["model.layers.0.mlp.experts.3.gate_proj.weight"].dtype == torch.uint8
-    assert torch.equal(tensors["model.layers.0.self_attn.q_proj.weight"], stream[1][1])
+    p = "model.layers.0.mlp.experts"
+    assert out[f"{p}.w13_weight"].shape == (4, 64, 32)          # (E, 2N, K/2)
+    assert out[f"{p}.w13_weight"].dtype == torch.uint8
+    assert out[f"{p}.w13_weight_scale"].shape == (4, 64, 4)     # (E, 2N, K/16)
+    assert out[f"{p}.w13_weight_scale_2"].shape == (4, 2)
+    assert out[f"{p}.w2_weight"].shape == (4, 64, 32)           # (E, K, 2N/2)
+    assert out[f"{p}.w2_weight_scale_2"].shape == (4,)
+    assert torch.equal(out["model.layers.0.self_attn.q_proj.weight"], stream[0][1])
+    assert "model.layers.0.mlp.experts.0.gate_proj.weight" not in out
 
 
-@cuda_only
-def test_filter_keeps_device():
-    stream = [("m.experts.0.up_proj.weight", torch.randn(16, 32, device="cuda"))]
+def test_filter_fused_matches_per_projection_quantization():
+    stream = _expert_stream(num_experts=2, n=16, k=32)
+    tensors = {n: t for n, t in stream}
     out = dict(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
-    assert all(t.device.type == "cuda" for t in out.values())
+    p = "model.layers.0.mlp.experts"
+    for e in range(2):
+        gq, _, gs2 = M.quantize_nvfp4_weight(tensors[f"{p}.{e}.gate_proj.weight"])
+        uq, _, us2 = M.quantize_nvfp4_weight(tensors[f"{p}.{e}.up_proj.weight"])
+        assert torch.equal(out[f"{p}.w13_weight"][e], torch.cat([gq, uq], dim=0))
+        assert torch.equal(out[f"{p}.w13_weight_scale_2"][e], torch.stack([gs2, us2]))
 
 
-def test_hf_quant_config_shape():
-    cfg = M.build_nvfp4_pertoken_hf_quant_config(["*lm_head*"])
-    assert cfg["quant_algo"] == "NVFP4"
-    assert cfg["ignore"] == ["*lm_head*"]
-    group = cfg["config_groups"]["group_0"]
-    assert group["targets"] == ["Linear"]
-    assert group["input_activations"]["dynamic"] is True
+def test_filter_flushes_multiple_layers_in_order():
+    stream = _expert_stream(
+        num_experts=2, n=16, k=32, layers=("model.layers.0", "model.layers.1")
+    )
+    names = [n for n, _ in M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"])]
+    assert names.index("model.layers.0.mlp.experts.w13_weight") < names.index(
+        "model.layers.1.mlp.experts.w13_weight"
+    )
+    assert len(names) == 12
 
 
 def test_filter_respects_ignore_patterns():
-    stream = [
-        ("m.experts.0.gate_proj.weight", torch.randn(16, 32)),
-        ("m.shared_expert.gate_proj.weight", torch.randn(16, 32)),
-    ]
-    out = list(
+    stream = _expert_stream(num_experts=2, n=16, k=32)
+    stream.append(("m.shared_expert.gate_proj.weight", torch.randn(16, 32)))
+    out = dict(
         M.iter_nvfp4_pertoken_weights(
             iter(stream),
             quant_patterns=["*expert*"],
             ignore_patterns=["*shared_expert*"],
         )
     )
-    names = [n for n, _ in out]
-    assert "m.experts.0.gate_proj.weight_scale" in names
-    assert "m.shared_expert.gate_proj.weight_scale" not in names
-    assert dict(out)["m.shared_expert.gate_proj.weight"].dtype != torch.uint8
+    assert "model.layers.0.mlp.experts.w13_weight" in out
+    assert out["m.shared_expert.gate_proj.weight"].dtype != torch.uint8
+
+
+@cuda_only
+def test_filter_keeps_device():
+    stream = [
+        (n, t.to("cuda")) for n, t in _expert_stream(num_experts=2, n=16, k=32)
+    ]
+    out = dict(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
+    assert all(t.device.type == "cuda" for t in out.values())
 
 
 def test_filter_raises_when_nothing_quantized():

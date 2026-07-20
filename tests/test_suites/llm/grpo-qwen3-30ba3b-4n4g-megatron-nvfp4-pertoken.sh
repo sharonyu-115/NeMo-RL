@@ -43,7 +43,7 @@ uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METR
 # active, per-token workers dispatched, and every refit actually quantized.
 grep -q "quantization=nvfp4_pertoken" "$RUN_LOG"
 grep -q "per-token NVFP4 activation scaling active" "$RUN_LOG"
-grep -Eq "\[nvfp4_pertoken\] refit: quantized [1-9][0-9]* params" "$RUN_LOG"
+grep -Eq "\[nvfp4_pertoken\] refit: quantized [1-9][0-9]* expert layers" "$RUN_LOG"
 # The ModelOpt QAT path must NOT be active.
 ! grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
 ! grep -q "FakeQuantWorker" "$RUN_LOG"

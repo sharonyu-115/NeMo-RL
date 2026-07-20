@@ -30,6 +30,7 @@ The producer matches vLLM's online-quant kernel
 
 import fnmatch
 import logging
+import re
 from collections.abc import Iterator
 from typing import Any, Optional
 
@@ -37,6 +38,10 @@ import torch
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
+
+_EXPERT_WEIGHT_RE = re.compile(
+    r"^(?P<prefix>.*\.experts)\.(?P<eid>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
+)
 
 # Layers kept in native precision during rollout (mirrors the ModelOpt path's
 # default; that path re-exports this constant so the dependency points from
@@ -181,44 +186,104 @@ def iter_nvfp4_pertoken_weights(
     """Refit filter: quantize matching ``*.weight`` tensors in an export stream.
 
     Wraps the ``(hf_name, tensor)`` iterator the Megatron policy worker already
-    produces (TP-gathered, HF-named). Matching weights are quantized on their
-    current device (on-GPU before IPC -> 4x smaller transfers) and yielded in
-    the ModelOpt NVFP4 HF checkpoint layout::
+    produces (TP-gathered, HF-named). Per-expert projections matching
+    ``quant_patterns`` (minus ``ignore_patterns``) are collected per layer,
+    quantized per (expert, projection), and emitted as FUSED stacked tensors
+    in the ModelOpt fused-MoE convention::
 
-        <base>.weight, <base>.weight_scale, <base>.weight_scale_2
+        <...>.experts.w13_weight          uint8   (E, 2N, K/2)
+        <...>.experts.w13_weight_scale    e4m3    (E, 2N, K/16)
+        <...>.experts.w13_weight_scale_2  fp32    (E, 2)
+        <...>.experts.w2_weight / _scale / _scale_2
 
     Everything else (non-matching weights, biases, kv scales, draft weights)
-    passes through untouched.
+    passes through untouched. Assumes the export streams a layer's experts
+    contiguously (HF checkpoint order), flushing on layer-prefix change.
     """
     ignore = ignore_patterns or []
-    quantized = 0
+    quantized_layers = 0
+    quantized_experts = 0
     passthrough = 0
+
+    # Per-(layer-prefix) buffers of expert projections. Experts are stacked
+    # and emitted as FUSED tensors (`<prefix>.w13_weight` etc., the ModelOpt
+    # fused MoE checkpoint convention vLLM's RoutedExperts loader consumes
+    # natively). Streaming per-expert names instead (~55k tensors on a
+    # 128-expert 48-layer model) crawls through per-tensor IPC handshakes and
+    # reload buffering and cannot finish a refit in tolerable time.
+    pending: dict[str, dict[str, dict[int, torch.Tensor]]] = {}
+
+    def _flush(prefix: str) -> Iterator[tuple[str, torch.Tensor]]:
+        nonlocal quantized_layers, quantized_experts
+        group = pending.pop(prefix)
+        missing = {p for p in ("gate_proj", "up_proj", "down_proj") if p not in group}
+        if missing:
+            raise RuntimeError(
+                f"[nvfp4_pertoken] incomplete expert group for {prefix}: "
+                f"missing {sorted(missing)}"
+            )
+        counts = {p: sorted(group[p]) for p in group}
+        num_experts = len(counts["gate_proj"])
+        for p, eids in counts.items():
+            if eids != list(range(num_experts)):
+                raise RuntimeError(
+                    f"[nvfp4_pertoken] non-contiguous expert ids for "
+                    f"{prefix}.{p}: {eids[:5]}..."
+                )
+
+        def _stack(proj: str) -> torch.Tensor:
+            return torch.stack([group[proj][e] for e in range(num_experts)], dim=0)
+
+        # Per-(expert, projection) global scales — exactly the on-disk
+        # ModelOpt NVFP4 layout the probe validated (w13_weight_scale_2 is
+        # (E, 2): one scale per gate/up shard).
+        g_q, g_bs, g_s2 = quantize_nvfp4_weight(_stack("gate_proj"))
+        u_q, u_bs, u_s2 = quantize_nvfp4_weight(_stack("up_proj"))
+        d_q, d_bs, d_s2 = quantize_nvfp4_weight(_stack("down_proj"))
+
+        quantized_layers += 1
+        quantized_experts += num_experts
+        yield f"{prefix}.w13_weight", torch.cat([g_q, u_q], dim=1)
+        yield f"{prefix}.w13_weight_scale", torch.cat([g_bs, u_bs], dim=1)
+        yield f"{prefix}.w13_weight_scale_2", torch.stack([g_s2, u_s2], dim=1)
+        yield f"{prefix}.w2_weight", d_q
+        yield f"{prefix}.w2_weight_scale", d_bs
+        yield f"{prefix}.w2_weight_scale_2", d_s2
+
+    current_prefix: Optional[str] = None
     for name, tensor in base_iter:
+        m = _EXPERT_WEIGHT_RE.match(name)
         if (
-            not name.endswith(".weight")
+            m is None
             or not _matches_any(name, quant_patterns)
             or _matches_any(name, ignore)
         ):
             passthrough += 1
             yield name, tensor
             continue
-        packed, block_scale, weight_scale_2 = quantize_nvfp4_weight(tensor)
-        base = name[: -len(".weight")]
-        quantized += 1
-        yield name, packed
-        yield f"{base}.weight_scale", block_scale
-        yield f"{base}.weight_scale_2", weight_scale_2
+        prefix = m.group("prefix")
+        if current_prefix is not None and prefix != current_prefix:
+            yield from _flush(current_prefix)
+        current_prefix = prefix
+        pending.setdefault(prefix, {}).setdefault(m.group("proj"), {})[
+            int(m.group("eid"))
+        ] = tensor
+
+    for prefix in list(pending):
+        yield from _flush(prefix)
 
     # Per-refit liveness proof: a config/name mismatch (e.g. quant_patterns
     # not matching the export's expert naming) would otherwise silently
     # degrade to an all-BF16 refit that vLLM then fails to load — or worse.
     logger.info(
-        "[nvfp4_pertoken] refit: quantized %d params -> %d tensors, passthrough %d",
-        quantized,
-        3 * quantized,
+        "[nvfp4_pertoken] refit: quantized %d expert layers (%d experts) -> "
+        "%d fused tensors, passthrough %d",
+        quantized_layers,
+        quantized_experts,
+        6 * quantized_layers,
         passthrough,
     )
-    if quant_patterns and quantized == 0:
+    if quant_patterns and quantized_layers == 0:
         raise RuntimeError(
             "[nvfp4_pertoken] refit quantized 0 params although quant_patterns="
             f"{quant_patterns} is configured — export naming and patterns are "

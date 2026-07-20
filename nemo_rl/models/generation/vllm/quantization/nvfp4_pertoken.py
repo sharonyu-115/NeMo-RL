@@ -275,13 +275,13 @@ def iter_nvfp4_pertoken_weights(
     # Per-refit liveness proof: a config/name mismatch (e.g. quant_patterns
     # not matching the export's expert naming) would otherwise silently
     # degrade to an all-BF16 refit that vLLM then fails to load — or worse.
-    logger.info(
-        "[nvfp4_pertoken] refit: quantized %d expert layers (%d experts) -> "
-        "%d fused tensors, passthrough %d",
-        quantized_layers,
-        quantized_experts,
-        6 * quantized_layers,
-        passthrough,
+    # print (not logger.info): Ray workers run at WARNING by default and the
+    # e2e drivers grep this exact marker as the per-refit liveness proof.
+    print(
+        f"[nvfp4_pertoken] refit: quantized {quantized_layers} expert layers "
+        f"({quantized_experts} experts) -> {6 * quantized_layers} fused "
+        f"tensors, passthrough {passthrough}",
+        flush=True,
     )
     if quant_patterns and quantized_layers == 0:
         raise RuntimeError(

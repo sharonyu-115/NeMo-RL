@@ -58,6 +58,9 @@ esac
 # fragile EXTRA_ARGS quoting. Its basename drives RUN_NAME -> distinct dirs.
 RECIPE="${RECIPE_OVERRIDE:-${RECIPE}}"
 RUN_NAME="$(basename "${RECIPE}" .yaml)"
+# EXP_TAG: suffix the run name -> distinct wandb name + ckpt/log dirs, so a
+# fresh run logs clean metrics (no resume/collision with a prior run's bucket).
+[[ -n "${EXP_TAG:-}" ]] && RUN_NAME="${RUN_NAME}-${EXP_TAG}"
 MAX_STEPS="${MAX_STEPS:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 

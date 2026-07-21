@@ -109,7 +109,10 @@ policy:
       # (job 2412970 OOM'd at step ~11 at 0.7). Safe on KV — generations avg
       # ~1k tokens, far below the 20k cap.
       gpu_memory_utilization: 0.5
-      enforce_eager: true
+      # enforce_eager=false: CUDA graphs (validated ~10x faster on the NVFP4
+      # per-token path, job 2417294). BF16 uses the triton MoE backend — its
+      # graph capture is unvalidated; if capture fails it errors fast at init.
+      enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
     colocated:
       enabled: true

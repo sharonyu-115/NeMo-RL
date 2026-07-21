@@ -1,0 +1,17 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken.yaml
+# CUDA-graph probe: identical to the NVFP4 per-token recipe EXCEPT
+# enforce_eager=false (enable CUDA graphs). Tests whether the slow rollout
+# (~12.8 tok/s/req, ~78ms/decode-step, launch-bound) is caused by graphs
+# being off. Short, no-checkpoint, distinct run dirs (via its own basename)
+# so it never touches the long run's checkpoint.
+grpo:
+  val_at_start: false   # skip the slow 960-sample AIME val; measure train-step rollout
+checkpointing:
+  enabled: false
+policy:
+  generation:
+    vllm_cfg:
+      # The whole point of the probe. Watch: (1) CUDA-graph capture of the
+      # nvfp4_pertoken FLASHINFER_TRTLLM MoE path on dev1283, (2) wake_up OOM
+      # at gpu_memory_utilization 0.5 (graphs use more memory).
+      enforce_eager: false

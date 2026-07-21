@@ -54,6 +54,9 @@ case "${PRECISION}" in
     nvfp4) RECIPE="examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken.yaml" ;;
     *) echo "ERROR: PRECISION must be bf16 or nvfp4 (got '${PRECISION}')." >&2; exit 1 ;;
 esac
+# RECIPE_OVERRIDE: run an arbitrary recipe (e.g. a probe variant) without the
+# fragile EXTRA_ARGS quoting. Its basename drives RUN_NAME -> distinct dirs.
+RECIPE="${RECIPE_OVERRIDE:-${RECIPE}}"
 RUN_NAME="$(basename "${RECIPE}" .yaml)"
 MAX_STEPS="${MAX_STEPS:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"

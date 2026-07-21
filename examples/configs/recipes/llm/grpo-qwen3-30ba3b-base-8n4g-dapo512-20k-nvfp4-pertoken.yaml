@@ -7,12 +7,12 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken
 policy:
   generation:
-    # The BF16 base forces moe_backend=triton (its FlashInfer BF16 MoE bug on
-    # GB200). NVFP4's per-token kernel REQUIRES the FlashInfer TRT-LLM backend,
-    # so null it out here to restore auto-selection (the validated config; the
-    # 4D-tiling bug doesn't affect the ModelOpt-quantized expert params).
-    vllm_kwargs:
-      moe_backend: null
+    # Inherit moe_backend=triton from the BF16 base. moe_backend only governs
+    # the UNQUANTIZED MoE (here: the f2l4 BF16 experts, layers 0-1/44-47) —
+    # vLLM rejects null/None for it. Triton is the correct/safe choice for
+    # those BF16 experts (the GB200 FlashInfer BF16 MoE 4D-tiling bug). The
+    # NVFP4-quantized experts pick FlashInfer TRT-LLM via the ModelOpt quant
+    # method, independent of moe_backend, so the per-token path is unaffected.
     # Per-token W4A4 rollout: weights real-quantized at refit, activations
     # per-token dynamic in vLLM. Ignore mirrors training coverage — attention /
     # router / shared / norms BF16, and the f2l4 layers' experts (0-1, 44-47)

@@ -90,6 +90,14 @@ policy:
   generation:
     backend: vllm
     max_new_tokens: 20480
+    vllm_kwargs:
+      # Force the Triton fused-MoE backend. The default FlashInfer BF16 MoE on
+      # GB200 stores w13_weight in a 4D tiled layout (E, hidden/64, 2N, 64); the
+      # stock RoutedExperts weight_loader then indexes a 3D per-expert slice and
+      # rejects the shard dim ("shard_dim=0 ... 3D tensor") at refit. Triton
+      # uses the standard 3D param. (Documented in the Stage-1 probe README as
+      # the GB200 BF16 FlashInfer fused-MoE workaround.)
+      moe_backend: triton
     vllm_cfg:
       # tp1 (NOT the coreai baseline's tp4): tp4 gives moe_intermediate
       # 768/4=192, not %128 — the GB200 vLLM MoE kernel rejects it. tp1 is

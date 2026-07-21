@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import os
 import re
 import traceback
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -398,6 +399,62 @@ class VllmInternalWorkerExtension:
         """
         from nemo_rl.models.generation.vllm.quantization import fp8
 
+        # Wrap the fused-MoE expert weight_loader once to name the exact
+        # tensor/param/shard_dim on failure (vLLM's ValueError omits it).
+        # No-op on success; only prints when a load raises, then re-raises.
+        if not os.environ.get("NRL_REFIT_DEBUG_OFF"):
+            try:
+                from vllm.model_executor.layers.fused_moe.routed_experts import (
+                    RoutedExperts,
+                )
+
+                if not getattr(RoutedExperts, "_nrl_wrapped", False):
+                    import sys as _sys
+
+                    # Patch the staticmethod that raises (resolved on the class
+                    # at call time, unlike the per-param-captured weight_loader).
+                    # On an invalid shard_dim, walk up the stack to the
+                    # weight_loader frame to recover weight_name + shapes.
+                    _orig_ghd = RoutedExperts._get_hidden_dim
+
+                    def _ghd(shard_dim, ndim):
+                        valid = ndim < 2 or shard_dim in (ndim - 2, ndim - 1)
+                        if not valid:
+                            info = {}
+                            f = _sys._getframe(1)
+                            depth = 0
+                            while f is not None and depth < 8:
+                                loc = f.f_locals
+                                for k in ("weight_name", "shard_id", "expert_id"):
+                                    if k in loc and k not in info:
+                                        info[k] = loc[k]
+                                if "loaded_weight" in loc and "loaded" not in info:
+                                    try:
+                                        info["loaded"] = tuple(loc["loaded_weight"].shape)
+                                    except Exception:
+                                        pass
+                                if "param" in loc and "param" not in info:
+                                    try:
+                                        info["param"] = (
+                                            type(loc["param"]).__name__,
+                                            tuple(loc["param"].shape),
+                                        )
+                                    except Exception:
+                                        pass
+                                f = f.f_back
+                                depth += 1
+                            print(
+                                f"[refit_debug] _get_hidden_dim REJECT "
+                                f"shard_dim={shard_dim} ndim={ndim} :: {info}",
+                                flush=True,
+                            )
+                        return _orig_ghd(shard_dim, ndim)
+
+                    RoutedExperts._get_hidden_dim = staticmethod(_ghd)
+                    RoutedExperts._nrl_wrapped = True
+            except Exception:  # noqa: BLE001 - diagnostic only
+                pass
+
         if (
             "Gemma3ForConditionalGeneration"
             in self.model_runner.vllm_config.model_config.architectures
@@ -409,7 +466,27 @@ class VllmInternalWorkerExtension:
         if fp8.is_fp8_model(self.model_runner.vllm_config):
             fp8.load_weights(policy_weights, self.model_runner)
         else:
-            self.model_runner.model.load_weights(weights=policy_weights)
+            policy_weights = list(policy_weights)
+            try:
+                self.model_runner.model.load_weights(weights=policy_weights)
+            except Exception as e:
+                # vLLM's fused-MoE loader errors (e.g. "shard_dim=0 ... 3D
+                # tensor") carry no weight name; dump the 3D tensors in the
+                # batch so the offending refit tensor is identifiable.
+                threed = [
+                    (n, tuple(t.shape))
+                    for n, t in policy_weights
+                    if hasattr(t, "dim") and t.dim() == 3
+                ]
+                print(
+                    f"[refit_debug] model.load_weights failed "
+                    f"({type(e).__name__}: {e}); {len(threed)} 3D tensors "
+                    f"of {len(policy_weights)} total in batch:",
+                    flush=True,
+                )
+                for n, s in threed[:64]:
+                    print(f"[refit_debug]   {n} {s}", flush=True)
+                raise
 
         self._load_draft_weights(draft_weights)
 

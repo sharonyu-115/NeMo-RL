@@ -7,6 +7,15 @@ checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken
 policy:
   generation:
+    vllm_cfg:
+      # enforce_eager=false: enable CUDA graphs. The eager default made the
+      # rollout launch-bound (~12.8 tok/s/req flat, ~1500-1963s/step). Graphs
+      # capture cleanly on the per-token FlashInfer-TRT-LLM path and cut the
+      # step to ~104-197s (~10x) with no OOM over the 3-step probe (job
+      # 2417294; steps 143.71/197.12/104.75s). Watch wake_up OOM over long
+      # runs (graphs reserve memory upfront + the expandable_segments:False
+      # fragmentation tail took ~10 steps to bite before).
+      enforce_eager: false
     # No moe_backend override: the BF16 base leaves it unset (the launcher only
     # injects triton for PRECISION=bf16), so NVFP4 uses vLLM auto-selection.
     # Auto picks flashinfer_trtllm for the NVFP4-quantized experts (the

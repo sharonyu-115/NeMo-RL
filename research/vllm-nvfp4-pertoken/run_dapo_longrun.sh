@@ -91,7 +91,8 @@ GRPO_ARGS="--config ${RECIPE} \
 # BF16 only: force the Triton fused-MoE backend (GB200 FlashInfer BF16 MoE
 # 4D-tiling bug breaks refit). NVFP4 must NOT get this — triton is invalid for
 # NVFP4 MoE; NVFP4 uses auto-selection (flashinfer_trtllm for its quant experts).
-[[ "${PRECISION}" == "bf16" ]] && GRPO_ARGS="${GRPO_ARGS} policy.generation.vllm_kwargs.moe_backend=triton"
+# '+' appends: the recipe has no vllm_kwargs block, so this creates the key.
+[[ "${PRECISION}" == "bf16" ]] && GRPO_ARGS="${GRPO_ARGS} +policy.generation.vllm_kwargs.moe_backend=triton"
 [[ -n "${EXTRA_ARGS}" ]] && GRPO_ARGS="${GRPO_ARGS} ${EXTRA_ARGS}"
 
 echo "=============================================="

@@ -62,6 +62,15 @@ policy:
     defer_fp32_logits: true
     batch_invariant_mode: false
     moe_router_dtype: fp32
+    checkpoint:
+      # async_save MUST stay off for colocated GRPO: with async_save +
+      # ckpt_assume_constant_structure (exemplar defaults), NVRx 0.6.0's
+      # persistent ckpt worker caches CUDA IPC handles to the GPU tensors on the
+      # first save and never re-reads live weights, so every later checkpoint in
+      # a job silently contains stale early-run weights + Adam state (bit-
+      # identical step_90/110/120 in run bf16-20260721; resume val 0.078 vs
+      # 0.195). See research/vllm-nvfp4-pertoken/debug_resume/ROOT_CAUSE.md.
+      async_save: false
     env_vars:
       NRL_MEGATRON_CHECKPOINT_DIR: /lustre/fsw/general_sa/shuangy/hf/megatron_ckpt
       # expandable_segments:False (NOT the coreai baseline's True): expandable

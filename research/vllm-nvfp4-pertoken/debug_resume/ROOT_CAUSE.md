@@ -59,6 +59,168 @@ re-copies fresh values into shared-memory tensors on **every** save — an impli
 acknowledgment that the GPU-IPC cache is unsafe when storages change. Megatron-Bridge does not
 enable that mode.
 
+## Mechanism diagrams
+
+### Save flow under async_save (per checkpoint step)
+
+```
+ GRPO step-N save (every save_period steps)                 [TRAINER PROCESS]
+ ────────────────────────────────────────────────────────────────────────────
+  grpo.py:3125-3158
+  ┌──────────────────────────────────────────────┐
+  │ init_tmp_checkpoint(tmp_step_N/)             │  writes training_info.json,
+  │                                              │  config.yaml  (plain files — always fresh)
+  └──────────────┬───────────────────────────────┘
+                 ▼
+  megatron_policy_worker.py:2333  save_checkpoint()
+  ┌──────────────────────────────────────────────┐
+  │ 1. finalize any previous async save (block)  │
+  │ 2. cfg.checkpoint.save = tmp_step_N/weights  │
+  │ 3. disable forward pre-hook (param gather)   │
+  └──────────────┬───────────────────────────────┘
+                 ▼
+  megatron-bridge checkpointing.py:1018  save_checkpoint()
+  ┌──────────────────────────────────────────────┐
+  │ generate_state_dict(model, optimizer, …)     │  fresh sharded refs to LIVE
+  │                                              │  GPU tensors — correct so far
+  │ common.pt  ◄── written SYNCHRONOUSLY, rank 0 │  (why scheduler counters were
+  │                                              │   always current in bad ckpts)
+  └──────────────┬───────────────────────────────┘
+                 ▼
+  mcore torch.py:658  TorchDistSaveShardedStrategy.async_save(async_strategy="nvrx")
+  ┌──────────────────────────────────────────────┐
+  │ nvidia-resiliency-ext installed? ──── yes ──►│  NVRx writer takes over
+  │ (mcore's own async path is deprecated)       │  use_cached_data_structure =
+  │                                              │    ckpt_assume_constant_structure ◄ recipe knob
+  └──────────────┬───────────────────────────────┘
+                 ▼
+  NVRx filesystem_async.py  prepare_write_data()
+  ┌──────────────────────────────────────────────┐
+  │ resolve plan items → live GPU tensors        │
+  │ split: GPU tensors  vs  CPU/ByteIO tensors   │
+  │        │                       │             │
+  │        │                       └────────────►│  CPU/ByteIO: ALWAYS sent fresh
+  │        ▼                                     │  (offloaded optim main params
+  │  use_cached_data_structure?                  │   stayed current in bad ckpts)
+  │        │yes                                  │
+  │        ▼                                     │
+  │  ╔═══ cache_exists for this key? ══════════╗ │
+  │  ║ NO  (first save of the job)             ║ │
+  │  ║  cached_tensor_data = (items, tensors)  ║ │  GPU tensors pickled via
+  │  ║  → send to worker via CUDA IPC          ║ │  CUDA IPC handles
+  │  ║  → worker caches handles in             ║ │
+  │  ║    _worker_data_cache   (core.py:434)   ║ │
+  │  ║                                         ║ │
+  │  ║ YES (every later save)           ⚠ BUG  ║ │
+  │  ║  cached_tensor_data = None              ║ │  ◄── "signal to reuse cached
+  │  ║  → NO tensor data sent at all           ║ │       data" (fs_async.py:405-421)
+  │  ╚═════════════════╤═══════════════════════╝ │
+  └────────────────────┼─────────────────────────┘
+                       ▼
+ ────────────────────────────────────────────────────────────────────────────
+  NVRx PersistentAsyncCaller.async_loop            [PERSISTENT WORKER PROCESS,
+  (spawned once per job, lives across saves)        spawned on the FIRST save]
+  ┌──────────────────────────────────────────────┐
+  │ preload_fn(): D2H copy of GPU tensors        │
+  │   first save : reads tensors just received   │  ✓ correct bytes
+  │   later saves: reads GPU memory through the  │  ⚠ STALE — colocated GRPO
+  │     IPC handles cached on the FIRST save     │    offloads/reallocates params
+  │                                              │    every step, so these handles
+  │ write .distcp shards → tmp_step_N/weights    │    no longer point at the live
+  │ signal completion                            │    weights. Every later ckpt
+  └──────────────┬───────────────────────────────┘    re-writes first-save state.
+                 ▼
+ ────────────────────────────────────────────────────────────────────────────
+  back in trainer: grpo.py                          [TRAINER PROCESS]
+  ┌──────────────────────────────────────────────┐
+  │ finalize_async_save(blocking) → .metadata,   │
+  │ latest_checkpointed_iteration.txt            │
+  │ rename tmp_step_N/ → step_N/    "success" ✓  │  ← looks perfect from outside
+  └──────────────────────────────────────────────┘
+```
+
+The two escape hatches map onto the fork: `async_save: false` skips the entire NVRx
+half (sync writer resolves and writes live tensors in-process);
+`ckpt_assume_constant_structure: false` keeps async but takes the "NO" branch every
+save (fresh IPC tensors each time).
+
+### Pointer-level view: why later saves read frozen memory
+
+An IPC handle names a physical **allocation**, not a tensor. Three snapshots of one
+GPU shared by the trainer and the persistent checkpoint worker:
+
+**T1 — first save (step 10). Cache gets primed.**
+
+```
+TRAINER PROCESS                      GPU PHYSICAL MEMORY              CKPT WORKER PROCESS
+───────────────                      ───────────────────              ───────────────────
+model.param.data ─────────────┐      ┌─────────────────────┐
+(torch.Tensor)                └────► │ Allocation A        │ ◄──┐     _worker_data_cache[key]:
+                                     │ bytes = W@step10    │    │       [(item, mapped_tensor)]
+optimizer.exp_avg ──────────► [ .. ] │ (param buffer,      │    └───── mapped storage M_A
+                                     │  cudaMalloc'd once  │           (cudaIpcOpenMemHandle(A))
+save #1: pickle tensors  ──────────► │  by DDP at startup) │
+  = cudaIpcGetMemHandle(A)           └─────────────────────┘     D2H copy reads A → W@step10 ✓
+  handle crosses process boundary,                                writes correct step_10 ckpt
+  NOT the bytes                       shared-mem refcount file:
+                                      counter[A] = 1  (worker holds a mapping)
+```
+
+**T2 — colocated offload/onload (every step, between saves).**
+
+```
+TRAINER PROCESS                      GPU PHYSICAL MEMORY              CKPT WORKER PROCESS
+───────────────                      ───────────────────              ───────────────────
+offload: param.data → CPU;           ┌─────────────────────┐
+GPU tensor A "freed"                 │ Allocation A        │ ◄────── M_A still mapped!
+  └► allocator checks counter[A]=1   │ bytes = W@step10    │         (cache never released
+     → CANNOT reuse/free A           │ FROZEN — nobody     │          until worker shutdown)
+     → A parked in CudaIPCSentData   │ writes here again   │
+       **Limbo** (pinned forever)    ├─────────────────────┤
+                                     │ Allocation B (NEW)  │
+onload: param.data ────────────────► │ bytes = W@step11,   │         worker knows nothing
+(fresh cudaMalloc → different        │ 12, 13… updated     │         about B — no handle
+ allocation, different address)      │ in place by training│         was ever sent for it
+                                     └─────────────────────┘
+```
+
+**T3 — save #2 (step 20). The bug fires.**
+
+```
+TRAINER PROCESS                      GPU PHYSICAL MEMORY              CKPT WORKER PROCESS
+───────────────                      ───────────────────              ───────────────────
+generate_state_dict() resolves       ┌─────────────────────┐
+LIVE tensors → point into B ✓        │ A: W@step10 (stale, │ ◄────── cache_exists=True, so
+                                     │    pinned by limbo) │         trainer sent NOTHING;
+NVRx prepare_write_data:             ├─────────────────────┤         worker D2H-copies from
+  cache_exists(key) → True           │ B: W@step20 (live)  │         its cached M_A → reads
+  cached_tensor_data = None ────X    └─────────────────────┘         **W@step10**
+  (no handles for B ever sent)
+                                                                     step_20 ckpt on disk =
+                                                                     W@step10 bytes  ✗✗✗
+```
+
+Key pointer facts:
+
+1. **An IPC handle names an allocation, not a tensor.** Tensors are (allocation,
+   offset, shape) views; when the trainer's params move to allocation B, the
+   worker's ticket to A doesn't follow and nobody invalidates it.
+2. **CUDA IPC refcounting makes the staleness *silent*.** PyTorch tracks each
+   exported allocation with a shared-memory refcount (`CudaIPCSentData` /
+   `CudaIPCSentDataLimbo`, torch/csrc/CudaIPCTypes.h). Because the worker still
+   holds a mapping, the trainer-side free at T2 cannot release A — it is parked in
+   limbo, pinned and never rewritten. The worker's reads therefore never crash and
+   never see garbage: A is a perfectly preserved copy of step-10 state. (It is also
+   a slow GPU memory leak — limbo blocks are held for the whole job.)
+3. **Classic pretraining never hits T2** — there, allocation A *is* the permanent
+   DDP param buffer and optimizer steps write into it in place forever, so the
+   cached mapping is always current and the cache is a legitimate optimization.
+   Colocated RL's per-step offload/onload breaks the "A is forever" premise, and
+   the design has no invalidation hook (`_worker_data_cache` clears only at worker
+   shutdown — exactly why each job's *first* save is correct). NVRx itself guards
+   the one fresh-allocation case it knew about (dequantized tensors,
+   `filesystem_async.py:289-291`) but not framework-level reallocation.
+
 ## Blast radius
 
 - **All checkpoints of exp_001 (step_90/110/120) are stale** — none is a usable resume point.

@@ -1,0 +1,38 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken.yaml
+# NVFP4 per-token, ALL MLP layers quantized: drops the first-2/last-4 (f2l4)
+# BF16 carve-out so the MoE expert linears in EVERY layer (0-47) train AND roll
+# out in NVFP4. Attention stays BF16 (te_precision unchanged). Tests whether the
+# boundary layers can also go FP4 without inflating gen_kl / token_mult_prob.
+# Everything else (tp2/ep8, 20k, DAPO-512, CUDA graphs, per-token W4A4 rollout,
+# NVTE numerics) inherited from the NVFP4 per-token recipe.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-allmlp
+policy:
+  generation:
+    # Rollout must quantize the SAME layers as training. Drop the per-layer
+    # f2l4 expert excludes; keep only DEFAULT_NVFP4_IGNORE (attention / router /
+    # shared expert / norms / embed / lm_head stay BF16). An explicit ignore
+    # list REPLACES the default (it does not merge), so the 9 defaults are
+    # repeated verbatim here.
+    nvfp4_pertoken_rollout:
+      enabled: true
+      ignore:
+        - "*lm_head*"
+        - "*mlp.gate"
+        - "*mlp.gate.*"
+        - "*mlp.shared_expert*"
+        - "*self_attn*"
+        - "*embed_tokens*"
+        - "*input_layernorm*"
+        - "*post_attention_layernorm*"
+        - "*norm*"
+  megatron_cfg:
+    # f2l4 OFF: quantize experts in all 48 layers (was: layers 0-1, 44-47 BF16).
+    # te_precision_config_file (attn BF16, MLP NVFP4) and fp4_cfg are inherited
+    # unchanged, so this only widens the layer range, not the module set.
+    first_last_layers_bf16: false
+    num_layers_at_start_in_bf16: 0
+    num_layers_at_end_in_bf16: 0
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-allmlp

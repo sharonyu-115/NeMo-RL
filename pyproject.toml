@@ -177,7 +177,7 @@ mcore = [
   # This dependency also needs to be compatible with the spec in Megatron-Bridge/pyproject.toml.
   # It is specified here since we don't directly use Megatron-Bridge/pyproject.toml, but a proxy setup.py+pyproject.toml combo
   # outside to allow "optionally" installing the megatron path. It's simpler to deal with transformer-engine here in the NeMo RL pyproject.toml
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/cael-ling/TransformerEngine.git@690ffea4d9cc11fe29e7b0e7d1fd250509fd64a3",
   "megatron-core",
   "megatron-bridge",
   # Must match Megatron-Bridge main's transformers requirement (still includes GLM 5.1 support).
@@ -352,7 +352,7 @@ override-dependencies = [
   # openai<=2.7.2 (conservative license-review pin) — override globally.
   # Watch item: exercise gym flows once on the bumped openai.
   "openai>=2.30.0",
-  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.15",
+  "transformer-engine[pytorch,core_cu13] @ git+https://github.com/cael-ling/TransformerEngine.git@690ffea4d9cc11fe29e7b0e7d1fd250509fd64a3",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.20.0.48; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.23.0",

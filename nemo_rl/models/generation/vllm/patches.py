@@ -282,6 +282,73 @@ def _patch_vllm_hermes_tool_parser_thread_safety(logger) -> None:
     logger.info("Successfully patched hermes tool parser for thread-safety.")
 
 
+def _patch_vllm_moe_routed_experts_capture(logger) -> None:
+    """Fire the routed-experts capture hook on the monolithic fused-MoE path.
+
+    ``RoutedExpertsCapturer`` (used by router replay / R3) is driven by the
+    ``capture_fn`` that only fires inside ``BaseRouter._select_experts``. But
+    ``MoERunner._apply_quant_method`` calls ``select_experts`` only on the
+    *modular* kernel branch; *monolithic* kernels (e.g. the FlashInfer TRT-LLM
+    NVFP4-per-token fused MoE) compute top-k routing internally via
+    ``forward_monolithic`` and never call it. The capture buffer therefore
+    stays zero, and the returned ``routed_experts`` are all-zero -> Megatron's
+    router replay sees duplicate expert ids and dies with "Split sizes doesn't
+    match total dim 0" in the MoE all_to_all during get_logprobs.
+
+    This inserts an explicit ``select_experts`` call on the monolithic branch,
+    guarded by ``capture_fn is not None`` so it only runs during rollout when
+    routing capture is active (no cost otherwise). Validated in
+    research/vllm-nvfp4-pertoken/debug_capture.py (capture_calls 0 -> 1200,
+    zero/duplicate route rows 40 -> 0).
+    """
+    try:
+        file_to_patch = _get_vllm_file(
+            "model_executor/layers/fused_moe/runner/moe_runner.py"
+        )
+    except RuntimeError:
+        logger.warning("Could not locate moe_runner.py for routed-experts capture patch.")
+        return
+
+    marker = "NeMo-RL patch (routed-experts capture for router replay)"
+    old_snippet = (
+        "        if self.routed_experts.quant_method.is_monolithic:\n"
+        "            # Monolithic kernels: pass router_logits to routed_experts\n"
+        "            fused_out = self.routed_experts.forward_monolithic("
+    )
+    new_snippet = (
+        "        if self.routed_experts.quant_method.is_monolithic:\n"
+        "            # Monolithic kernels: pass router_logits to routed_experts\n"
+        f"            # {marker}: monolithic MoE kernels compute top-k routing\n"
+        "            # inside the fused kernel and never call router.select_experts,\n"
+        "            # so the RoutedExpertsCapturer hook never fires and returned\n"
+        "            # routes are all-zero. Fire it explicitly when capture is on.\n"
+        '            if getattr(self.router, "capture_fn", None) is not None:\n'
+        "                self.router.select_experts(\n"
+        "                    hidden_states=hidden_states,\n"
+        "                    router_logits=router_logits,\n"
+        "                    topk_indices_dtype=self._quant_method.topk_indices_dtype,\n"
+        "                    input_ids=input_ids,\n"
+        "                )\n"
+        "            fused_out = self.routed_experts.forward_monolithic("
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            logger.info("MoE routed-experts capture patch already applied.")
+            return
+        if old_snippet not in content:
+            logger.warning(
+                "Could not apply MoE routed-experts capture patch: expected "
+                "code snippet not found in %s. The vLLM version may have changed.",
+                file_to_patch,
+            )
+            return
+        content = content.replace(old_snippet, new_snippet, 1)
+        write_back(content)
+
+    logger.info("Successfully patched MoE routed-experts capture (monolithic path).")
+
+
 def _apply_vllm_patches(
     py_executable: str, *, extra_env_vars: list[str] | None = None
 ) -> None:
@@ -295,3 +362,4 @@ def _apply_vllm_patches(
 
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_hermes_tool_parser_thread_safety(patch_logger)
+    _patch_vllm_moe_routed_experts_capture(patch_logger)

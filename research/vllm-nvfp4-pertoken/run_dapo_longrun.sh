@@ -17,12 +17,16 @@
 # (checkpoint_must_save_by=4:15 forces a clean save before the 5h wall).
 #
 # Knobs (sbatch --export=ALL,...):
-#   PRECISION  = bf16 (default) | nvfp4
-#   MAX_STEPS  = override grpo.max_num_steps (default: recipe = 800)
+#   PRECISION  = bf16 (default) | nvfp4 | nvfp4_bwd
+#                (nvfp4_bwd = per-token fwd + real FP4 per-token backward, PR #3045;
+#                 REQUIRES CONTAINER_IMAGE_OVERRIDE=<te690ffea probe image>)
+#   MAX_STEPS  = override grpo.max_num_steps (default: recipe = 800; use 1 for a smoke)
 #   EXTRA_ARGS = extra Hydra overrides (no commas)
 # Usage (from repo root):
 #   sbatch --export=ALL,GPUS_PER_NODE=4,PRECISION=bf16  research/vllm-nvfp4-pertoken/run_dapo_longrun.sh
 #   sbatch --export=ALL,GPUS_PER_NODE=4,PRECISION=nvfp4 research/vllm-nvfp4-pertoken/run_dapo_longrun.sh
+#   # per-token backward smoke (1 step) on the te690 probe image:
+#   sbatch --export=ALL,GPUS_PER_NODE=4,PRECISION=nvfp4_bwd,MAX_STEPS=1,CONTAINER_IMAGE_OVERRIDE=/lustre/fsw/general_sa/shuangy/images/nemo-rl-te690ffea-probe.sqsh research/vllm-nvfp4-pertoken/run_dapo_longrun.sh
 # Secrets (WANDB_API_KEY etc.) come from research/vllm-nvfp4-pertoken/.env (gitignored).
 # =============================================================================
 
@@ -52,8 +56,18 @@ PRECISION="${PRECISION:-bf16}"
 case "${PRECISION}" in
     bf16)  RECIPE="examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-bf16.yaml" ;;
     nvfp4) RECIPE="examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken.yaml" ;;
-    *) echo "ERROR: PRECISION must be bf16 or nvfp4 (got '${PRECISION}')." >&2; exit 1 ;;
+    # NVFP4 per-token forward + real FP4 per-token BACKWARD (TE PR #3045). REQUIRES
+    # the te690ffea probe image: pass CONTAINER_IMAGE_OVERRIDE=/lustre/.../images/
+    # nemo-rl-te690ffea-probe.sqsh (the v4 image lacks the per-token backward TE).
+    nvfp4_bwd) RECIPE="examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd.yaml" ;;
+    *) echo "ERROR: PRECISION must be bf16, nvfp4, or nvfp4_bwd (got '${PRECISION}')." >&2; exit 1 ;;
 esac
+# nvfp4_bwd needs the TE-690ffea build; fail early if pointed at a non-te690 image.
+if [[ "${PRECISION}" == "nvfp4_bwd" && "${CONTAINER_IMAGE}" != *te690* ]]; then
+    echo "ERROR: PRECISION=nvfp4_bwd requires the te690ffea probe image; got CONTAINER_IMAGE='${CONTAINER_IMAGE}'." >&2
+    echo "       Set CONTAINER_IMAGE_OVERRIDE=/lustre/fsw/general_sa/shuangy/images/nemo-rl-te690ffea-probe.sqsh" >&2
+    exit 1
+fi
 # RECIPE_OVERRIDE: run an arbitrary recipe (e.g. a probe variant) without the
 # fragile EXTRA_ARGS quoting. Its basename drives RUN_NAME -> distinct dirs.
 RECIPE="${RECIPE_OVERRIDE:-${RECIPE}}"

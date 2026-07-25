@@ -318,6 +318,25 @@ class Fp4Config(TypedDict):
     fp4_param: NotRequired[bool]
     # Dotted path to a quantizer factory; required when fp4_recipe == "custom".
     fp4_quantizer_factory: NotRequired[str]
+    # NVFP4 BACKWARD (dgrad/wgrad) mode, via TransformerEngine PR #3045
+    # (per-token backward). Translated to NVTE_* env vars in
+    # nemo_rl.models.megatron.setup.fp4_cfg_to_env_overrides and injected into
+    # the Megatron worker's runtime env (same channel as megatron_cfg.env_vars).
+    #   "dequantized"   -> NVTE_BACKWARD_OVERRIDE=dequantized (dequant operands;
+    #                      suppresses FP4 backward — today's forward-only behavior)
+    #   "high_precision"-> NVTE_BACKWARD_OVERRIDE=high_precision (keep hi-p backward)
+    #   "nvfp4_pertoken"-> NVTE_NVFP4_PER_TOKEN=1 + UNSET NVTE_BACKWARD_OVERRIDE
+    #                      (real FP4 per-token dgrad/wgrad; also forces per-token fwd)
+    # OMITTED (field absent) -> nothing emitted; TE's own default + any raw
+    # env_vars stand (preserves existing fp4 recipes byte-for-byte). Requires a
+    # TE build carrying PR #3045; setup enforces a capability gate otherwise.
+    backward: NotRequired[Literal["dequantized", "high_precision", "nvfp4_pertoken"]]
+    # Opt-in per-token backward refinements (PR #3045). Each, when True, sets the
+    # matching NVTE_NVFP4_PER_TOKEN_{RHT,SR,WEIGHT_2D}=1; when absent/False, the
+    # var is not emitted. Only meaningful with backward="nvfp4_pertoken".
+    per_token_rht: NotRequired[bool]
+    per_token_sr: NotRequired[bool]
+    per_token_weight_2d: NotRequired[bool]
 
 
 class MegatronConfigDisabled(TypedDict):

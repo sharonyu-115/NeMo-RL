@@ -140,6 +140,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
 
+            # Translate typed fp4_cfg backward/per-token fields (TE PR #3045)
+            # into NVTE_* vars on the worker runtime env, so they are in the
+            # worker's os.environ at process start (raw env_vars win, D3). Kept
+            # in a dependency-light module — no megatron import on the driver.
+            from nemo_rl.models.megatron.fp4_env import (
+                apply_fp4_backward_env_overrides,
+            )
+
+            apply_fp4_backward_env_overrides(
+                env_vars, config["megatron_cfg"].get("fp4_cfg")
+            )
+
             if "TORCH_CUDA_ARCH_LIST" not in os.environ:
                 raise RuntimeError(
                     "TORCH_CUDA_ARCH_LIST is not set. This is required in Megatron backend. This variable is set in our container, but "

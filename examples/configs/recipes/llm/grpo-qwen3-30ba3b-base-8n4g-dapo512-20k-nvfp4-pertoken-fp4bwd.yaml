@@ -1,0 +1,31 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken.yaml
+# NVFP4 per-token BACKWARD leg of the DAPO-512/20k 8n4g campaign. Identical to the
+# per-token forward run (same data, topology, f2l4, experts-only NVFP4, per-token
+# W4A4 rollout) EXCEPT the MoE-expert GEMMs also run real FP4 per-token dgrad/wgrad
+# via TransformerEngine PR #3045 (fork cael-ling@690ffea). Requires the te690ffea
+# probe image. Design: research/vllm-nvfp4-pertoken/DESIGN-te-nvfp4-pertoken-backward.md;
+# numerics: ROW-SCALED-vs-FULL-PER-TOKEN.md.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd
+policy:
+  megatron_cfg:
+    fp4_cfg:
+      # backward mode ONLY; enabled/fp4/fp4_recipe/fp4_param + te_precision + f2l4
+      # + moe_router_dtype=fp32 all inherited from the per-token forward recipe.
+      # backward=nvfp4_pertoken (nemo_rl.models.megatron.fp4_env) sets
+      # NVTE_NVFP4_PER_TOKEN=1 and CLEARS the inherited NVTE_BACKWARD_OVERRIDE=
+      # dequantized so real FP4 per-token dgrad/wgrad engages.
+      backward: nvfp4_pertoken
+      # Opt-in per-token backward refinements stay OFF for this baseline leg
+      # (set per_token_rht / per_token_sr / per_token_weight_2d: true to ablate).
+    env_vars:
+      # Deep-merges onto the parent env_vars. NVTE_NVFP4_PER_TOKEN forces the
+      # forward off row-scaling; set it explicit (parent had "1") for clarity.
+      # The inherited NVTE_NVFP4_DISABLE_{RHT,2D,STOCHASTIC_ROUNDING}="1" already
+      # match the per-token defaults; NVTE_BACKWARD_OVERRIDE is cleared in code
+      # (nested YAML can't drop a key — merge_with_override _override_ is
+      # top-level only).
+      NVTE_NVFP4_ROW_SCALED_ACTIVATION: "0"
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd

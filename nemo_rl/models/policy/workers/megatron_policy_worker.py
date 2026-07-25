@@ -69,6 +69,10 @@ from nemo_rl.models.megatron.pipeline_parallel import (
     broadcast_tensors_from_last_stage,
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.models.megatron.fp4_env import (
+    assert_te_supports_fp4_backward,
+    fp4_cfg_wants_per_token_backward,
+)
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
     handle_model_import,
@@ -374,6 +378,17 @@ class MegatronPolicyWorkerImpl(
         self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
         self.fp4_cfg = config["megatron_cfg"].get("fp4_cfg", None)
 
+        # NVFP4 per-token backward (TE PR #3045): fail loudly if requested but
+        # the installed TE cannot honor the switch, before we build the model.
+        assert_te_supports_fp4_backward(self.fp4_cfg)
+        # When fp4_cfg opts into per-token backward we want REAL FP4 dgrad/wgrad,
+        # i.e. NO NVTE_BACKWARD_OVERRIDE at all (NVTE_NVFP4_PER_TOKEN rides the
+        # persistent env). Defeat any inherited override (recipe or container) so
+        # it is neither captured nor re-applied in train().
+        self._nvfp4_per_token_backward = fp4_cfg_wants_per_token_backward(
+            self.fp4_cfg
+        )
+
         # NVTE_BACKWARD_OVERRIDE (MXFP8/NVFP4 high-precision backward) must
         # apply only during train() forward+backward — it is incompatible with
         # the inference/logprob forward paths. Capture it, strip it from the
@@ -384,7 +399,13 @@ class MegatronPolicyWorkerImpl(
             )
             or os.environ.get("NVTE_BACKWARD_OVERRIDE")
         )
-        if self._nvte_backward_override is not None:
+        if self._nvfp4_per_token_backward:
+            # Per-token backward supersedes any override: keep it unset always so
+            # real FP4 dgrad/wgrad runs. Drop any inherited value (recipe pin is
+            # warned about on the driver; container-baked value dropped here).
+            self._nvte_backward_override = None
+            os.environ.pop("NVTE_BACKWARD_OVERRIDE", None)
+        elif self._nvte_backward_override is not None:
             os.environ.pop("NVTE_BACKWARD_OVERRIDE", None)
 
         # Full-iteration CUDA graphs cannot be interrupted, so disable the

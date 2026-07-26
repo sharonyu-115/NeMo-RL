@@ -73,6 +73,9 @@ from nemo_rl.models.megatron.fp4_env import (
     assert_te_supports_fp4_backward,
     fp4_cfg_wants_per_token_backward,
 )
+from nemo_rl.models.megatron.te_grouped_ckpt_patch import (
+    install_te_grouped_empty_extra_state_patch,
+)
 from nemo_rl.models.megatron.setup import (
     finalize_megatron_setup,
     handle_model_import,
@@ -381,6 +384,11 @@ class MegatronPolicyWorkerImpl(
         # NVFP4 per-token backward (TE PR #3045): fail loudly if requested but
         # the installed TE cannot honor the switch, before we build the model.
         assert_te_supports_fp4_backward(self.fp4_cfg)
+        # NVFP4 per-token leaves the grouped-expert _extra_state empty, which
+        # trips Megatron's checkpoint save. Install the empty-state-safe patch
+        # (no-op when _extra_state is non-empty) whenever fp4 is enabled.
+        if self.fp4_cfg is not None and self.fp4_cfg.get("enabled", False):
+            install_te_grouped_empty_extra_state_patch()
         # When fp4_cfg opts into per-token backward we want REAL FP4 dgrad/wgrad,
         # i.e. NO NVTE_BACKWARD_OVERRIDE at all (NVTE_NVFP4_PER_TOKEN rides the
         # persistent env). Defeat any inherited override (recipe or container) so

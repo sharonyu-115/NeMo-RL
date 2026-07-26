@@ -1,0 +1,18 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd.yaml
+# -fp4bwd (per-token fwd + real FP4 per-token BACKWARD, TE PR #3045) + R3 ROUTER
+# REPLAY. vLLM returns the generation-time MoE routing per token and the Megatron
+# training forward replays those exact routing choices, removing routing
+# nondeterminism from the train/gen gap. A/B vs the no-r3 -fp4bwd run.
+#
+# Minimal enablement (only router_replay.enabled): the vLLM monolithic-capture
+# fix (patches.py::_patch_vllm_moe_routed_experts_capture, commit 1d3f0eea8 — this
+# branch's base) means the old -r3 sampling/packing/prefix-caching workarounds are
+# NOT needed, so DAPO sampling/packing stay identical to -fp4bwd (clean A/B).
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3
+policy:
+  router_replay:
+    enabled: true
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3

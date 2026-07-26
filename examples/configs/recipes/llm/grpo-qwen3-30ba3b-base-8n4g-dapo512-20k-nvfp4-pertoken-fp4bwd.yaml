@@ -5,6 +5,12 @@ defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken.yaml
 # via TransformerEngine PR #3045 (fork cael-ling@690ffea). Requires the te690ffea
 # probe image. Design: research/vllm-nvfp4-pertoken/DESIGN-te-nvfp4-pertoken-backward.md;
 # numerics: ROW-SCALED-vs-FULL-PER-TOKEN.md.
+grpo:
+  # Long run to 1500 steps (parent default is 800). Baked in the recipe — NOT
+  # passed per-submission — so every resume reads the SAME max_num_steps and the
+  # LR/wd scheduler (warmup-10 then CONSTANT lr=1e-6) does not trip the Megatron
+  # wd_incr_steps resume assert. See memory: megatron-max-steps-resume-assert.
+  max_num_steps: 1500
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd
 policy:

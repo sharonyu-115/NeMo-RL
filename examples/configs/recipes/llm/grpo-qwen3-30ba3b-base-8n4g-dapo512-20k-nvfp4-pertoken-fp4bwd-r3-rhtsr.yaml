@@ -1,0 +1,20 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3.yaml
+# fp4bwd-r3 (full per-token fwd + FP4 per-token bwd + router replay) + per-token
+# RHT & SR opt-ins. Here the FP4 backward is active, so BOTH act on real FP4
+# tensors: RHT smooths outliers in the input + gradient casts, SR removes the
+# rounding bias when quantizing gradients (the two NVFP4-paper techniques the
+# per-token path defaults OFF). Ablation vs the no-RHT/SR fp4bwd-r3 run.
+#
+# Raw env vars (not typed per_token_* fields) for consistency with the leg-2
+# ablation; NVTE_NVFP4_PER_TOKEN=1 (inherited) makes _force_per_token_settings
+# honor them (disable_rht = not per_token_rht; disable_sr = not per_token_sr).
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3-rhtsr
+policy:
+  megatron_cfg:
+    env_vars:
+      NVTE_NVFP4_PER_TOKEN_RHT: "1"
+      NVTE_NVFP4_PER_TOKEN_SR: "1"
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3-rhtsr

@@ -1,0 +1,24 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4fwd.yaml
+# Leg 2 (full per-token fwd + dequant bwd) + per-token RHT & SR opt-ins.
+# Ablation: does re-enabling the random Hadamard transform (RHT) tighten the
+# per-token forward? (Our wandb analysis found full per-token has ~37% higher
+# gen_kl/js + a heavier outlier tail vs row-scaled — RHT targets exactly that
+# long-tail; see ANALYSIS-rowscaled-vs-fullpertoken-fwd.md / nvfp4-r2 memory.)
+#
+# Set as RAW env vars (not the typed per_token_* fields) so the backward stays
+# DEQUANTIZED — the typed fields would flip fp4_cfg_wants_per_token_backward and
+# force FP4 backward, which is NOT wanted here. NVTE_NVFP4_PER_TOKEN=1 (inherited)
+# means _force_per_token_settings honors these: disable_rht = not per_token_rht,
+# disable_stochastic_rounding = not per_token_sr (overrides the inherited
+# DISABLE_* = 1). NB: SR only affects FP4 GRADIENT quant -> no-op on this
+# dequant-backward leg; RHT affects the forward input quant (the point).
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4fwd-rhtsr
+policy:
+  megatron_cfg:
+    env_vars:
+      NVTE_NVFP4_PER_TOKEN_RHT: "1"
+      NVTE_NVFP4_PER_TOKEN_SR: "1"
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4fwd-rhtsr

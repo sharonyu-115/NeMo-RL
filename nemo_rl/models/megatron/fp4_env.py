@@ -36,6 +36,7 @@ _FP4_PER_TOKEN_FLAG_ENV = {
     "per_token_rht": "NVTE_NVFP4_PER_TOKEN_RHT",
     "per_token_sr": "NVTE_NVFP4_PER_TOKEN_SR",
     "per_token_weight_2d": "NVTE_NVFP4_PER_TOKEN_WEIGHT_2D",
+    "per_token_weight_per_tensor_1d": "NVTE_NVFP4_PER_TOKEN_WEIGHT_PER_TENSOR_1D",
 }
 
 
@@ -55,6 +56,10 @@ def fp4_cfg_to_env_overrides(
       backward="high_precision" -> set NVTE_BACKWARD_OVERRIDE=high_precision
       backward="nvfp4_pertoken" -> set NVTE_NVFP4_PER_TOKEN=1, UNSET NVTE_BACKWARD_OVERRIDE
       per_token_{rht,sr,weight_2d}=True -> set NVTE_NVFP4_PER_TOKEN_{RHT,SR,WEIGHT_2D}=1
+      per_token_weight_per_tensor_1d=True
+                                -> set NVTE_NVFP4_PER_TOKEN_WEIGHT_PER_TENSOR_1D=1
+                                   (weight ablation leg; only takes effect alongside
+                                    per_token_weight_2d=True)
     """
     to_set: dict[str, str] = {}
     to_unset: set[str] = set()

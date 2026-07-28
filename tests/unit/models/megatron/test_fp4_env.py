@@ -88,6 +88,27 @@ def test_per_token_flags():
     assert to_set["NVTE_NVFP4_PER_TOKEN_RHT"] == "1"
     assert to_set["NVTE_NVFP4_PER_TOKEN_WEIGHT_2D"] == "1"
     assert "NVTE_NVFP4_PER_TOKEN_SR" not in to_set  # False -> not emitted
+    # Absent -> not emitted (the three legs must stay distinguishable).
+    assert "NVTE_NVFP4_PER_TOKEN_WEIGHT_PER_TENSOR_1D" not in to_set
+
+
+def test_per_token_weight_per_tensor_1d_flag():
+    """The per-tensor-1D weight leg rides the same channel as the other flags.
+
+    It only takes effect in TE alongside per_token_weight_2d, so the two are set
+    together here — the ablation is 2D-vs-1D *inner geometry* under a shared
+    per-tensor scalar outer amax.
+    """
+    to_set, _ = fp4_cfg_to_env_overrides(
+        {
+            "enabled": True,
+            "backward": "nvfp4_pertoken",
+            "per_token_weight_2d": True,
+            "per_token_weight_per_tensor_1d": True,
+        }
+    )
+    assert to_set["NVTE_NVFP4_PER_TOKEN_WEIGHT_2D"] == "1"
+    assert to_set["NVTE_NVFP4_PER_TOKEN_WEIGHT_PER_TENSOR_1D"] == "1"
 
 
 def test_invalid_backward_raises():

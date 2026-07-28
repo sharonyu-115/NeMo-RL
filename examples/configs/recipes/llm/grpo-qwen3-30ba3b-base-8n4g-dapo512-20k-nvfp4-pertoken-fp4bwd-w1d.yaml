@@ -1,0 +1,28 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd.yaml
+# Weight-quantization ablation leg C on top of the per-token FP4 backward run:
+# per-tensor scalar outer amax (as in weight-2D) but 1D 16-element inner blocks.
+# One scale per 16 elements instead of per 256 — finer scale resolution, but the
+# forward/backward transposition bias returns (1D inner blocks are
+# direction-dependent, so rowwise != columnwise^T). This is an ABLATION, not an
+# expected win: it separates inner-block resolution from fwd/bwd weight
+# consistency, which the weight-2D route bundles together.
+#
+# Requires the patched TE (sharonyu-115@25e1fda6) — i.e. the
+# nemo-rl-te690-w1d-probe.sqsh image. On an unpatched TE the second flag below is
+# silently ignored and this recipe degenerates into leg B (per-tensor 2D).
+# Verified at the cast level in research/vllm-nvfp4-pertoken/verify_w1d_weight_legs.py.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w1d
+policy:
+  megatron_cfg:
+    fp4_cfg:
+      # BOTH flags are required. per_token_weight_per_tensor_1d only changes the
+      # inner geometry *inside* the weight-2D cast branch, which is gated on
+      # per_token_weight_2d — on its own the second flag is a no-op.
+      #   weight_2d alone            -> leg B: scalar outer amax + 16x16 tiles
+      #   weight_2d + per_tensor_1d  -> leg C: scalar outer amax + 16-elem blocks
+      per_token_weight_2d: true
+      per_token_weight_per_tensor_1d: true
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w1d

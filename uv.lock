@@ -87,7 +87,7 @@ overrides = [
     { name = "torch", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
     { name = "torchaudio", marker = "sys_platform != 'darwin'", specifier = "==2.11.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchaudio", marker = "sys_platform == 'darwin'", specifier = "==2.11.0", index = "https://pypi.org/simple" },
-    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/cael-ling/TransformerEngine.git?rev=690ffea4d9cc11fe29e7b0e7d1fd250509fd64a3" },
+    { name = "transformer-engine", extras = ["pytorch", "core-cu13"], git = "https://github.com/sharonyu-115/TransformerEngine.git?rev=25e1fda6e31927a2228b651b53a719d1119b4596" },
     { name = "xgrammar", specifier = "==0.1.33" },
 ]
 excludes = ["nvidia-cutlass-dsl-libs-base"]
@@ -3643,7 +3643,7 @@ requires-dist = [
     { name = "torchvision", marker = "sys_platform == 'darwin'", specifier = "==0.26.0", index = "https://pypi.org/simple" },
     { name = "transferqueue", git = "https://github.com/Ascend/TransferQueue.git?rev=b266d39" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'automodel'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=v2.14.1" },
-    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'mcore'", git = "https://github.com/cael-ling/TransformerEngine.git?rev=690ffea4d9cc11fe29e7b0e7d1fd250509fd64a3" },
+    { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'mcore'", git = "https://github.com/sharonyu-115/TransformerEngine.git?rev=25e1fda6e31927a2228b651b53a719d1119b4596" },
     { name = "transformers", specifier = ">=5.5.0,<5.9.0" },
     { name = "transformers", marker = "extra == 'automodel'", specifier = ">=5.5.0,<5.6.0" },
     { name = "transformers", marker = "extra == 'mcore'", specifier = ">=5.8.1,<5.9.0" },
@@ -6572,7 +6572,7 @@ dependencies = [
 [[package]]
 name = "transformer-engine"
 version = "2.15.0+42b8400"
-source = { git = "https://github.com/cael-ling/TransformerEngine.git?rev=690ffea4d9cc11fe29e7b0e7d1fd250509fd64a3#690ffea4d9cc11fe29e7b0e7d1fd250509fd64a3" }
+source = { git = "https://github.com/sharonyu-115/TransformerEngine.git?rev=25e1fda6e31927a2228b651b53a719d1119b4596#25e1fda6e31927a2228b651b53a719d1119b4596" }
 dependencies = [
     { name = "importlib-metadata", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "packaging", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },

@@ -337,6 +337,14 @@ class Fp4Config(TypedDict):
     per_token_rht: NotRequired[bool]
     per_token_sr: NotRequired[bool]
     per_token_weight_2d: NotRequired[bool]
+    # Weight-quantization ablation leg: keep the per-tensor scalar outer amax that
+    # per_token_weight_2d introduces, but use 1D 16-element inner blocks instead of
+    # 16x16 tiles (one scale per 16 elements instead of per 256). Finer scale
+    # resolution, but it reintroduces the forward/backward transposition bias that
+    # weight-2D removes, so it is an ablation and not an expected win. Only
+    # meaningful together with per_token_weight_2d=True; requires a TE build
+    # carrying the NVTE_NVFP4_PER_TOKEN_WEIGHT_PER_TENSOR_1D patch.
+    per_token_weight_per_tensor_1d: NotRequired[bool]
 
 
 class MegatronConfigDisabled(TypedDict):

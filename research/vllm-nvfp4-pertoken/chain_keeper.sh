@@ -9,22 +9,18 @@ LAUNCH=research/vllm-nvfp4-pertoken/run_dapo_longrun.sh
 LOG=session/te-nvfp4-backward/chain_keeper.log
 CAP=session/te-nvfp4-backward/.keeper_submitted   # one line per keeper-submitted job
 
-KEYS=(fp4fwd-leg2 fp4bwd-r3 fp4fwd-rhtsr fp4bwd-r3-rhtsr)
+# fp4fwd-rhtsr / fp4bwd-r3-rhtsr REMOVED 2026-07-26: gen_kl exploded to ~3.8
+# (vs ~0.005 normal) — forward RHT mismatches the no-RHT vLLM rollout. Cancelled.
+KEYS=(fp4fwd-leg2 fp4bwd-r3)
 declare -A RECIPE=(
   [fp4fwd-leg2]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4fwd.yaml
-  [fp4bwd-r3]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3.yaml
-  [fp4fwd-rhtsr]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4fwd-rhtsr.yaml
-  [fp4bwd-r3-rhtsr]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3-rhtsr.yaml )
+  [fp4bwd-r3]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3.yaml )
 declare -A RUNDIR=(
   [fp4fwd-leg2]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4fwd
-  [fp4bwd-r3]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3
-  [fp4fwd-rhtsr]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4fwd-rhtsr
-  [fp4bwd-r3-rhtsr]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3-rhtsr )
+  [fp4bwd-r3]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-r3 )
 declare -A JOBNAME=(
   [fp4fwd-leg2]=general_sa-nemo_rl.fp4fwd-leg2-1500
-  [fp4bwd-r3]=general_sa-nemo_rl.fp4bwd-r3-1500
-  [fp4fwd-rhtsr]=general_sa-nemo_rl.fp4fwd-rhtsr-1500
-  [fp4bwd-r3-rhtsr]=general_sa-nemo_rl.fp4bwd-r3-rhtsr-1500 )
+  [fp4bwd-r3]=general_sa-nemo_rl.fp4bwd-r3-1500 )
 
 TARGET=1500; LOWWATER=3; TOPUP=6; MAXTOTAL=30; INTERVAL=1800; STUCK_CYCLES=4
 export PRECISION=nvfp4_bwd GPUS_PER_NODE=4

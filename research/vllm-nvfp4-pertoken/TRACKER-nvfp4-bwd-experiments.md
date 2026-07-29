@@ -130,9 +130,9 @@ identifies it as the discriminating property.
 | Leg | Weight outer / inner | Dir-dep? | Replay | Container (TE) | Status | Reached | Learning |
 |---|---|---|---|---|---|---|---|
 | [`fp4bwd`](#fp4bwd) | vector / 1x16 | **yes** | off | te690ffea (`690ffea4`) | **STOPPED** 07-26 | step 348, ckpt step_340 | **NO** (-0.86 @150) |
-| [`fp4bwd-r3`](#fp4bwd-r3) | vector / 1x16 | yes | **on** | te690ffea (`690ffea4`) | **RUNNING** 2445982 | **step 742 / 1500** | yes, peaked +0.10 @280, decaying |
+| [`fp4bwd-r3`](#fp4bwd-r3) | vector / 1x16 | yes | **on** | te690ffea (`690ffea4`) | **STOPPED** 07-28, sufficient steps | step 764, ckpt **step_760** | yes, peaked +0.10 @280, decaying |
 | [`fp4bwd-w2d`](#fp4bwd-w2d) | **scalar / 16x16** | **no** | off | te690-w1d (`25e1fda6`) | **RUNNING** 2456196 | **step 148 / 1500** | yes, -0.04 @150 and climbing |
-| [`fp4bwd-w1d`](#fp4bwd-w1d) | **scalar / 1x16** | **yes** | off | te690-w1d (`25e1fda6`) | **FAILED — 0 steps** | never trained | — (**next to run**) |
+| [`fp4bwd-w1d`](#fp4bwd-w1d) | **scalar / 1x16** | **yes** | off | te690-w1d (`25e1fda6`) | **QUEUED** 2460444 (3rd attempt) | 0 / 1500 | — (**the priority A/B vs w2d**) |
 | [`fp4bwd-r3-rhtsr`](#adjacent-legs) | vector / 1x16 | yes | on | te690ffea | CANCELLED 07-26 | — | — |
 
 Forward-only controls (dequantized backward, same forward + rollout):
@@ -183,7 +183,13 @@ monolithic-capture fix (`patches.py::_patch_vllm_moe_routed_experts_capture`,
 sampling/packing stay identical to `fp4bwd`. Clean single-dial A/B.
 
 - **Weight quant**: same as `fp4bwd`.
-- **Status**: RUNNING, the longest-lived leg. Keeper tops up the chain when queued < 4.
+- **Status**: **STOPPED 2026-07-28** at step 764 (checkpoint `step_760`) — enough steps
+  for its purpose; the running job 2445983 and 7 queued jobs were cancelled to free
+  nodes for `fp4bwd-w1d`. Resumable from step_760 if the late-run decay ever needs
+  chasing further.
+- **Trap**: `chain_keeper.sh` still lists `fp4bwd-r3` in `KEYS`. The keeper is not
+  running now, but restarting it would resubmit this leg and undo the stop. Drop the
+  key before the keeper is used again.
 
 ### fp4bwd-w2d
 
@@ -213,9 +219,19 @@ inner-block geometry from outer-amax granularity, with `fp4bwd-w2d` as its contr
   direction-dependence by design (gate B: ~76-77% of elements differ rowwise vs
   columnwise^T). Cast is byte-identical to a plain per-tensor 1D weight, so
   `scale_inv` geometry is unchanged and the per-token CUTLASS GEMM needs no work.
-- **Status**: **FAILED before training.** All six chained jobs (2456201-2456206) died
-  in `setup()` at `wandb.init`, ~18 min each; chain consumed; checkpoint dir empty.
-  See [F-2](#f-2). Needs a fresh chain submission.
+- **Status**: **3rd attempt, chain 2460444-2460449** (6 x 5h, afterany, launched
+  2026-07-28), replay OFF so that w2d stays a single-dial control. Attempts 1
+  (2456201-2456206) and 2 (2459047-2459052) both died before training on the deleted
+  pinned W&B run id — see [F-2](#f-2); this attempt carries a fresh pin.
+- **Pre-launch smoke**: job **2458966** (`EXP_TAG=smoke2`, `MAX_STEPS=1`) COMPLETED —
+  loss 0.0676, gen KL 0.0090, checkpoint written, zero errors, reproducing the
+  earlier smoke 2455672 exactly. Critically, it also **proved leg identifiability**:
+  the NeMo-RL wiring line emits all three flags —
+  `set={'NVTE_NVFP4_PER_TOKEN': '1', 'NVTE_NVFP4_PER_TOKEN_WEIGHT_2D': '1',
+  'NVTE_NVFP4_PER_TOKEN_WEIGHT_PER_TENSOR_1D': '1'} unset=['NVTE_BACKWARD_OVERRIDE']`
+  — so this leg is confirmed to be leg C and not a silent duplicate of leg B, despite
+  TE's `_make_repr` being ambiguous. The smoke's W&B init also succeeded, indicating
+  the F-2 blip has cleared.
 
 ### Adjacent legs
 
@@ -269,9 +285,9 @@ i.e. running in the regime this finding says does not learn. Decide whether the
 weight-geometry ablation should carry `router_replay.enabled: true` before spending
 more allocations on it.
 
-### F-2 — w1d chain lost to a wandb.init timeout, not an FP4 problem
-*2026-07-27 19:29-20:24. Evidence: jobs 2456201-2456206, all FAILED;
-`2456203-logs/ray-driver.log`.*
+### F-2 — w1d chains die because their pinned W&B run was DELETED
+*2026-07-27 19:29 and 2026-07-28. Evidence: jobs 2456201-2456206 and 2459047-2459052,
+all FAILED (~18 min each, 12 jobs, zero training steps).*
 
 ```
 wandb.errors.errors.CommError: Run initialization has timed out after 90.0 sec.
@@ -279,19 +295,47 @@ wandb.errors.errors.CommError: Run initialization has timed out after 90.0 sec.
   via nemo_rl/algorithms/grpo.py:364 -> Logger(logger_config)
 ```
 
-Every job in the chain failed identically in `setup()` before any training step,
-burning ~18 min each until the chain was exhausted. This is transient W&B API
-reachability, not the new TE flag — the leg has **never** executed a training step, so
-nothing is known about per-tensor-1D weights under FP4 backward. The
-`Container/Code Version Mismatch` warning in the same logs is the expected TE re-pin
-drift (warning-only), not the cause.
+**Root cause — NOT a transient API blip** (an earlier revision of this entry said so;
+that was wrong). `run_dapo_longrun.sh` pins a W&B run id per leg so every 5h allocation
+rejoins the same run and the curve stays continuous, exporting it as `WANDB_RUN_ID`
+with `WANDB_RESUME=allow`. `WandbLogger.__init__` calls `wandb.init(**cfg)` with only
+`{project, name}`, so id and resume mode are picked up from the environment. The w1d
+pin held `671373472731ad3c952be8846881d188` — a run created by smoke 2455672 and then
+**manually deleted from W&B**. Every subsequent job therefore asked to resume a run
+that no longer exists; the client can neither attach nor create under that id and
+hangs until the 90 s `init_timeout`. Fully deterministic, hence 12/12 identical
+failures across two days. `w2d`/`r3` are unaffected: their pinned runs still exist.
 
-**Action**: resubmit a fresh w1d chain. Consider raising `init_timeout` or making
-W&B init non-fatal so an API blip cannot consume a whole dependency chain.
+**Trap**: deleting the pin file does not help. With the pin absent the launcher
+recomputes the id as `md5(project-runname)`, which reproduces the same dead id
+(verified: derived == pinned). Only an explicitly different id escapes.
+**Deleting a W&B run that a chained long run has pinned bricks that run name.**
 
-### F-3 — The blocker is the weight transposition bias, not the absence of router replay
+**Fix applied 2026-07-28**: fresh id `eda77a36db894eaea44060e0b7318819` written to the
+pin; chain resubmitted as 2460444-2460449. The run *name* is independent of the id, so
+the leg still logs as `...-fp4bwd-w1d`.
+
+**Methodological note**: the pre-launch smoke 2458966 used `EXP_TAG=smoke2`, which gave
+it a *fresh* id — so it created a new run instead of resuming the deleted one and
+passed, exercising the only path that was never broken. A smoke meant to de-risk a
+failing long run must reproduce that run's W&B identity, not sidestep it.
+
+**Underlying defect, still open**: `logger.py:209` has no retry, no `init_timeout`
+override and no offline fallback, so a metrics-logger failure kills `setup()` and with
+it an entire `afterany` chain — 12 jobs and ~4 h of 8-node allocation for zero steps.
+`WANDB_MODE=offline` plus a later `wandb sync` would have let every one of them train.
+
+### F-3 — The blocker is the weight transposition bias, not the absence of router replay — **SUPERSEDED**
 *2026-07-28. Evidence: W&B `nv-welcome/qwen3-30b-nvfp4`, `train/reward` +
 `train/gen_kl_error`, fetched by `fetch_bwd_curves.py`. Run ids in that script.*
+
+> **Superseded 2026-07-28 by `REPORT-nvfp4-bwd-factorial.md`**, once the full six-leg
+> factorial ran and `validation/accuracy` was used instead of `train/reward`. Two errors
+> here: (a) the conclusion was drawn from shaped reward, which compresses the real
+> differences (report F5); (b) `fp4bwd-w2d`'s early climb was read as a rescue, but the
+> single-dial pair that isolates the outer scale is `fp4bwd` vs `fp4bwd-w1d`, not
+> `fp4bwd` vs `w2d`. The report's F1/F2/F9 replace this entry. Kept for the audit trail
+> — **do not cite.**
 
 `train/reward` in windowed means, all four legs, at comparable steps:
 
@@ -334,8 +378,8 @@ weight-geometry question, not yet investigated. cf. `[[nvfp4-r2-divergence-rootc
 
 ## Open questions / next actions
 
-1. **[NEXT] Resubmit `fp4bwd-w1d`, replay OFF, as the side-by-side for the running
-   `fp4bwd-w2d`.** This is now the highest-value experiment in the campaign: it is the
+1. **[LAUNCHED 2026-07-28, chain 2459047-2459052] `fp4bwd-w1d`, replay OFF, as the
+   side-by-side for the running `fp4bwd-w2d`.** The highest-value experiment: it is the
    single-dial discriminator for [F-3](#f-3) (scalar outer amax held fixed; only inner
    geometry 16x16 -> 1x16 changes, restoring direction-dependence on ~76-77% of
    elements per gate B). Keep replay OFF — replay-on would re-confound the comparison

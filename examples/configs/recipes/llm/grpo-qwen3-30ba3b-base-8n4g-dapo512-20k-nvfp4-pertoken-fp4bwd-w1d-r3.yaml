@@ -1,0 +1,30 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w1d.yaml
+# Weight per-tensor-1D (scalar outer amax + 16-element inner blocks) + ROUTER REPLAY.
+# Single dial on top of -w1d, so -w1d is its matched control; and a single dial
+# (inner geometry) away from -w2d-r3, so the pair mirrors -w1d vs -w2d with replay
+# held ON. Completes the {weight geometry} x {replay} factorial:
+#
+#            replay OFF          replay ON
+#   vec/1x16  -fp4bwd (flat)     -fp4bwd-r3 (peak +0.10)
+#   sca/16x16 -w2d               -w2d-r3
+#   sca/1x16  -w1d               -w1d-r3   <- this recipe
+#
+# The 1D inner blocks are direction-dependent (rowwise != columnwise^T on ~76-77% of
+# elements, gate B), so this leg carries the fwd/bwd transposition bias that -w2d
+# removes. Under replay it asks whether replay compensates for that bias the same way
+# it does for the default per-token weight in -fp4bwd-r3 — i.e. whether replay is a
+# general rescue for weight direction-dependence, or specific to the vector-outer-amax
+# case. NOT an expected win: like -w1d it is an ablation for attribution, not a
+# shipping candidate.
+#
+# Requires the patched TE (sharonyu-115@25e1fda6) — the nemo-rl-te690-w1d-probe.sqsh
+# image. On an unpatched TE the per_token_weight_per_tensor_1d flag is silently
+# ignored and this recipe degenerates into -w2d-r3.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w1d-r3
+policy:
+  router_replay:
+    enabled: true
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w1d-r3

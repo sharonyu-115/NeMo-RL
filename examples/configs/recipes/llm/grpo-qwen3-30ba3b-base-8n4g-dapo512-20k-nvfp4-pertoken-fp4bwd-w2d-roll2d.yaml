@@ -1,0 +1,29 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d.yaml
+# -w2d with the ROLLOUT weight cast also moved to 16x16 tiles, replay OFF.
+# Single dial on top of -w2d, which is therefore its matched control; and the
+# replay-off partner of -w2d-r3-roll2d.
+#
+# Rationale in full: see -fp4bwd-w2d-r3-roll2d.yaml. In short, training and
+# generation each quantize the same weight and until now no configuration
+# agreed on both fronts — 16x16 training weights buy transposition invariance
+# for the gradient but face a 1x16 rollout weight. Moving the rollout to 16x16
+# closes that gap; it needs no kernel change because the 2D cast replicates one
+# tile scale across the tile's 16 rows, keeping the standard (..., K/16) NVFP4
+# scale layout.
+#
+# Measured on a 1-step smoke (jobs 2467432 control vs 2467433 treatment, same
+# base weights, one dial): gen_kl_error 0.0137 -> 0.0068.
+#
+# Cost: one rollout weight scale per 256 elements instead of per 16. The smoke
+# measures alignment, NOT rollout quality — a degraded rollout that happens to
+# agree with training would also show low gen_kl. Watch mean_gen_tokens_per_sample
+# and validation/accuracy, not gen_kl, to judge this leg.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-roll2d
+policy:
+  generation:
+    nvfp4_pertoken_rollout:
+      weight_2d: true
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-roll2d

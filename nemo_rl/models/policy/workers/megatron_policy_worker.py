@@ -2009,6 +2009,7 @@ class MegatronPolicyWorkerImpl(
             base_iter,
             quant_patterns=rollout_cfg.quant_patterns,
             ignore_patterns=rollout_cfg.resolved_ignore(),
+            weight_2d=rollout_cfg.weight_2d,
         )
 
     def _iter_params_with_optional_kv_scales_impl(

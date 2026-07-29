@@ -1,0 +1,37 @@
+defaults: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-r3.yaml
+# -w2d-r3 with the ROLLOUT weight cast also moved to 16x16 tiles. Single dial on
+# top of -w2d-r3, which is therefore its matched control.
+#
+# Why: training and generation each quantize the same weight, and until now no
+# configuration could agree on both fronts at once.
+#
+#   axis A  training forward vs training backward  -> wants transposition
+#           invariance, i.e. 16x16 tiles           -> scalar/16x16 wins
+#   axis B  training forward vs the rollout's cast -> wants the training cast to
+#           match the rollout's scalar + 1x16      -> scalar/1x16 wins
+#
+# -w2d has axis A but not B (its 16x16 training weight faces a 1x16 rollout
+# weight); -w1d has B but not A. Moving the rollout to 16x16 gives -w2d both.
+#
+# This needs no kernel change: the 2D cast emits one scale per 16x16 tile
+# REPLICATED across the tile's 16 rows, so the scale tensor keeps the standard
+# (..., K/16) NVFP4 layout and FlashInfer consumes it unchanged. Same trick TE
+# uses for per_token_weight_2d ("16-row-replicated e4m3 inner SF").
+#
+# Cost: the rollout weight gets one scale per 256 elements instead of per 16, so
+# this trades rollout weight fidelity for train/generation agreement. It also
+# breaks the producer's documented bit-identity with vLLM's scaled_fp4_quant —
+# by design, and only when weight_2d is set.
+#
+# Expected signal: gen_kl_error at step 1 should drop toward the -w1d legs
+# (~0.003) from -w2d-r3's ~0.012, since step 1 has no training dynamics and
+# isolates axis B.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-r3-roll2d
+policy:
+  generation:
+    nvfp4_pertoken_rollout:
+      weight_2d: true
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-r3-roll2d

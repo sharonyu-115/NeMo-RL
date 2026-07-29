@@ -65,7 +65,7 @@ def test_bitwise_vs_vllm_online_quant():
     for e, n, k in [(8, 256, 512), (4, 64, 128), (2, 96, 2048)]:
         w = torch.randn(e, n, k, dtype=torch.bfloat16, device="cuda") * 3.0
         q_ref, bs_ref, gs_ref = ref(w)
-        q, bs, gs = M.quantize_nvfp4_weight(w)
+        q, bs, gs = M.quantize_nvfp4_weight(w, weight_2d=False)
 
         assert torch.equal(gs, gs_ref), f"global scales differ ({e},{n},{k})"
         assert torch.equal(
@@ -81,9 +81,9 @@ def test_bitwise_vs_vllm_online_quant():
 def test_2d_matches_3d_per_expert():
     torch.manual_seed(1)
     w = torch.randn(4, 128, 256, dtype=torch.bfloat16, device="cuda")
-    q3, bs3, gs3 = M.quantize_nvfp4_weight(w)
+    q3, bs3, gs3 = M.quantize_nvfp4_weight(w, weight_2d=False)
     for e in range(4):
-        q2, bs2, gs2 = M.quantize_nvfp4_weight(w[e])
+        q2, bs2, gs2 = M.quantize_nvfp4_weight(w[e], weight_2d=False)
         assert torch.equal(q2, q3[e])
         assert torch.equal(bs2.view(torch.uint8), bs3[e].view(torch.uint8))
         assert torch.equal(gs2, gs3[e])
@@ -93,8 +93,8 @@ def test_2d_matches_3d_per_expert():
 def test_deterministic_and_layout():
     torch.manual_seed(2)
     w = torch.randn(2, 64, 160, dtype=torch.bfloat16, device="cuda")
-    q1, bs1, gs1 = M.quantize_nvfp4_weight(w)
-    q2, bs2, gs2 = M.quantize_nvfp4_weight(w.clone())
+    q1, bs1, gs1 = M.quantize_nvfp4_weight(w, weight_2d=False)
+    q2, bs2, gs2 = M.quantize_nvfp4_weight(w.clone(), weight_2d=False)
     assert torch.equal(q1, q2)
     assert torch.equal(bs1.view(torch.uint8), bs2.view(torch.uint8))
     assert torch.equal(gs1, gs2)
@@ -108,7 +108,7 @@ def test_deterministic_and_layout():
 def test_roundtrip_dequant_close():
     torch.manual_seed(3)
     w = torch.randn(64, 256, dtype=torch.bfloat16, device="cuda")
-    q, bs, gs = M.quantize_nvfp4_weight(w)
+    q, bs, gs = M.quantize_nvfp4_weight(w, weight_2d=False)
 
     lut = torch.tensor(M._E2M1_VALUES, device="cuda")
     lo, hi = (q & 0x7).long(), ((q >> 4) & 0x7).long()
@@ -126,16 +126,16 @@ def test_roundtrip_dequant_close():
 
 def test_rejects_bad_shapes():
     with pytest.raises(ValueError):
-        M.quantize_nvfp4_weight(torch.randn(16))
+        M.quantize_nvfp4_weight(torch.randn(16), weight_2d=False)
     with pytest.raises(AssertionError):
-        M.quantize_nvfp4_weight(torch.randn(4, 20))  # K % 16 != 0
+        M.quantize_nvfp4_weight(torch.randn(4, 20), weight_2d=False)  # K % 16 != 0
 
 
 @cuda_only
 def test_zero_block_yields_zero_codes():
     w = torch.zeros(16, 32, dtype=torch.bfloat16, device="cuda")
     w[0, 16:] = 1.0  # non-zero amax so global scale is finite
-    q, bs, _ = M.quantize_nvfp4_weight(w)
+    q, bs, _ = M.quantize_nvfp4_weight(w, weight_2d=False)
     assert (q[0, :8] == 0).all()  # the all-zero block packs to zero codes
 
 
@@ -157,7 +157,9 @@ def test_filter_emits_fused_tensors_and_passes_rest():
     stream.insert(0, ("model.layers.0.self_attn.q_proj.weight", torch.randn(8, 8)))
     stream.append(("model.layers.0.self_attn.attn.k_scale", torch.tensor(1.0)))
     out = dict(
-        M.iter_nvfp4_pertoken_weights(iter(stream), quant_patterns=["*.experts.*"])
+        M.iter_nvfp4_pertoken_weights(
+            iter(stream), quant_patterns=["*.experts.*"], weight_2d=False
+        )
     )
     p = "model.layers.0.mlp.experts"
     assert out[f"{p}.w13_weight"].shape == (4, 64, 32)          # (E, 2N, K/2)
@@ -179,7 +181,7 @@ def test_filter_w13_shares_one_global_scale_per_expert():
     """
     stream = _expert_stream(num_experts=2, n=16, k=32)
     tensors = {n: t for n, t in stream}
-    out = dict(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
+    out = dict(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"], weight_2d=False))
     p = "model.layers.0.mlp.experts"
     s2 = out[f"{p}.w13_weight_scale_2"]
     assert torch.equal(s2[:, 0], s2[:, 1])
@@ -191,7 +193,7 @@ def test_filter_w13_shares_one_global_scale_per_expert():
             ],
             dim=0,
         )
-        fq, _, fs2 = M.quantize_nvfp4_weight(fused)
+        fq, _, fs2 = M.quantize_nvfp4_weight(fused, weight_2d=False)
         assert torch.equal(out[f"{p}.w13_weight"][e], fq)
         assert torch.equal(s2[e, 0], fs2)
 
@@ -200,7 +202,7 @@ def test_filter_flushes_multiple_layers_in_order():
     stream = _expert_stream(
         num_experts=2, n=16, k=32, layers=("model.layers.0", "model.layers.1")
     )
-    names = [n for n, _ in M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"])]
+    names = [n for n, _ in M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"], weight_2d=False)]
     assert names.index("model.layers.0.mlp.experts.w13_weight") < names.index(
         "model.layers.1.mlp.experts.w13_weight"
     )
@@ -215,6 +217,7 @@ def test_filter_respects_ignore_patterns():
             iter(stream),
             quant_patterns=["*expert*"],
             ignore_patterns=["*shared_expert*"],
+            weight_2d=False,
         )
     )
     assert "model.layers.0.mlp.experts.w13_weight" in out
@@ -226,14 +229,14 @@ def test_filter_keeps_device():
     stream = [
         (n, t.to("cuda")) for n, t in _expert_stream(num_experts=2, n=16, k=32)
     ]
-    out = dict(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
+    out = dict(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"], weight_2d=False))
     assert all(t.device.type == "cuda" for t in out.values())
 
 
 def test_filter_raises_when_nothing_quantized():
     stream = [("m.self_attn.q_proj.weight", torch.randn(8, 16))]
     with pytest.raises(RuntimeError, match="quantized 0 params"):
-        list(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
+        list(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"], weight_2d=False))
 
 
 def test_expand_fused_roundtrips_to_per_expert_checkpoint_names():
@@ -242,7 +245,7 @@ def test_expand_fused_roundtrips_to_per_expert_checkpoint_names():
     w13_/w2_ names are silently dropped by vLLM's loader)."""
     stream = _expert_stream(num_experts=2, n=16, k=32)
     stream.insert(0, ("m.self_attn.q_proj.weight", torch.randn(8, 8)))
-    fused = list(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"]))
+    fused = list(M.iter_nvfp4_pertoken_weights(iter(stream), ["*.experts.*"], weight_2d=False))
     expanded = dict(M.expand_fused_expert_weights(iter(fused)))
     fused = dict(fused)
 
@@ -325,3 +328,67 @@ def test_resolver_dispatch_and_mutual_exclusion():
             base,
             {"quant_cfg": "some.yaml", "nvfp4_pertoken_rollout": {"enabled": True}},
         )
+
+
+# ---------------------------------------------------------------------------
+# weight_2d: 16x16 tile block scales
+# ---------------------------------------------------------------------------
+
+
+def test_weight_2d_scale_is_replicated_across_each_tile():
+    """A 16x16 tile must emit one scale, repeated over the tile's 16 rows.
+
+    That replication is what lets an unmodified NVFP4 kernel — which expects
+    1x16 block scales — consume a 2D-quantized weight unchanged.
+    """
+    torch.manual_seed(0)
+    w = torch.randn(64, 128, dtype=torch.bfloat16)
+    _, bs, _ = M.quantize_nvfp4_weight(w, weight_2d=True)
+
+    assert bs.shape == (64, 128 // 16)  # same layout as the 1x16 path
+    f = bs.float()
+    for r0 in range(0, 64, 16):
+        tile_rows = f[r0 : r0 + 16]
+        assert torch.equal(tile_rows, tile_rows[:1].expand_as(tile_rows)), (
+            f"rows {r0}..{r0 + 15} do not share one scale"
+        )
+
+
+def test_weight_2d_is_transpose_consistent_and_1d_is_not():
+    """The point of 2D: the tile scale is invariant under transpose.
+
+    Quantizing W and W^T must give scale sets that are transposes of each other
+    for weight_2d=True. The 1x16 path reads 16 elements along a row vs along a
+    column, so it does not have this property.
+    """
+    torch.manual_seed(0)
+    w = torch.randn(64, 64, dtype=torch.bfloat16)
+
+    _, bs_2d, _ = M.quantize_nvfp4_weight(w, weight_2d=True)
+    _, bs_2d_t, _ = M.quantize_nvfp4_weight(w.t().contiguous(), weight_2d=True)
+    # Collapse each tile back to one value, then compare against the transpose.
+    tile = bs_2d.float()[::16, :]
+    tile_t = bs_2d_t.float()[::16, :]
+    assert torch.equal(tile, tile_t.t()), "2D tile scales are not transpose-consistent"
+
+    _, bs_1d, _ = M.quantize_nvfp4_weight(w, weight_2d=False)
+    _, bs_1d_t, _ = M.quantize_nvfp4_weight(w.t().contiguous(), weight_2d=False)
+    assert not torch.equal(bs_1d.float()[::16, :], bs_1d_t.float()[::16, :].t()), (
+        "1x16 scales unexpectedly matched under transpose"
+    )
+
+
+def test_weight_2d_scale_is_coarser_than_1d():
+    """One scale per 256 elements is >= the 1x16 scale it replaces."""
+    torch.manual_seed(0)
+    w = torch.randn(64, 128, dtype=torch.bfloat16)
+    _, bs1, _ = M.quantize_nvfp4_weight(w, weight_2d=False)
+    _, bs2, _ = M.quantize_nvfp4_weight(w, weight_2d=True)
+    # The tile amax dominates every row amax inside it (modulo e4m3 rounding).
+    assert (bs2.float() >= bs1.float() * 0.94).all()
+    assert bs2.float().mean() > bs1.float().mean()
+
+
+def test_weight_2d_rejects_row_count_not_divisible_by_16():
+    with pytest.raises(AssertionError, match="divisible by 16"):
+        M.quantize_nvfp4_weight(torch.randn(24, 32, dtype=torch.bfloat16), weight_2d=True)

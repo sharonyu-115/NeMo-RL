@@ -77,11 +77,23 @@ class NvFp4PerTokenRolloutConfig(BaseModel, extra="allow"):
       matching ``quant_patterns`` is quantized at refit.
     - ``quant_patterns``: HF-name allowlist quantized at refit (MoE experts
       only — the per-token kernel is MoE-only).
+    - ``weight_2d``: derive each weight's e4m3 block scale from a 16x16 tile
+      instead of a 1x16 row. Default False, which reproduces vLLM's
+      ``scaled_fp4_quant`` bit for bit. Setting it True makes the rollout
+      weight cast match a TransformerEngine ``per_token_weight_2d`` training
+      weight, so the training forward and the rollout quantize the weight the
+      same way. The emitted scale tensor keeps the standard ``(..., K // 16)``
+      NVFP4 layout — the 16 rows of a tile simply carry the same scale — so no
+      kernel change is needed and ``group_size: 16`` stays correct in the HF
+      quantization_config. Trade-off: one scale per 256 elements instead of per
+      16, i.e. coarser rollout weights in exchange for train/generation
+      agreement.
     """
 
     enabled: bool = False
     ignore: Optional[list[str]] = None
     quant_patterns: list[str] = ["*.experts.*"]
+    weight_2d: bool = False
 
     def resolved_ignore(self) -> list[str]:
         return list(DEFAULT_NVFP4_IGNORE) if self.ignore is None else self.ignore
@@ -120,22 +132,56 @@ def _round_e2m1_codes(y: torch.Tensor) -> torch.Tensor:
     return sign | codes
 
 
-def _quantize_blocks(scaled: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Block-16 NVFP4 quantization of a pre-globally-scaled tensor.
+def _block_scale_1d(x_blocks: torch.Tensor) -> torch.Tensor:
+    """1x16 e4m3 block scale: RNE(block_amax / 6) over the last dim."""
+    return (x_blocks.abs().amax(dim=-1) / _FP4_MAX).to(torch.float8_e4m3fn)
 
-    Mirrors ``scaled_fp4_quant(scaled, global_scale=1, non-swizzled)``:
+
+def _block_scale_2d(scaled: torch.Tensor) -> torch.Tensor:
+    """16x16-tile e4m3 block scale, broadcast back to the 1x16 scale layout.
+
+    A 16x16 tile holds the same 256 numbers whichever way the matrix is read, so
+    a weight scaled this way dequantizes identically rowwise and
+    columnwise-transposed. The returned tensor keeps the ``(..., N, K // 16)``
+    shape of the 1x16 path — the 16 rows of a tile carry an identical scale —
+    which is what lets an unmodified NVFP4 kernel consume it. This mirrors
+    TransformerEngine's ``per_token_weight_2d`` cast, which emits the same
+    "16-row-replicated e4m3 inner SF" (``quantizer.cpp``).
+    """
+    *lead, n, k = scaled.shape
+    assert n % 16 == 0, f"2D tiles need a row count divisible by 16, got {n}"
+    tiles = scaled.reshape(*lead, n // 16, 16, k // 16, 16)
+    tile_amax = tiles.abs().amax(dim=(-3, -1))  # (..., N // 16, K // 16)
+    tile_scale = (tile_amax / _FP4_MAX).to(torch.float8_e4m3fn)
+    return tile_scale.repeat_interleave(16, dim=-2)  # (..., N, K // 16)
+
+
+def _quantize_blocks(
+    scaled: torch.Tensor, *, weight_2d: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """NVFP4 block quantization of a pre-globally-scaled tensor.
+
+    With ``weight_2d=False`` this mirrors
+    ``scaled_fp4_quant(scaled, global_scale=1, non-swizzled)`` bit for bit:
     per-16-block e4m3 scale = RNE(block_amax / 6); elements are multiplied by
     the reciprocal of the decoded scale (multiply, not divide — matches the
     kernel) and rounded RNE onto the E2M1 grid, then nibble-packed with the
     even element in the low nibble.
+
+    With ``weight_2d=True`` only the scale derivation changes (16x16 tile
+    instead of 1x16 row); encoding, rounding and packing are untouched, and the
+    emitted scale tensor has the same shape either way.
     """
     *lead, k = scaled.shape
     assert k % 16 == 0, f"last dim must be a multiple of 16, got {k}"
     x = scaled.float().reshape(*lead, k // 16, 16)
 
-    block_amax = x.abs().amax(dim=-1)
-    block_scale = (block_amax / _FP4_MAX).to(torch.float8_e4m3fn)
-    sf = block_scale.float()
+    if weight_2d:
+        block_scale = _block_scale_2d(scaled.float())
+    else:
+        block_scale = _block_scale_1d(x)
+
+    sf = block_scale.float().reshape(*lead, k // 16)
     inv_sf = torch.where(sf > 0, sf.reciprocal(), torch.zeros_like(sf))
     y = x * inv_sf.unsqueeze(-1)
 
@@ -145,7 +191,7 @@ def _quantize_blocks(scaled: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def quantize_nvfp4_weight(
-    weight: torch.Tensor,
+    weight: torch.Tensor, *, weight_2d: bool
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a weight to the NVFP4 (ModelOpt HF checkpoint) layout.
 
@@ -157,9 +203,11 @@ def quantize_nvfp4_weight(
     - global ``weight_scale_2``, float32, scalar for 2D / ``(E,)`` for 3D,
       stored as ``amax / (6 * 448)``
 
-    Matches vLLM's ``_quantize_moe_weight_to_nvfp4`` numerics: per-tensor
-    (per-expert) amax, global scale folded in with an intermediate cast back
-    to the input dtype, then block-16 quantization under a unit global scale.
+    With ``weight_2d=False`` this matches vLLM's ``_quantize_moe_weight_to_nvfp4``
+    numerics: per-tensor (per-expert) amax, global scale folded in with an
+    intermediate cast back to the input dtype, then block-16 quantization under a
+    unit global scale. ``weight_2d=True`` swaps the 1x16 block scale for a 16x16
+    tile scale (see :func:`_block_scale_2d`); everything else is unchanged.
     """
     if weight.dim() == 2:
         amax = weight.abs().amax().float().clamp_min(1e-8)
@@ -174,7 +222,7 @@ def quantize_nvfp4_weight(
     else:
         raise ValueError(f"expected 2D or 3D weight, got shape {tuple(weight.shape)}")
 
-    packed, block_scale = _quantize_blocks(scaled)
+    packed, block_scale = _quantize_blocks(scaled, weight_2d=weight_2d)
     return packed, block_scale, weight_scale_2.to(torch.float32)
 
 
@@ -186,6 +234,8 @@ def iter_nvfp4_pertoken_weights(
     base_iter: Iterator[tuple[str, torch.Tensor]],
     quant_patterns: list[str],
     ignore_patterns: Optional[list[str]] = None,
+    *,
+    weight_2d: bool,
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Refit filter: quantize matching ``*.weight`` tensors in an export stream.
 
@@ -250,8 +300,10 @@ def iter_nvfp4_pertoken_weights(
         # the (E, 2) checkpoint-convention shape carries the shared scale in
         # both columns.
         w13 = torch.cat([_stack("gate_proj"), _stack("up_proj")], dim=1)
-        w13_q, w13_bs, w13_s2 = quantize_nvfp4_weight(w13)
-        d_q, d_bs, d_s2 = quantize_nvfp4_weight(_stack("down_proj"))
+        w13_q, w13_bs, w13_s2 = quantize_nvfp4_weight(w13, weight_2d=weight_2d)
+        d_q, d_bs, d_s2 = quantize_nvfp4_weight(
+            _stack("down_proj"), weight_2d=weight_2d
+        )
 
         quantized_layers += 1
         quantized_experts += num_experts

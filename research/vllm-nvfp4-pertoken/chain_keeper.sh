@@ -20,22 +20,28 @@ CAP=session/te-nvfp4-backward/.keeper_submitted   # one line per keeper-submitte
 # w2d ckpt step_360) and were cancelled. Their map entries below are kept so the
 # legs can be re-enabled by name, but they must stay OUT of KEYS — the drained-chain
 # restart added on 2026-07-28 would otherwise resubmit a fresh head for each.
-KEYS=(fp4bwd-w1d-r3 fp4bwd-w2d-r3)
+KEYS=(fp4bwd-w1d-r3 fp4bwd-w2d-r3 fp4bwd-w2d-roll2d fp4bwd-w2d-r3-roll2d)
 declare -A RECIPE=(
   [fp4bwd-w1d]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w1d.yaml
   [fp4bwd-w1d-r3]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w1d-r3.yaml
   [fp4bwd-w2d]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d.yaml
-  [fp4bwd-w2d-r3]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-r3.yaml )
+  [fp4bwd-w2d-r3]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-r3.yaml
+  [fp4bwd-w2d-roll2d]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-roll2d.yaml
+  [fp4bwd-w2d-r3-roll2d]=examples/configs/recipes/llm/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-r3-roll2d.yaml )
 declare -A RUNDIR=(
   [fp4bwd-w1d]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w1d
   [fp4bwd-w1d-r3]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w1d-r3
   [fp4bwd-w2d]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d
-  [fp4bwd-w2d-r3]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-r3 )
+  [fp4bwd-w2d-r3]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-r3
+  [fp4bwd-w2d-roll2d]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-roll2d
+  [fp4bwd-w2d-r3-roll2d]=results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-fp4bwd-w2d-r3-roll2d )
 declare -A JOBNAME=(
   [fp4bwd-w1d]=general_sa-nemo_rl.fp4bwd-w1d-1500
   [fp4bwd-w1d-r3]=general_sa-nemo_rl.fp4bwd-w1d-r3-1500
   [fp4bwd-w2d]=general_sa-nemo_rl.fp4bwd-w2d-1500
-  [fp4bwd-w2d-r3]=general_sa-nemo_rl.fp4bwd-w2d-r3-1500 )
+  [fp4bwd-w2d-r3]=general_sa-nemo_rl.fp4bwd-w2d-r3-1500
+  [fp4bwd-w2d-roll2d]=general_sa-nemo_rl.fp4bwd-w2d-roll2d-1500
+  [fp4bwd-w2d-r3-roll2d]=general_sa-nemo_rl.fp4bwd-w2d-r3-roll2d-1500 )
 # MANDATORY per leg. run_dapo_longrun.sh only guards that the image name matches
 # *te690*, and .env's default (nemo-rl-te690ffea-probe.sqsh, TE 690ffea4) matches
 # that pattern while LACKING the NVTE_NVFP4_PER_TOKEN_WEIGHT_PER_TENSOR_1D patch —
@@ -45,7 +51,9 @@ declare -A CONTAINER=(
   [fp4bwd-w1d]=/lustre/fsw/general_sa/shuangy/images/nemo-rl-te690-w1d-probe.sqsh
   [fp4bwd-w1d-r3]=/lustre/fsw/general_sa/shuangy/images/nemo-rl-te690-w1d-probe.sqsh
   [fp4bwd-w2d]=/lustre/fsw/general_sa/shuangy/images/nemo-rl-te690-w1d-probe.sqsh
-  [fp4bwd-w2d-r3]=/lustre/fsw/general_sa/shuangy/images/nemo-rl-te690-w1d-probe.sqsh )
+  [fp4bwd-w2d-r3]=/lustre/fsw/general_sa/shuangy/images/nemo-rl-te690-w1d-probe.sqsh
+  [fp4bwd-w2d-roll2d]=/lustre/fsw/general_sa/shuangy/images/nemo-rl-te690-w1d-probe.sqsh
+  [fp4bwd-w2d-r3-roll2d]=/lustre/fsw/general_sa/shuangy/images/nemo-rl-te690-w1d-probe.sqsh )
 
 TARGET=1500; LOWWATER=3; TOPUP=6; MAXTOTAL=30; INTERVAL=1800; STUCK_CYCLES=4
 export PRECISION=nvfp4_bwd GPUS_PER_NODE=4

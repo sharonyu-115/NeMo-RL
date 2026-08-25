@@ -120,6 +120,7 @@ def _configure_nvfp4_pertoken_engine_kwargs(
     configure_nvfp4_pertoken_engine_kwargs(
         llm_kwargs,
         validated_config.resolved_ignore(),
+        experimental_stacked_reload=validated_config.experimental_stacked_reload,
         explicit_engine_kwargs=cfg.get("vllm_kwargs") or {},
     )
 

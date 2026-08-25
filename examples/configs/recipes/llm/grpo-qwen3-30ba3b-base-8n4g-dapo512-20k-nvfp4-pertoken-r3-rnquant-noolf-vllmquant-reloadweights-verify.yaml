@@ -1,0 +1,16 @@
+defaults: ./grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-r3-rnquant-noolf-vllmquant-fixverify.yaml
+
+# Fresh numerical regression run for the vLLM reload_weights IPC refactor.
+# Keep the training and rollout settings identical to fixverify; only the run
+# identity and 90-step stopping point differ so gen_kl_error can be compared
+# through the previously problematic steps 42 and 78 without resuming the
+# existing step-1050 campaign.
+grpo:
+  max_num_steps: 90
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-r3-rnquant-noolf-vllmquant-reloadweights-verify
+
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-r3-rnquant-noolf-vllmquant-reloadweights-verify

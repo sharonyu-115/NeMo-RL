@@ -1,0 +1,16 @@
+defaults: ./grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-r3-rnquant-noolf-vllmquant-reloadweights-verify.yaml
+
+# Ninety-step alignment run for the layer-stacked NVFP4 reload experiment.
+# The inherited baseline already stops at step 90, covering the previously
+# problematic steps 42 and 78. Only the loader flag and run identity differ.
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-r3-rnquant-noolf-vllmquant-stackedreload-verify
+
+policy:
+  generation:
+    nvfp4_pertoken_rollout:
+      experimental_stacked_reload: true
+
+logger:
+  wandb:
+    name: grpo-qwen3-30ba3b-base-8n4g-dapo512-20k-nvfp4-pertoken-r3-rnquant-noolf-vllmquant-stackedreload-verify

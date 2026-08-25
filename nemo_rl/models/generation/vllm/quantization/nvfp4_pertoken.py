@@ -21,9 +21,9 @@ BF16.
 """
 
 import re
-from contextlib import contextmanager
+import time
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 
 import torch
 from vllm import _custom_ops as ops
@@ -48,8 +48,8 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
 )
 from nemo_rl.models.generation.vllm.vllm_backend import (
     VllmInternalWorkerExtension,
-    WeightUpdateFinalizer,
-    WeightUpdateTransport,
+    _IPCReloadMetrics,
+    _ReloadWeightPreparer,
 )
 
 logger = init_logger(__name__)
@@ -106,11 +106,23 @@ class NvFp4PerTokenQuantizer:
         self._pending: dict[tuple[str, int], PendingHalf] = {}
         self._quantized_layer: dict[str, bool] = {}
         self._quantized_events = 0
+        self._quantize_seconds = 0.0
 
     def reset(self) -> None:
-        """Clear pending gate/up state and this refit's liveness counter."""
+        """Clear pending gate/up state and this refit's counters."""
         self._pending = {}
         self._quantized_events = 0
+        self._quantize_seconds = 0.0
+
+    @property
+    def quantized_events(self) -> int:
+        """Expert weight groups quantized so far this refit."""
+        return self._quantized_events
+
+    @property
+    def quantize_seconds(self) -> float:
+        """Wall-clock seconds spent inside :meth:`process` so far this refit."""
+        return self._quantize_seconds
 
     def _is_quantized_layer(self, layer_prefix: str) -> bool:
         cached = self._quantized_layer.get(layer_prefix)
@@ -140,6 +152,18 @@ class NvFp4PerTokenQuantizer:
         quantized tensors are already safe; passthrough tensors are views
         into that buffer unless cloned here.
         """
+        start = time.perf_counter()
+        try:
+            out = self._process(weights)
+        finally:
+            # finally, not a trailing statement: a failed refit still reports
+            # how long it spent quantizing before it died.
+            self._quantize_seconds += time.perf_counter() - start
+        return out
+
+    def _process(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]:
         out: list[tuple[str, torch.Tensor]] = []
         for name, tensor in weights:
             match = _EXPERT_WEIGHT_RE.match(name)
@@ -252,21 +276,16 @@ class NvFp4PerTokenQuantizer:
         than let that pass unnoticed (mirrors
         ``_IPCWeightManifest.require_complete``).
 
-        Also prints a per-refit liveness line and raises if nothing was
-        quantized — a config/name mismatch would otherwise silently degrade to
-        an all-BF16 refit. Use print because Ray workers default to
-        WARNING-level logging.
+        Also raises if nothing was quantized — a config/name mismatch would
+        otherwise silently degrade to an all-BF16 refit. The per-refit liveness
+        line is emitted by ``NvFp4PerTokenWorkerExtension``, which is the only
+        place that knows the surrounding native-reload timings too.
         """
         if self._pending:
             raise RuntimeError(
                 "[nvfp4_pertoken] refit ended with unpaired expert projections: "
                 f"{sorted(self._pending)}"
             )
-        print(
-            f"[nvfp4_pertoken] refit: quantized {self._quantized_events} expert "
-            "weight groups",
-            flush=True,
-        )
         if self._quantized_events == 0:
             raise RuntimeError(
                 "[nvfp4_pertoken] refit quantized 0 params — export naming and "
@@ -276,6 +295,13 @@ class NvFp4PerTokenQuantizer:
 
 class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
     """W4A4 MoE: pre-quantized weights, per-token dynamic activation scales.
+
+    The stock ModelOpt method cannot be delegated to with ``super()``: it
+    builds the kernel with ``per_token_activation=False`` and then folds the
+    static input scales into the expert scales in place. Rebuilding a
+    per-token kernel afterwards would therefore double-process mutated scale
+    state. Keep this override aligned with the upstream method until vLLM
+    exposes a per-token ModelOpt kernel-setup hook.
 
     The class NAME must contain "ModelOpt": vLLM's RoutedExperts.weight_loader
     duck-types NVFP4 scale loading on ``"ModelOpt" in
@@ -411,10 +437,10 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
 
     Quantizes routed-expert BF16 weights to NVFP4 at refit-load time
     (``NvFp4PerTokenQuantizer``), mirroring the fp8/mxfp8 real-quant rollout
-    path (``quantization/fp8.py``). Weight updates run inside vLLM's
-    layerwise reload lifecycle so quantized params are restored to load
-    format before loading and re-processed (per-token kernel rebuilt)
-    afterwards, preserving CUDA-graph-stable kernel storage.
+    path (``quantization/fp8.py``). IPC weight updates enter vLLM through its
+    native ``reload_weights`` API, which restores quantized params to load
+    format and re-processes them afterwards while preserving stable kernel
+    storage for CUDA graphs.
     """
 
     _quantizer: Optional[NvFp4PerTokenQuantizer] = None
@@ -424,8 +450,8 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
             self._quantizer = NvFp4PerTokenQuantizer(self.model_runner.model)
         return self._quantizer
 
-    def _load_hf_weights(self, policy_weights: list[tuple[str, torch.Tensor]]) -> None:
-        super()._load_hf_weights(self._get_quantizer().process(policy_weights))
+    def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer:
+        return self._get_quantizer()
 
     def maybe_init_zmq(self) -> None:
         """Use a longer ZMQ timeout.
@@ -439,33 +465,23 @@ class NvFp4PerTokenWorkerExtension(VllmInternalWorkerExtension):
         self.zmq_socket.setsockopt(zmq.SNDTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
         self.zmq_socket.setsockopt(zmq.RCVTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
 
-    @contextmanager
-    def _weight_update_lifecycle(
-        self, transport: WeightUpdateTransport
-    ) -> Iterator[WeightUpdateFinalizer]:
-        del transport
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_reload,
-            initialize_layerwise_reload,
+    def _on_ipc_reload_complete(self, metrics: _IPCReloadMetrics) -> None:
+        # These spans are deliberately not presented as an additive breakdown:
+        # receive, preparation, and data ACK fences all happen while vLLM is
+        # consuming the lazy iterator inside reload_weights.
+        quantizer = self._get_quantizer()
+        print(
+            f"[nvfp4_pertoken] refit: quantized "
+            f"{quantizer.quantized_events} expert weight groups | "
+            f"wall {metrics.wall_seconds:.2f}s | reload_weights "
+            f"{metrics.reload_seconds:.2f}s (receive "
+            f"{metrics.receive_seconds:.2f}s, prepare_enqueue "
+            f"{metrics.prepare_seconds:.2f}s, quant_enqueue "
+            f"{quantizer.quantize_seconds:.2f}s, data_ack_sync "
+            f"{metrics.data_sync_seconds:.2f}s) | final_sync "
+            f"{metrics.final_sync_seconds:.2f}s",
+            flush=True,
         )
-
-        model = self.model_runner.model
-        # Reset on entry, not just at completion: _weight_update_errors_are_fatal
-        # is True, so a mid-refit exception propagates but the actor survives —
-        # a pending half from a failed refit must not silently pair with a
-        # fresh partner on the next one.
-        self._get_quantizer().reset()
-
-        with torch.device(self.device):
-            initialize_layerwise_reload(model)
-
-        def finalize() -> None:
-            self._get_quantizer().finish()
-            with torch.device(self.device):
-                finalize_layerwise_reload(model, self.model_config)
-            torch.accelerator.synchronize()
-
-        yield finalize
 
     def _weight_update_errors_are_fatal(self) -> bool:
         return True
@@ -495,6 +511,7 @@ def configure_nvfp4_pertoken_engine_kwargs(
     llm_kwargs: dict[str, Any],
     ignore: list[str],
     *,
+    experimental_stacked_reload: bool = False,
     explicit_engine_kwargs: dict[str, Any] | None = None,
 ) -> None:
     """Mutate vLLM engine kwargs for the per-token W4A4 rollout.
@@ -519,9 +536,14 @@ def configure_nvfp4_pertoken_engine_kwargs(
     llm_kwargs["load_format"] = "dummy"
     hf_overrides = llm_kwargs.setdefault("hf_overrides", {})
     hf_overrides["quantization_config"] = build_nvfp4_pertoken_hf_quant_config(ignore)
+    extension_module = "nvfp4_pertoken"
+    extension_class = "NvFp4PerTokenWorkerExtension"
+    if experimental_stacked_reload:
+        extension_module = "nvfp4_stacked_reload"
+        extension_class = "NvFp4PerTokenStackedWorkerExtension"
     llm_kwargs["worker_extension_cls"] = (
-        "nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken."
-        "NvFp4PerTokenWorkerExtension"
+        "nemo_rl.models.generation.vllm.quantization."
+        f"{extension_module}.{extension_class}"
     )
 
 

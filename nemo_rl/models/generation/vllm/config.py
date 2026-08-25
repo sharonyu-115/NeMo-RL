@@ -211,6 +211,14 @@ def validate_nvfp4_pertoken_generation(
         )
     if vllm_cfg.get("expert_parallel_size") != 1:
         raise ValueError("generation.nvfp4_pertoken_rollout requires vLLM EP=1")
+    if (
+        rollout.experimental_stacked_reload
+        and vllm_cfg.get("tensor_parallel_size") != 1
+    ):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout.experimental_stacked_reload "
+            "currently requires vLLM TP=1"
+        )
     if vllm_cfg.get("kv_cache_dtype") != "auto":
         raise ValueError(
             "generation.nvfp4_pertoken_rollout requires kv_cache_dtype=auto"

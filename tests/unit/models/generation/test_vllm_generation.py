@@ -637,6 +637,17 @@ def test_nvfp4_pertoken_validation_accepts_vllm_model_parallelism(vllm_cfg):
     )
 
 
+def test_nvfp4_stacked_reload_poc_rejects_tp_greater_than_one():
+    config = _make_nvfp4_pertoken_generation_config()
+    config["nvfp4_pertoken_rollout"]["experimental_stacked_reload"] = True
+    config["vllm_cfg"]["tensor_parallel_size"] = 2
+
+    with pytest.raises(ValueError, match="experimental_stacked_reload.*TP=1"):
+        configure_generation_config(
+            config, MagicMock(pad_token_id=0, eos_token_id=1), is_eval=False
+        )
+
+
 @pytest.mark.parametrize(
     ("architectures", "decoder_sparse_step", "mlp_only_layers"),
     [
@@ -684,9 +695,15 @@ def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
     fake_vllm_module = types.ModuleType(module_name)
     captured = {}
 
-    def configure(llm_kwargs, ignore, explicit_engine_kwargs):
+    def configure(
+        llm_kwargs,
+        ignore,
+        experimental_stacked_reload,
+        explicit_engine_kwargs,
+    ):
         captured["kwargs"] = llm_kwargs
         captured["ignore"] = ignore
+        captured["experimental_stacked_reload"] = experimental_stacked_reload
         captured["explicit_engine_kwargs"] = explicit_engine_kwargs
         llm_kwargs["quantization"] = "nvfp4_pertoken"
 
@@ -709,6 +726,7 @@ def test_main_worker_configures_nvfp4_pertoken_engine_kwargs(monkeypatch):
     assert captured == {
         "kwargs": llm_kwargs,
         "ignore": [*DEFAULT_NVFP4_IGNORE, layer_ignore],
+        "experimental_stacked_reload": False,
         "explicit_engine_kwargs": {"hf_overrides": {"max_position_embeddings": 4096}},
     }
     assert llm_kwargs["quantization"] == "nvfp4_pertoken"
@@ -747,6 +765,27 @@ def test_main_worker_accepts_nvfp4_pertoken_over_framework_defaults():
         build_nvfp4_pertoken_hf_quant_config(DEFAULT_NVFP4_IGNORE)
     )
     assert llm_kwargs["hf_overrides"]["max_position_embeddings"] == 4096
+
+
+def test_main_worker_selects_opt_in_nvfp4_stacked_extension():
+    pytest.importorskip("vllm")
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    llm_kwargs = {}
+    vllm_worker._configure_nvfp4_pertoken_engine_kwargs(
+        {
+            "nvfp4_pertoken_rollout": {
+                "enabled": True,
+                "experimental_stacked_reload": True,
+            },
+            "vllm_kwargs": {},
+        },
+        llm_kwargs,
+    )
+
+    assert llm_kwargs["worker_extension_cls"].endswith(
+        ".NvFp4PerTokenStackedWorkerExtension"
+    )
 
 
 def test_main_worker_rejects_explicit_quantization_for_nvfp4_pertoken():

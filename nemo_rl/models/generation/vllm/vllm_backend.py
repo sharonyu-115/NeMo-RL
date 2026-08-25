@@ -13,11 +13,14 @@
 # limitations under the License.
 import gc
 import logging
+import os
 import re
 import socket
+import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal
+from dataclasses import dataclass
+from typing import Any, Literal, Protocol
 
 import torch
 import zmq
@@ -58,6 +61,51 @@ except ImportError:
 
 WeightUpdateTransport = Literal["ipc", "collective"]
 WeightUpdateFinalizer = Callable[[], None]
+
+# 0-based index of the refit to profile, and where to write the .pstats file.
+# Both must be set for profiling to happen at all.
+NRL_REFIT_PROFILE_STEP = os.environ.get("NRL_REFIT_PROFILE_STEP", "")
+NRL_REFIT_PROFILE_DIR = os.environ.get("NRL_REFIT_PROFILE_DIR", "")
+
+
+@contextmanager
+def profile_refit(refit_index: int) -> Iterator[None]:
+    """Run one refit under cProfile, writing ``.pstats`` to the configured dir.
+
+    Quantized refit paths are Python-bound rather than kernel-bound: the cost is
+    in vLLM's per-name expert mapping scan and layerwise-reload loader wrapper,
+    plus the per-expert quantize launches. A call-graph profile attributes that
+    time where CUDA kernel timing cannot, so this is deliberately cProfile and
+    not NVTX.
+
+    Every generation worker profiles and writes its own pid-suffixed file. There
+    is deliberately no rank filter: colocated Ray gives each worker its own
+    CUDA_VISIBLE_DEVICES, so every worker's device index is 0 and a
+    ``device.index == 0`` guard would select all of them anyway. Profiling all
+    of them is the honest version -- the interpreter overhead lands on every
+    rank equally instead of turning one rank into a straggler the others wait
+    on, which keeps the per-rank breakdown lines comparable.
+
+    Args:
+        refit_index: 0-based count of refits the worker has served.
+    """
+    # Deferred: cProfile is only needed on the opt-in profiling path.
+    import cProfile
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+    try:
+        yield
+    finally:
+        profiler.disable()
+        os.makedirs(NRL_REFIT_PROFILE_DIR, exist_ok=True)
+        path = os.path.join(
+            NRL_REFIT_PROFILE_DIR, f"refit-{refit_index}-pid{os.getpid()}.pstats"
+        )
+        profiler.dump_stats(path)
+        # warning, not info: worker logging defaults to WARNING, and a profiled
+        # refit is an explicitly requested one-off worth seeing in the log.
+        logger.warning("Wrote refit %d cProfile to %s", refit_index, path)
 
 
 def _format_refit_key_error(label: str, keys: set[str]) -> str:
@@ -114,6 +162,30 @@ class _IPCWeightManifest:
             details.append(_format_refit_key_error("missing keys", missing_keys))
         if details:
             raise IPCWeightManifestError("; ".join(details))
+
+
+class _ReloadWeightPreparer(Protocol):
+    """Turn transport batches into reload-safe checkpoint tensors."""
+
+    def reset(self) -> None: ...
+
+    def process(
+        self, weights: list[tuple[str, torch.Tensor]]
+    ) -> list[tuple[str, torch.Tensor]]: ...
+
+    def finish(self) -> None: ...
+
+
+@dataclass
+class _IPCReloadMetrics:
+    """Non-overlapping and nested timings for one native IPC reload."""
+
+    wall_seconds: float = 0.0
+    reload_seconds: float = 0.0
+    receive_seconds: float = 0.0
+    prepare_seconds: float = 0.0
+    data_sync_seconds: float = 0.0
+    final_sync_seconds: float = 0.0
 
 
 class NixlVllmWorker(VllmWorker):
@@ -184,6 +256,8 @@ class VllmInternalWorkerExtension:
     _mtp_drafter_from_disk: bool = False
     _sparse_delta_applier: Any = None
     _nrl_named_parameters: dict[str, torch.nn.Parameter]
+    # Refits served by this worker, used only to select which one to profile.
+    _refit_index: int = 0
 
     def _get_named_parameters(self) -> dict[str, torch.nn.Parameter]:
         params = getattr(self, "_nrl_named_parameters", None)
@@ -636,6 +710,197 @@ class VllmInternalWorkerExtension:
         """Fence work consuming one IPC data batch before its acknowledgment."""
         torch.cuda.current_stream().synchronize()
 
+    def _get_reload_weight_preparer(self) -> _ReloadWeightPreparer | None:
+        """Return this worker's transport-neutral checkpoint preparer."""
+        return None
+
+    def _on_ipc_reload_complete(self, metrics: _IPCReloadMetrics) -> None:
+        """Observe timings after a successful native IPC reload."""
+        del metrics
+
+    def _drain_ipc_reload_sender(self) -> None:
+        """Release a REQ sender after a native reload has failed."""
+        while True:
+            payload = self.zmq_socket.recv_pyobj()
+            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+            if payload == IPCProtocol.COMPLETE:
+                return
+
+    def _update_weights_via_ipc_zmq_with_reload(
+        self, preparer: _ReloadWeightPreparer
+    ) -> bool:
+        """Receive IPC batches through vLLM's native layerwise reload API."""
+        try:
+            self.maybe_init_zmq()
+            manifest = _IPCWeightManifest(self.state_dict_info)
+            metrics = _IPCReloadMetrics()
+            refit_start = time.perf_counter()
+            complete_received = False
+
+            def iter_prepared_weights() -> Iterator[tuple[str, torch.Tensor]]:
+                nonlocal complete_received
+                while True:
+                    receive_start = time.perf_counter()
+                    payload = self.zmq_socket.recv_pyobj()
+                    metrics.receive_seconds += time.perf_counter() - receive_start
+
+                    if payload == IPCProtocol.COMPLETE:
+                        complete_received = True
+                        manifest.require_complete()
+                        preparer.finish()
+                        return
+
+                    buffer = None
+                    weight = None
+                    weights = None
+                    prepared_weights = None
+                    batch_keys = None
+                    batch_error = None
+                    try:
+                        ipc_handle, list_keys, used_bytes = payload
+                        batch_keys = manifest.validate_batch(list_keys)
+                        if batch_keys is None:
+                            continue
+
+                        buffer = rebuild_cuda_tensor_from_ipc(
+                            ipc_handle, self.device.index
+                        )
+                        weights = []
+                        offset = 0
+                        for key in list_keys:
+                            shape, dtype = self.state_dict_info[key]  # pyrefly
+                            if isinstance(shape, list):
+                                shape = torch.Size(shape)
+
+                            size_in_bytes = dtype.itemsize * shape.numel()
+                            weight = (
+                                buffer[offset : offset + size_in_bytes]
+                                .view(dtype=dtype)
+                                .view(shape)
+                            )
+                            weights.append((key, weight))
+                            offset += calculate_aligned_size(size_in_bytes)
+
+                        assert offset == used_bytes, (
+                            "Offset is not equal to used bytes, usually indicate "
+                            "inaccurate info like keys or cached dtype in "
+                            "state_dict_info"
+                        )
+                        prepare_start = time.perf_counter()
+                        prepared_weights = preparer.process(weights)
+                        metrics.prepare_seconds += time.perf_counter() - prepare_start
+                    except Exception as error:
+                        batch_error = error
+                        batch_desc = ", ".join(
+                            f"{k}: {tuple(w.shape)} {w.dtype}"
+                            for k, w in (weights or [])[:40]
+                        )
+                        logger.exception(
+                            "IPC reload batch preparation failed (batch: %s)",
+                            batch_desc,
+                        )
+                    finally:
+                        if buffer is not None:
+                            sync_start = time.perf_counter()
+                            try:
+                                self._synchronize_before_ipc_data_ack()
+                            except Exception as error:
+                                if batch_error is None:
+                                    batch_error = error
+                                logger.exception(
+                                    "IPC reload batch synchronization failed"
+                                )
+                            finally:
+                                metrics.data_sync_seconds += (
+                                    time.perf_counter() - sync_start
+                                )
+
+                        if batch_error is not None:
+                            manifest.record_load_failure(batch_error)
+                        elif batch_keys is not None:
+                            manifest.record_loaded(batch_keys)
+
+                        # Prepared weights must own their storage. Drop every raw
+                        # IPC view before ACK permits sender-side buffer reuse.
+                        del weight, weights, buffer
+                        weight = None
+                        weights = None
+                        buffer = None
+                        try:
+                            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                        except Exception:
+                            if batch_error is None:
+                                raise
+                            logger.exception(
+                                "Failed to ACK an IPC batch after preparation failed"
+                            )
+
+                    if batch_error is not None:
+                        raise batch_error
+                    if prepared_weights is not None:
+                        yield from prepared_weights
+
+            prepared_iterator: Iterator[tuple[str, torch.Tensor]] | None = None
+            try:
+                preparer.reset()
+                prepared_iterator = iter_prepared_weights()
+                reload_start = time.perf_counter()
+                try:
+                    self.model_runner.reload_weights(
+                        weights_iterator=prepared_iterator,
+                        is_checkpoint_format=True,
+                    )
+                finally:
+                    metrics.reload_seconds = time.perf_counter() - reload_start
+
+                if not complete_received:
+                    raise RuntimeError(
+                        "vLLM reload_weights returned before exhausting the IPC "
+                        "weight iterator"
+                    )
+
+                final_sync_start = time.perf_counter()
+                try:
+                    torch.accelerator.synchronize()
+                finally:
+                    metrics.final_sync_seconds = time.perf_counter() - final_sync_start
+            except Exception:
+                if prepared_iterator is not None:
+                    try:
+                        prepared_iterator.close()
+                    except Exception:
+                        logger.exception(
+                            "Failed to close the IPC reload weight iterator"
+                        )
+                try:
+                    if complete_received:
+                        self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+                    else:
+                        self._drain_ipc_reload_sender()
+                except Exception:
+                    logger.exception(
+                        "Failed to release the IPC sender after reload failure"
+                    )
+                raise
+
+            # COMPLETE is deliberately acknowledged only after reload finalization
+            # and the final device fence have both succeeded.
+            self.zmq_socket.send(IPCProtocol.ACK.value.encode())
+            metrics.wall_seconds = time.perf_counter() - refit_start
+            self._on_ipc_reload_complete(metrics)
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            return True
+        except Exception as e:
+            if self._weight_update_errors_are_fatal():
+                raise
+            logger.exception(
+                "Error in native IPC reload for VllmInternalWorkerExtension: %s",
+                e,
+            )
+            return False
+
     @wrap_with_nvtx_name("vllm_internal_worker_extension/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
         """Receive and update model weights via ZMQ IPC socket.
@@ -643,6 +908,18 @@ class VllmInternalWorkerExtension:
         Returns:
             bool: True if weights were successfully updated.
         """
+        refit_index = self._refit_index
+        self._refit_index = refit_index + 1
+        if not NRL_REFIT_PROFILE_DIR or str(refit_index) != NRL_REFIT_PROFILE_STEP:
+            return self._update_weights_via_ipc_zmq_impl()
+        with profile_refit(refit_index):
+            return self._update_weights_via_ipc_zmq_impl()
+
+    def _update_weights_via_ipc_zmq_impl(self) -> bool:
+        preparer = self._get_reload_weight_preparer()
+        if preparer is not None:
+            return self._update_weights_via_ipc_zmq_with_reload(preparer)
+
         buffer = None
         weight = None
         weights = None

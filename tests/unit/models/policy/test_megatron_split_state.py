@@ -111,6 +111,7 @@ def _make_worker(loss_type):
     )
 
     w = object.__new__(MegatronPolicyWorkerImpl)
+    w._nvte_backward_override = None
     w.model = _make_mock_model()
     w.optimizer = MagicMock()
     # MegatronOptimizer.step returns (success, grad_norm, num_zeros)

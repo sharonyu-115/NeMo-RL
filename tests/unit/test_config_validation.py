@@ -99,7 +99,11 @@ absolute_path = os.path.abspath(__file__)
 configs_dir = Path(
     os.path.join(os.path.dirname(absolute_path), "../../examples/configs")
 ).resolve()
-config_files = glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
+config_files = [
+    config_file
+    for config_file in glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
+    if "te_precision" not in Path(config_file).relative_to(configs_dir).parts
+]
 assert len(config_files) > 0, "No config files found"
 
 

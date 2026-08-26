@@ -513,17 +513,18 @@ def test_value_worker_train_decreases_loss(value_setup):
     value, _, data, loss_fn = value_setup
 
     value.prepare_for_training()
-    losses: list[float] = []
+    initial_loss = value.train(data, loss_fn, eval_mode=True)["loss"]
     for _ in range(3):
         results = value.train(data, loss_fn)
         loss_tensor = results["loss"]
         assert not torch.isnan(loss_tensor).any()
         assert not torch.isinf(loss_tensor).any()
-        losses.append(float(loss_tensor.mean().item()))
+    final_loss = value.train(data, loss_fn, eval_mode=True)["loss"]
     value.finish_training()
 
-    assert losses[-1] <= losses[0] + 1e-3, (
-        f"Value loss should not increase after 3 steps; got {losses}"
+    assert final_loss.mean() < initial_loss.mean(), (
+        "Value loss should decrease after 3 steps; "
+        f"got initial={initial_loss}, final={final_loss}"
     )
 
 

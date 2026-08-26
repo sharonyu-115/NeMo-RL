@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
@@ -238,6 +238,30 @@ def test_nvte_backward_override_is_scoped_to_training(monkeypatch):
         assert os.environ["NVTE_BACKWARD_OVERRIDE"] == "dequantized"
 
     assert "NVTE_BACKWARD_OVERRIDE" not in os.environ
+
+
+def test_nvfp4_pertoken_rollout_uses_extended_refit_timeout():
+    import zmq
+
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    worker.cfg = {
+        "generation": {
+            "backend": "vllm",
+            "nvfp4_pertoken_rollout": {"enabled": True},
+        }
+    }
+    worker.zmq_socket = MagicMock()
+
+    worker.maybe_init_zmq()
+
+    worker.zmq_socket.setsockopt.assert_has_calls(
+        [
+            call(zmq.SNDTIMEO, megatron_policy_worker.NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS),
+            call(zmq.RCVTIMEO, megatron_policy_worker.NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS),
+        ]
+    )
 
 
 def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):

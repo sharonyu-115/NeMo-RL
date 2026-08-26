@@ -99,10 +99,14 @@ absolute_path = os.path.abspath(__file__)
 configs_dir = Path(
     os.path.join(os.path.dirname(absolute_path), "../../examples/configs")
 ).resolve()
+# Non-algorithm YAMLs are validated through their native loaders in focused tests.
+non_algorithm_config_files = {
+    configs_dir / "te_precision" / "attn_bf16_mlp_nvfp4.yaml",
+}
 config_files = [
     config_file
     for config_file in glob.glob(str(configs_dir / "**/*.yaml"), recursive=True)
-    if "te_precision" not in Path(config_file).relative_to(configs_dir).parts
+    if Path(config_file) not in non_algorithm_config_files
 ]
 assert len(config_files) > 0, "No config files found"
 
